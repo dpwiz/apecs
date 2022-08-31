@@ -1,3 +1,4 @@
+{-# LANGUAGE GADTs      #-}
 {-# LANGUAGE FlexibleContexts      #-}
 {-# LANGUAGE FlexibleInstances     #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
@@ -13,6 +14,9 @@ import qualified Data.Vector.Unboxed  as U
 
 import Apecs.Components ()
 import Apecs.Core
+
+import Apecs.Stores (Judy(..))
+import qualified Data.Judy as Judy
 
 -- | Run a system in a game world
 {-# INLINE runSystem #-}

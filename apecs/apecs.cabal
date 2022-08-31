@@ -45,6 +45,7 @@ library
     , mtl               >=2.2    && <2.3
     , template-haskell  >=2.12   && <3
     , vector            >=0.11   && <0.14
+    , judy
 
   ghc-options:      -Wall
 

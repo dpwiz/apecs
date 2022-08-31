@@ -8,9 +8,11 @@
 {-# LANGUAGE Strict                #-}
 {-# LANGUAGE TypeApplications      #-}
 {-# LANGUAGE TypeFamilies          #-}
+{-# LANGUAGE InstanceSigs #-}
 
 module Apecs.Stores
   ( Map, Cache, Unique,
+    Judy, Judy.JE(..),
     Global,
     Cachable,
     ReadOnly, setReadOnly, destroyReadOnly
@@ -31,6 +33,46 @@ import qualified Data.Vector.Unboxed.Mutable as UM
 import           GHC.TypeLits
 
 import           Apecs.Core
+
+import qualified Data.Judy as Judy
+import Unsafe.Coerce (unsafeCoerce)
+
+newtype Judy c = Judy (Judy.JudyL c)
+
+type instance Elem (Judy c) = c
+
+instance (MonadIO m, Judy.JE c) => ExplInit m (Judy c) where
+  explInit = liftIO $ Judy <$> Judy.new
+
+instance (MonadIO m, Typeable c, Judy.JE c) => ExplGet m (Judy c) where
+  explGet :: (MonadIO m, Typeable c) => Judy c -> Int -> m (Elem (Judy c))
+  explGet    (Judy l) ety = liftIO$
+    Judy.lookup (unsafeCoerce ety) l >>= \case
+      Just c -> pure c
+      notFound -> error $ unwords
+        [ "Reading non-existent Map component"
+        , show (typeRep notFound)
+        , "for entity"
+        , show ety
+        ]
+  explExists :: (MonadIO m, Typeable c) => Judy c -> Int -> m Bool
+  explExists (Judy l) ety = liftIO$ Judy.member (unsafeCoerce ety) l
+  {-# INLINE explExists #-}
+  {-# INLINE explGet #-}
+
+instance (MonadIO m, Judy.JE c) => ExplSet m (Judy c) where
+  {-# INLINE explSet #-}
+  explSet (Judy l) ety x = liftIO$
+    Judy.insert (unsafeCoerce ety) x l
+
+instance MonadIO m => ExplDestroy m (Judy c) where
+  {-# INLINE explDestroy #-}
+  explDestroy (Judy l) ety = liftIO$
+    Judy.delete (unsafeCoerce ety) l
+
+instance (MonadIO m, Judy.JE c) => ExplMembers m (Judy c) where
+  {-# INLINE explMembers #-}
+  explMembers (Judy l) = liftIO$ Judy.unsafeFreeze l >>= Judy.keysUV
 
 -- | A map based on 'Data.IntMap.Strict'. O(log(n)) for most operations.
 newtype Map c = Map (IORef (M.IntMap c))
@@ -129,6 +171,7 @@ instance MonadIO m => ExplSet m (Global c) where
 --   This prevents stores like `Unique` and 'Global', which do /not/ behave like simple maps, from being cached.
 class Cachable s
 instance Cachable (Map s)
+instance Cachable (Judy s)
 instance (KnownNat n, Cachable s) => Cachable (Cache n s)
 
 -- | A cache around another store.
