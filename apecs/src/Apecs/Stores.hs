@@ -11,6 +11,7 @@
 
 module Apecs.Stores
   ( Map, Cache, Unique,
+    StorableSparseSet,
     Global,
     Cachable,
     ReadOnly, setReadOnly, destroyReadOnly
@@ -31,6 +32,78 @@ import qualified Data.Vector.Unboxed.Mutable as UM
 import           GHC.TypeLits
 
 import           Apecs.Core
+
+
+import Foreign.Storable (Storable)
+import Data.Word (Word32)
+import qualified Data.SparseSet.Storable as SS
+-- import qualified Data.SparseSet.Unboxed as SU
+
+newtype StorableSparseSet a = StorableSparseSet (SS.SparseSetStorable a)
+type instance Elem (StorableSparseSet c) = c
+
+maxEntities :: Word32
+maxEntities = 1999999 -- 1024 * 1024 * 32 -- XXX: 32 * 4 = 128 MB per component
+
+initialDense :: Word32
+initialDense = 999999
+
+-- newtype UnboxedSparseSet a = UnboxedSparseSet (SU.SparseSetUnboxed a)
+-- type instance Elem (UnboxedSparseSet c) = c
+
+-- instance (MonadIO m, UM.Unbox c) => ExplInit m (UnboxedSparseSet c) where
+--   explInit = liftIO $ UnboxedSparseSet <$> SU.create maxEntities initialDense
+
+-- instance (MonadIO m, Typeable c, UM.Unbox c) => ExplGet m (UnboxedSparseSet c) where
+--   explGet (UnboxedSparseSet ss) ety = liftIO$
+--     SU.unsafeLookup ss (fromIntegral ety)
+
+--   explExists (UnboxedSparseSet ss) ety = liftIO$ SU.contains ss (fromIntegral ety)
+--   {-# INLINE explExists #-}
+--   {-# INLINE explGet #-}
+
+-- instance (MonadIO m, UM.Unbox c) => ExplSet m (UnboxedSparseSet c) where
+--   {-# INLINE explSet #-}
+--   explSet (UnboxedSparseSet ss) ety x = liftIO$
+--     SU.insert ss (fromIntegral ety) x
+
+-- instance (MonadIO m, UM.Unbox c) => ExplDestroy m (UnboxedSparseSet c) where
+--   {-# INLINE explDestroy #-}
+--   explDestroy (UnboxedSparseSet ss) ety = liftIO$
+--     SU.remove ss (fromIntegral ety)
+
+-- instance (MonadIO m, UM.Unbox c) => ExplMembers m (UnboxedSparseSet c) where
+--   {-# INLINE explMembers #-}
+--   explMembers (UnboxedSparseSet ss) =
+--     SU.unsafeKeys ss >>= pure . U.map fromIntegral . U.convert
+
+--------------------------------
+
+instance (MonadIO m, Storable c) => ExplInit m (StorableSparseSet c) where
+  explInit = liftIO $ StorableSparseSet <$> SS.create maxEntities initialDense
+
+instance (MonadIO m, Typeable c, Storable c) => ExplGet m (StorableSparseSet c) where
+  explGet (StorableSparseSet ss) ety = liftIO$
+    SS.unsafeLookup ss (fromIntegral ety)
+
+  explExists (StorableSparseSet ss) ety = liftIO$ SS.contains ss (fromIntegral ety)
+  {-# INLINE explExists #-}
+  {-# INLINE explGet #-}
+
+instance (MonadIO m, Storable c) => ExplSet m (StorableSparseSet c) where
+  {-# INLINE explSet #-}
+  explSet (StorableSparseSet ss) ety x = liftIO$
+    SS.insert ss (fromIntegral ety) x
+
+instance (MonadIO m, Storable c) => ExplDestroy m (StorableSparseSet c) where
+  {-# INLINE explDestroy #-}
+  explDestroy (StorableSparseSet ss) ety = liftIO$
+    SS.remove ss (fromIntegral ety)
+
+instance (MonadIO m, Storable c) => ExplMembers m (StorableSparseSet c) where
+  {-# INLINE explMembers #-}
+  explMembers (StorableSparseSet ss) =
+    SS.unsafeKeys ss >>= pure . U.map fromIntegral . U.convert
 
 -- | A map based on 'Data.IntMap.Strict'. O(log(n)) for most operations.
 newtype Map c = Map (IORef (M.IntMap c))
@@ -129,6 +202,7 @@ instance MonadIO m => ExplSet m (Global c) where
 --   This prevents stores like `Unique` and 'Global', which do /not/ behave like simple maps, from being cached.
 class Cachable s
 instance Cachable (Map s)
+
 instance (KnownNat n, Cachable s) => Cachable (Cache n s)
 
 -- | A cache around another store.

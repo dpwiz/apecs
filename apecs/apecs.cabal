@@ -34,6 +34,8 @@ library
     Apecs.System
     Apecs.TH
     Apecs.Util
+    Data.SparseSet.Storable
+    Data.SparseSet.Unboxed
 
   other-modules:    Apecs.THTuples
   default-language: Haskell2010
