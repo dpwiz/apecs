@@ -16,6 +16,7 @@ import           Control.Monad.Catch
 import           Control.Monad.IO.Class
 import           Control.Monad.IO.Unlift
 import           Control.Monad.Reader
+import qualified Data.IntSet          as IS
 import qualified Data.Vector.Unboxed  as U
 
 -- | An Entity is just an integer, used to index into a component store.
@@ -76,6 +77,10 @@ class Monad m => ExplDestroy m s where
 class Monad m => ExplMembers m s where
   -- | Returns an unboxed vector of member indices
   explMembers :: s -> m (U.Vector Int)
+
+  -- | Returns an IntSet of member indices
+  explMemberSet :: s -> m IS.IntSet
+  explMemberSet s = IS.fromList . U.toList <$> explMembers s
 
 type Get     w m c = (Has w m c, ExplGet     m (Storage c))
 type Set     w m c = (Has w m c, ExplSet     m (Storage c))
