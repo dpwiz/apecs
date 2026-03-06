@@ -77,3 +77,21 @@ executable children
     , linear
 
   default-language: Haskell2010
+
+executable union-user-space
+  main-is:             UnionUserSpace.hs
+  build-depends:       base, apecs, vector
+  default-language:    Haskell2010
+  ghc-options:         -Wall
+
+executable union-pseudo-component
+  main-is:             UnionPseudoComponent.hs
+  build-depends:       base, apecs, vector
+  default-language:    Haskell2010
+  ghc-options:         -Wall
+
+executable union-advanced-core
+  main-is:             UnionAdvancedCore.hs
+  build-depends:       base, apecs, vector
+  default-language:    Haskell2010
+  ghc-options:         -Wall
