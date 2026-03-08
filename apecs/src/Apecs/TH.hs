@@ -61,7 +61,10 @@ makeWorldNoEC worldName cTypes = do
   -- Destructible type synonym
   destructible_decl <- makeInstanceTuples (worldName ++ "Destructible") ''ExplDestroy cTypes
 
-  pure $ data_decl : destructible_decl ++ concat (init_world : instances)
+  -- Enumerable type synonym
+  enumerable_decl <- makeInstanceEithers (worldName ++ "Enumerable") ''ExplMembers cTypes
+
+  pure $ data_decl : destructible_decl ++ enumerable_decl ++ concat (init_world : instances)
   where
     enumerate :: [a] -> [(Int,a)]
     enumerate = zip [0..]
