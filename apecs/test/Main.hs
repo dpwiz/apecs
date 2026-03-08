@@ -135,20 +135,24 @@ makeWorld "Tuples" [''T1, ''T2, ''T3]
 -- Tests Enumerable class
 makeWorld "WorldEnumerable" [''T1, ''T2, ''T3]
 
-worldEntityIds :: System WorldEnumerable [Entity]
+worldEntityIds :: System WorldEnumerable S.IntSet
 worldEntityIds = do
   s :: Storage WorldEnumerableEnumerable <- getStore
-  liftIO $ fmap Entity . S.toList <$> explMemberSet s
+  liftIO $ explMemberSet s
 
 prop_enumerable :: [Entity] -> [(Entity, (T1, T2))] -> [(Entity, T3)] -> Property
 prop_enumerable dels t12s t3s = assertSys initWorldEnumerable $ do
   forM_ t12s $ \(e, (t1, t2)) -> set e t1 >> set e t2
   forM_ t3s $ \(e, t3) -> set e t3
+
+  let expectedBefore = S.fromList (map (unEntity . fst) t12s ++ map (unEntity . fst) t3s)
+  actualBefore <- worldEntityIds
+
   forM_ dels $ \e -> destroy e (Proxy @WorldEnumerableDestructible)
 
-  let expected = S.fromList (map (unEntity . fst) t12s ++ map (unEntity . fst) t3s) `S.difference` S.fromList (map unEntity dels)
-  actual <- S.fromList . map unEntity <$> worldEntityIds
-  return (expected == actual)
+  let expectedAfter = expectedBefore `S.difference` S.fromList (map unEntity dels)
+  actualAfter <- worldEntityIds
+  return (expectedBefore == actualBefore && expectedAfter == actualAfter)
 
 prop_setGetTuple = genericSetGet initTuples (undefined :: (T1,T2,T3))
 prop_setSetTuple = genericSetSet initTuples (undefined :: (T1,T2,T3))
