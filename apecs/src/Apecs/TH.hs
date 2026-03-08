@@ -1,3 +1,4 @@
+{-# LANGUAGE CPP             #-}
 {-# LANGUAGE QuasiQuotes     #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeFamilies    #-}
@@ -71,13 +72,36 @@ makeWorldNoEC worldName cTypes = do
 
 makeInstanceFold :: ([Type] -> Type) -> String -> Name -> [Name] -> Q [Dec]
 makeInstanceFold foldT synName cls cTypes = do
-  let destructible ty
+  let hasInstance ty
         | nameBase ty == "EntityCounter" = pure False
-        | otherwise = isInstance cls [ConT ''IO, AppT (ConT ''Storage) (ConT ty)]
-  destroyableTypes <- filterM destructible cTypes
+        | otherwise = do
+            -- Resolve the Storage type family before calling isInstance.
+            -- isInstance does not reduce type family applications on GHC < 9.2,
+            -- and even on newer GHCs it matches instance heads without checking
+            -- whether constraints are satisfiable. Resolving first ensures stores
+            -- like Global (which lack ExplDestroy/ExplMembers) are excluded.
+            storageT <- resolveStorageType ty
+            case storageT of
+              Just resolved -> isInstance cls [ConT ''IO, resolved]
+              Nothing       -> pure False
+  matchingTypes <- filterM hasInstance cTypes
   let getType ty = ConT ty
-  decl <- tySynD (mkName synName) [] (pure $ foldT $ getType <$> destroyableTypes)
+  decl <- tySynD (mkName synName) [] (pure $ foldT $ getType <$> matchingTypes)
   return [decl]
+
+-- | Resolve the @Storage@ type family for a component type.
+-- On GHC < 9.2, @isInstance@ does not reduce type family applications,
+-- so we need to resolve @Storage ty@ before passing it to @isInstance@.
+resolveStorageType :: Name -> Q (Maybe Type)
+resolveStorageType ty = do
+  insts <- reifyInstances ''Storage [ConT ty]
+  pure $ case insts of
+#if MIN_VERSION_template_haskell(2,15,0)
+    [TySynInstD (TySynEqn _ _ rhs)] -> Just rhs
+#else
+    [TySynInstD _ (TySynEqn _ rhs)] -> Just rhs
+#endif
+    _ -> Nothing
 
 makeInstanceTuples :: String -> Name -> [Name] -> Q [Dec]
 makeInstanceTuples = makeInstanceFold mkTupleT
