@@ -132,8 +132,11 @@ instance Component T3 where type Storage T3 = Map T3
 
 makeWorld "Tuples" [''T1, ''T2, ''T3]
 
+newtype G1 = G1 () deriving (Eq, Show, Arbitrary, Semigroup, Monoid)
+instance Component G1 where type Storage G1 = Global G1
+
 -- Tests Enumerable class
-makeWorld "WorldEnumerable" [''T1, ''T2, ''T3]
+makeWorld "WorldEnumerable" [''G1, ''T1, ''T2, ''T3]
 
 worldEntityIds :: System WorldEnumerable S.IntSet
 worldEntityIds = do
