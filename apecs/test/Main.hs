@@ -138,7 +138,7 @@ makeWorld "WorldEnumerable" [''T1, ''T2, ''T3]
 worldEntityIds :: System WorldEnumerable S.IntSet
 worldEntityIds = do
   s :: Storage WorldEnumerableEnumerable <- getStore
-  liftIO $ explMemberSet s
+  explMemberSet s
 
 prop_enumerable :: [Entity] -> [(Entity, (T1, T2))] -> [(Entity, T3)] -> Property
 prop_enumerable dels t12s t3s = assertSys initWorldEnumerable $ do
