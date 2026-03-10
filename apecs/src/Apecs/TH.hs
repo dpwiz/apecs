@@ -192,21 +192,14 @@ makeComponentSum typeName consPrefix cTypes = do
     derivs = [ DerivClause Nothing (map ConT [''Show]) ]
   pure [DataD [] (mkName typeName) [] Nothing cons derivs]
 
-makeTagLookup :: String -> String -> String -> String -> String -> [Name] -> Q [Dec]
-makeTagLookup funName tagType tagPrefix sumType sumPrefix cTypes = do
+makeTagLookup :: String -> String -> String -> String -> String -> String -> [Name] -> Q [Dec]
+makeTagLookup funName worldName tagType tagPrefix sumType sumPrefix cTypes = do
   let fName = mkName funName
       tagN  = mkName tagType
       sumN  = mkName sumType
+      worldN = mkName worldName
   e <- newName "e"
   t <- newName "t"
-
-  -- world name can be inferred from tagType if we assume tagType = worldName ++ "Tag"
-  -- but the PR specifically requested "ReaderT World IO (Maybe WorldSum)"
-  -- wait, the user says "The provided type names are for this".
-  -- They mean tagType and sumType.
-  -- But where do I get "World"? Let's just strip "Tag" from the end of tagType.
-  let worldName = take (length tagType - 3) tagType
-      worldN    = mkName worldName
 
   sig <- sigD fName [t| Entity -> $(conT tagN) -> System $(conT worldN) (Maybe $(conT sumN)) |]
 
@@ -226,7 +219,7 @@ makeTaggedComponents :: String -> [Name] -> Q [Dec]
 makeTaggedComponents worldName cTypes = do
   tags <- makeComponentTags tagType tagPrefix cTypes
   sums <- makeComponentSum sumType sumPrefix cTypes
-  getter <- makeTagLookup lookupFunName tagType tagPrefix sumType sumPrefix cTypes
+  getter <- makeTagLookup lookupFunName worldName tagType tagPrefix sumType sumPrefix cTypes
   pure $ tags ++ sums ++ getter
   where
     tagType = worldName ++ "Tag"
