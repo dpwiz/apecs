@@ -194,25 +194,23 @@ makeComponentSum typeName consPrefix cTypes = do
 
 makeTagLookup :: String -> String -> String -> String -> String -> String -> [Name] -> Q [Dec]
 makeTagLookup funName worldName tagType tagPrefix sumType sumPrefix cTypes = do
-  let fName = mkName funName
-      tagN  = mkName tagType
-      sumN  = mkName sumType
-      worldN = mkName worldName
   e <- newName "e"
+  matches <- mapM (makeMatch e) cTypes
   t <- newName "t"
-
-  sig <- sigD fName [t| Entity -> $(conT tagN) -> System $(conT worldN) (Maybe $(conT sumN)) |]
-
-  let makeMatch cType = do
-        let tagCon = mkName (tagPrefix ++ nameBase cType)
-            sumCon = mkName (sumPrefix ++ nameBase cType)
-        match (conP tagCon []) (normalB [| fmap $(conE sumCon) <$> get $(varE e) |]) []
-
-  matches <- mapM makeMatch cTypes
   let body = caseE (varE t) (map pure matches)
+  sig <- sigD fName [t| Entity -> $(conT tagN) -> System $(conT worldN) (Maybe $(conT sumN)) |]
   decl <- funD fName [clause [varP e, varP t] (normalB body) []]
-
   pure [sig, decl]
+  where
+    makeMatch e cType =
+      match (conP tagCon []) (normalB [| fmap $(conE sumCon) <$> get $(varE e) |]) []
+      where
+        tagCon = mkName (tagPrefix ++ nameBase cType)
+        sumCon = mkName (sumPrefix ++ nameBase cType)
+    fName = mkName funName
+    tagN  = mkName tagType
+    sumN  = mkName sumType
+    worldN = mkName worldName
 
 -- | Calls 'makeComponentTags' and 'makeComponentSum' using the world name.
 makeTaggedComponents :: String -> [Name] -> Q [Dec]

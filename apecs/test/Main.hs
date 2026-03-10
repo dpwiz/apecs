@@ -182,7 +182,6 @@ prop_tags dels t12s t3s = assertSys initWorldEnumerable $ do
 
   let it = show (eav :: M.Map Entity (M.Map WorldEnumerableTag WorldEnumerableSum))
   guard (length it > 0)
-  liftIO $ putStrLn it
 
   pure True
 
