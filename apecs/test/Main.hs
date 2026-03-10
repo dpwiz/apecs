@@ -7,6 +7,7 @@
 {-# LANGUAGE LambdaCase                 #-}
 {-# LANGUAGE ScopedTypeVariables        #-}
 {-# LANGUAGE TemplateHaskell            #-}
+{-# LANGUAGE TupleSections              #-}
 {-# LANGUAGE TypeApplications           #-}
 {-# LANGUAGE TypeFamilies               #-}
 {-# LANGUAGE UndecidableInstances       #-}
@@ -175,19 +176,15 @@ prop_tags dels t12s t3s = assertSys initWorldEnumerable $ do
 
   entities <- worldEntityIds
 
-  let getTag :: Entity -> WorldTags -> System WorldEnumerable (Maybe WorldSum)
-
-  let allTags = [minBound .. maxBound] :: [WorldTags]
-
   eav <- fmap M.fromList . forM (map Entity $ S.toList entities) $ \e -> do
-    tagged <- fmap M.fromList . forM allTags $ \t -> (t,) <$> case t of
+    tagged <- fmap M.fromList . forM [minBound .. maxBound] $ \t -> (t,) <$> case t of
       TG1 -> fmap WorldEnumerableG1 <$> get e
       TT1 -> fmap WorldEnumerableT1 <$> get e
       TT2 -> fmap WorldEnumerableT2 <$> get e
       TT3 -> fmap WorldEnumerableT3 <$> get e
-    pure (Entity e, [ (t, v) | Just (t, v) <- tagged ])
+    pure (e, [ (t, v) | Just (t, v) <- tagged ])
 
-  let it = show (eav :: M.Map Entity (M.Map WorldTags WorldSum))
+  let it = show (eav :: M.Map Entity (M.Map WorldEnumerableTags WorldEnumerableSum))
   guard (length it > 0)
 
   pure True
