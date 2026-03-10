@@ -180,7 +180,7 @@ prop_tags dels t12s t3s = assertSys initWorldEnumerable $ do
   let allTags = [minBound .. maxBound] :: [WorldTags]
 
   eav <- fmap M.fromList . forM (map Entity $ S.toList entities) $ \e -> do
-    tagged <- fmap M.fromList . forM allTags $ \t -> (t,) <$> case
+    tagged <- fmap M.fromList . forM allTags $ \t -> (t,) <$> case t of
       TG1 -> fmap WorldEnumerableG1 <$> get e
       TT1 -> fmap WorldEnumerableT1 <$> get e
       TT2 -> fmap WorldEnumerableT2 <$> get e
