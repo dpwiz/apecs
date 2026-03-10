@@ -140,10 +140,10 @@ instance Component G1 where type Storage G1 = Global G1
 
 -- Tests Enumerable class
 makeWorld "WorldEnumerable" [''G1, ''T1, ''T2, ''T3]
+makeWorldTags "WorldEnumerable" [''G1, ''T1, ''T2, ''T3]
 -- Generate a (T1, T2, T3) tuple in a contrived way
 -- (that allows processing component lists when placed in external file)
 pure <$> makeInstanceFold mkTupleT "WorldEnumerableShowable" [''T1, ''T2, ''T3]
-makeWorldTags "World" [''G1, ''T1, ''T2, ''T3]
 
 worldEntityIds :: System WorldEnumerable S.IntSet
 worldEntityIds = do
@@ -173,34 +173,24 @@ prop_tags dels t12s t3s = assertSys initWorldEnumerable $ do
   forM_ t12s $ \(e, (t1, t2)) -> set e t1 >> set e t2
   forM_ t3s $ \(e, t3) -> set e t3
 
-  actualBefore <- worldEntityIds
-  let entities = S.toList actualBefore
+  entities <- worldEntityIds
 
   let getTag :: Entity -> WorldTags -> System WorldEnumerable (Maybe WorldSum)
-      getTag e TG1 = fmap WorldSumG1 <$> get e
-      getTag e TT1 = fmap WorldSumT1 <$> get e
-      getTag e TT2 = fmap WorldSumT2 <$> get e
-      getTag e TT3 = fmap WorldSumT3 <$> get e
 
   let allTags = [minBound .. maxBound] :: [WorldTags]
 
-  entityMaps <- forM entities $ \e -> do
-    tagValues <- forM allTags $ \tag -> do
-      mVal <- getTag (Entity e) tag
-      return $ case mVal of
-        Just val -> Just (tag, val)
-        Nothing -> Nothing
-    return (Entity e, M.fromList [ (t, v) | Just (t, v) <- tagValues ])
+  eav <- fmap M.fromList . forM (map Entity $ S.toList entities) $ \e -> do
+    tagged <- fmap M.fromList . forM allTags $ \t -> (t,) <$> case
+      TG1 -> fmap WorldEnumerableG1 <$> get e
+      TT1 -> fmap WorldEnumerableT1 <$> get e
+      TT2 -> fmap WorldEnumerableT2 <$> get e
+      TT3 -> fmap WorldEnumerableT3 <$> get e
+    pure (Entity e, [ (t, v) | Just (t, v) <- tagged ])
 
-  let finalMap :: M.Map Entity (M.Map WorldTags WorldSum)
-      finalMap = M.fromList entityMaps
-
-  let it = show finalMap
+  let it = show (eav :: M.Map Entity (M.Map WorldTags WorldSum))
   guard (length it > 0)
 
-  forM_ dels $ \e -> destroy e (Proxy @WorldEnumerableDestructible)
-
-  return True
+  pure True
 
 prop_setGetTuple = genericSetGet initTuples (undefined :: (T1,T2,T3))
 prop_setSetTuple = genericSetSet initTuples (undefined :: (T1,T2,T3))
