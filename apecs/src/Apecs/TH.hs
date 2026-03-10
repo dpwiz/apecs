@@ -7,6 +7,7 @@ module Apecs.TH
   ( makeWorld
   , makeWorldNoEC
   , makeWorldAndComponents
+  , makeWorldTags
   , makeMapComponents
   , makeMapComponentsFor
   , makeComponentTags
@@ -188,4 +189,14 @@ makeComponentSum :: String -> [Name] -> Q [Dec]
 makeComponentSum tagName cTypes = do
   let dataName = mkName tagName
       cons = map (\c -> NormalC (mkName (tagName ++ nameBase c)) [(Bang NoSourceUnpackedness NoSourceStrictness, ConT c)]) cTypes
-  return [DataD [] dataName [] Nothing cons []]
+      derivs = [ DerivClause Nothing (map ConT [''Eq, ''Show]) ]
+  return [DataD [] dataName [] Nothing cons derivs]
+
+-- | Calls 'makeComponentTags' and 'makeComponentSum' using the world name.
+makeWorldTags :: String -> [Name] -> Q [Dec]
+makeWorldTags worldName cTypes = do
+  let tagName = worldName ++ "Tags"
+      sumName = worldName ++ "Sum"
+  tags <- makeComponentTags tagName cTypes
+  sums <- makeComponentSum sumName cTypes
+  return $ tags ++ sums
