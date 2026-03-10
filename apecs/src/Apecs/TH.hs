@@ -193,10 +193,22 @@ makeComponentSum typeName consPrefix cTypes = do
   pure [DataD [] (mkName typeName) [] Nothing cons derivs]
 
 makeTagLookup :: String -> String -> String -> String -> String -> [Name] -> Q [Dec]
-makeTagLookup funName _tagType tagPrefix _sumType sumPrefix cTypes = do
+makeTagLookup funName tagType tagPrefix sumType sumPrefix cTypes = do
   let fName = mkName funName
+      tagN  = mkName tagType
+      sumN  = mkName sumType
   e <- newName "e"
   t <- newName "t"
+
+  -- world name can be inferred from tagType if we assume tagType = worldName ++ "Tag"
+  -- but the PR specifically requested "ReaderT World IO (Maybe WorldSum)"
+  -- wait, the user says "The provided type names are for this".
+  -- They mean tagType and sumType.
+  -- But where do I get "World"? Let's just strip "Tag" from the end of tagType.
+  let worldName = take (length tagType - 3) tagType
+      worldN    = mkName worldName
+
+  sig <- sigD fName [t| Entity -> $(conT tagN) -> System $(conT worldN) (Maybe $(conT sumN)) |]
 
   let makeMatch cType = do
         let tagCon = mkName (tagPrefix ++ nameBase cType)
@@ -207,7 +219,7 @@ makeTagLookup funName _tagType tagPrefix _sumType sumPrefix cTypes = do
   let body = caseE (varE t) (map pure matches)
   decl <- funD fName [clause [varP e, varP t] (normalB body) []]
 
-  pure [decl]
+  pure [sig, decl]
 
 -- | Calls 'makeComponentTags' and 'makeComponentSum' using the world name.
 makeTaggedComponents :: String -> [Name] -> Q [Dec]
