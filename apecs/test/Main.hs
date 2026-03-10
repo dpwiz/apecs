@@ -177,11 +177,7 @@ prop_tags dels t12s t3s = assertSys initWorldEnumerable $ do
   entities <- worldEntityIds
 
   eav <- fmap M.fromList . forM (map Entity $ S.toList entities) $ \e -> do
-    tagged <- forM [minBound .. maxBound] $ \t -> fmap (t,) <$> case t of
-      TG1 -> fmap SG1 <$> get e
-      TT1 -> fmap ST1 <$> get e
-      TT2 -> fmap ST2 <$> get e
-      TT3 -> fmap ST3 <$> get e
+    tagged <- forM [minBound .. maxBound] $ \t -> fmap (t,) <$> lookupWorldEnumerableTag e t
     pure (e, M.fromList [ (t, v) | Just (t, v) <- tagged ])
 
   let it = show (eav :: M.Map Entity (M.Map WorldEnumerableTag WorldEnumerableSum))

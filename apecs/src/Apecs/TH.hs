@@ -12,6 +12,7 @@ module Apecs.TH
   , makeMapComponentsFor
   , makeComponentTags
   , makeComponentSum
+  , makeTagLookup
   , hasStoreInstance
   , makeInstanceFold
   , mkFoldT
@@ -191,9 +192,33 @@ makeComponentSum typeName consPrefix cTypes = do
     derivs = [ DerivClause Nothing (map ConT [''Show]) ]
   pure [DataD [] (mkName typeName) [] Nothing cons derivs]
 
+makeTagLookup :: String -> String -> String -> String -> String -> [Name] -> Q [Dec]
+makeTagLookup funName _tagType tagPrefix _sumType sumPrefix cTypes = do
+  let fName = mkName funName
+  e <- newName "e"
+  t <- newName "t"
+
+  let makeMatch cType = do
+        let tagCon = mkName (tagPrefix ++ nameBase cType)
+            sumCon = mkName (sumPrefix ++ nameBase cType)
+        match (conP tagCon []) (normalB [| fmap $(conE sumCon) <$> get $(varE e) |]) []
+
+  matches <- mapM makeMatch cTypes
+  let body = caseE (varE t) (map pure matches)
+  decl <- funD fName [clause [varP e, varP t] (normalB body) []]
+
+  pure [decl]
+
 -- | Calls 'makeComponentTags' and 'makeComponentSum' using the world name.
 makeTaggedComponents :: String -> [Name] -> Q [Dec]
 makeTaggedComponents worldName cTypes = do
-  tags <- makeComponentTags (worldName ++ "Tag") "T" cTypes
-  sums <- makeComponentSum (worldName ++ "Sum") "S" cTypes
-  pure $ tags ++ sums
+  tags <- makeComponentTags tagType tagPrefix cTypes
+  sums <- makeComponentSum sumType sumPrefix cTypes
+  getter <- makeTagLookup lookupFunName tagType tagPrefix sumType sumPrefix cTypes
+  pure $ tags ++ sums ++ getter
+  where
+    tagType = worldName ++ "Tag"
+    tagPrefix = "T"
+    sumType = worldName ++ "Sum"
+    sumPrefix = "S"
+    lookupFunName = "lookup" ++ worldName ++ "Tag"
