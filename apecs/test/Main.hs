@@ -20,6 +20,7 @@ import qualified Data.Foldable               as F
 import qualified Data.IntSet                 as S
 import           Data.IORef
 import           Data.List                   ((\\), delete, nub, sort)
+import qualified Data.IntMap.Strict          as IM
 import qualified Data.Map.Strict             as M
 import qualified Data.Vector.Unboxed         as U
 import           Test.QuickCheck
