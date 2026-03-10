@@ -20,6 +20,14 @@ executable simple
 
   default-language: Haskell2010
 
+executable tags
+  main-is:          Tags.hs
+  build-depends:
+      apecs
+    , base    >=4.9 && <5
+
+  default-language: Haskell2010
+
 executable shmup
   main-is:          Shmup.lhs
   build-depends:
