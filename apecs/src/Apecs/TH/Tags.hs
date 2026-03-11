@@ -17,7 +17,6 @@ import           Control.Monad.Trans.Reader (asks)
 import           Control.Monad.Trans.Class (lift)
 import           Data.Traversable     (for)
 import           Language.Haskell.TH
-import qualified Data.Set as Set
 
 import           Apecs.Core
 import           Apecs.Stores
@@ -31,7 +30,12 @@ makeTaggedComponents worldName cTypes = do
   sums <- makeComponentSum sumType sumPrefix cTypes
   getter <- makeTagLookup lookupFunName worldName tagType tagPrefix sumType sumPrefix cTypes
   toTag <- makeTagFromSum tagFromSumFunName tagType tagPrefix sumType sumPrefix cTypes
-  getTags <- makeGetTags getTagsFunName worldName tagType tagPrefix cTypes
+
+  let skip = ["Global", "ReadOnly"]
+  let m = ConT ''IO
+  existing <- filterM (hasStoreInstance skip ''ExplGet m) cTypes
+
+  getTags <- makeGetTags getTagsFunName worldName tagType tagPrefix existing
   pure $ tags ++ sums ++ getter ++ toTag ++ getTags
   where
     tagType = worldName ++ "Tag"
@@ -100,23 +104,19 @@ makeGetTags :: String -> String -> String -> String -> [Name] -> Q [Dec]
 makeGetTags funName worldName tagType tagPrefix cTypes = do
   e <- newName "e"
 
-  let skip = ["Global", "ReadOnly"]
-  let m = ConT ''IO
-  existing <- filterM (hasStoreInstance skip ''ExplGet m) cTypes
+  sig <- sigD fName [t| Entity -> SystemT $(conT worldN) IO [$(conT tagN)] |]
 
-  let fName = mkName funName
-      tagN = mkName tagType
-      worldN = mkName worldName
-
-  sig <- sigD fName [t| Entity -> SystemT $(conT worldN) IO (Set.Set $(conT tagN)) |]
-
-  stmts <- mapM (makeStmt e) existing
-  let returnE = noBindS (appE (varE 'return) (appE (varE 'Set.fromList) (appE (varE 'concat) (listE (map (varE . mkName . ("tag_" ++) . nameBase) existing)))))
+  stmts <- mapM (makeStmt e) cTypes
+  let returnE = noBindS (appE (varE 'return) (appE (varE 'concat) (listE (map (varE . mkName . ("tag_" ++) . nameBase) cTypes))))
   let body = doE (map pure stmts ++ [returnE])
 
   decl <- funD fName [clause [varP e] (normalB body) []]
   pure [sig, decl]
   where
+    fName = mkName funName
+    tagN = mkName tagType
+    worldN = mkName worldName
+
     makeStmt e cType = do
       let tagCon = mkName (tagPrefix ++ nameBase cType)
           tagName = mkName ("tag_" ++ nameBase cType)
