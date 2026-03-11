@@ -9,16 +9,21 @@ module Apecs.TH.Tags
   , makeComponentSum
   , makeTagLookup
   , makeTagFromSum
+  , makeGetTags
   ) where
 
 import           Control.Monad        (filterM)
 import           Control.Monad.Trans.Reader (asks)
+import           Control.Monad.Trans.Class (lift)
 import           Data.Traversable     (for)
 import           Language.Haskell.TH
+import qualified Data.Set as Set
 
 import           Apecs.Core
 import           Apecs.Stores
+
 import           Apecs.Util           (EntityCounter)
+import           Apecs.TH             (hasStoreInstance)
 
 makeTaggedComponents :: String -> [Name] -> Q [Dec]
 makeTaggedComponents worldName cTypes = do
@@ -26,7 +31,8 @@ makeTaggedComponents worldName cTypes = do
   sums <- makeComponentSum sumType sumPrefix cTypes
   getter <- makeTagLookup lookupFunName worldName tagType tagPrefix sumType sumPrefix cTypes
   toTag <- makeTagFromSum tagFromSumFunName tagType tagPrefix sumType sumPrefix cTypes
-  pure $ tags ++ sums ++ getter ++ toTag
+  getTags <- makeGetTags getTagsFunName worldName tagType tagPrefix cTypes
+  pure $ tags ++ sums ++ getter ++ toTag ++ getTags
   where
     tagType = worldName ++ "Tag"
     tagPrefix = "T"
@@ -34,6 +40,7 @@ makeTaggedComponents worldName cTypes = do
     sumPrefix = "S"
     lookupFunName = "lookup" ++ worldName ++ "Tag"
     tagFromSumFunName = "tag" ++ sumType
+    getTagsFunName = "get" ++ worldName ++ "Tags"
 
 -- | Creates an Enum of component tags
 makeComponentTags :: String -> String -> [Name] -> Q [Dec]
@@ -57,7 +64,7 @@ makeTagLookup funName worldName tagType tagPrefix sumType sumPrefix cTypes = do
   matches <- mapM (makeMatch e) cTypes
   t <- newName "t"
   let body = caseE (varE t) (map pure matches)
-  sig <- sigD fName [t| Entity -> $(conT tagN) -> System $(conT worldN) (Maybe $(conT sumN)) |]
+  sig <- sigD fName [t| Entity -> $(conT tagN) -> SystemT $(conT worldN) IO (Maybe $(conT sumN)) |]
   decl <- funD fName [clause [varP e, varP t] (normalB body) []]
   pure [sig, decl]
   where
@@ -88,3 +95,33 @@ makeTagFromSum funName tagType tagPrefix sumType sumPrefix cTypes = do
     fName = mkName funName
     tagN  = mkName tagType
     sumN  = mkName sumType
+
+makeGetTags :: String -> String -> String -> String -> [Name] -> Q [Dec]
+makeGetTags funName worldName tagType tagPrefix cTypes = do
+  e <- newName "e"
+
+  let skip = ["Global", "ReadOnly"]
+  let m = ConT ''IO
+  existing <- filterM (hasStoreInstance skip ''ExplGet m) cTypes
+
+  let fName = mkName funName
+      tagN = mkName tagType
+      worldN = mkName worldName
+
+  sig <- sigD fName [t| Entity -> SystemT $(conT worldN) IO (Set.Set $(conT tagN)) |]
+
+  stmts <- mapM (makeStmt e) existing
+  let returnE = noBindS (appE (varE 'return) (appE (varE 'Set.fromList) (appE (varE 'concat) (listE (map (varE . mkName . ("tag_" ++) . nameBase) existing)))))
+  let body = doE (map pure stmts ++ [returnE])
+
+  decl <- funD fName [clause [varP e] (normalB body) []]
+  pure [sig, decl]
+  where
+    makeStmt e cType = do
+      let tagCon = mkName (tagPrefix ++ nameBase cType)
+          tagName = mkName ("tag_" ++ nameBase cType)
+      -- We need to give the store a specific type: Storage ComponentType
+      bindS (varP tagName) [| do
+        s <- getStore :: SystemT $(conT (mkName worldName)) IO (Storage $(conT cType))
+        has <- lift $ explExists s (unEntity $(varE e))
+        return (if has then [$(conE tagCon)] else []) |]
