@@ -22,24 +22,6 @@ import           Language.Haskell.TH
 import Apecs.Core
 import Apecs.TH (hasStoreInstance)
 
-#if MIN_VERSION_template_haskell(2,17,0)
-mkPlainTV :: Name -> TyVarBndr Specificity
-mkPlainTV n = PlainTV n SpecifiedSpec
-#else
-mkPlainTV :: Name -> TyVarBndr
-mkPlainTV n = PlainTV n
-#endif
-
--- | Build a @forall m. (Cls World m C1, ...) => body@ type signature,
---   returning the fresh @m@ 'Name' for use in the function body.
-forallMSig :: Name -> Name -> Name -> [Name] -> (Name -> Type) -> Q (Name, Dec)
-forallMSig fName cls worldN cTypes mkBody = do
-  m <- newName "m"
-  let constraints = [ foldl AppT (ConT cls) [ConT worldN, VarT m, ConT c] | c <- cTypes ]
-      fullType = ForallT [mkPlainTV m] constraints (mkBody m)
-  sig <- sigD fName (pure fullType)
-  pure (m, sig)
-
 makeTaggedComponents :: String -> [Name] -> Q [Dec]
 makeTaggedComponents worldName cTypes = do
   tags <- makeComponentTags tagType tagPrefix cTypes
@@ -206,3 +188,21 @@ makeCountComponents funName worldName tagType tagPrefix cTypes = do
       where
         countNames = map (varE . mkName . ("count_" ++) . nameBase) cTypes
         resultE = noBindS . appE (varE 'pure) $ listE countNames
+
+-- | Build a @forall m. (Cls World m C1, ...) => body@ type signature,
+--   returning the fresh @m@ 'Name' for use in the function body.
+forallMSig :: Name -> Name -> Name -> [Name] -> (Name -> Type) -> Q (Name, Dec)
+forallMSig fName cls worldN cTypes mkBody = do
+  m <- newName "m"
+  let constraints = [ foldl AppT (ConT cls) [ConT worldN, VarT m, ConT c] | c <- cTypes ]
+      fullType = ForallT [mkPlainTV m] constraints (mkBody m)
+  sig <- sigD fName (pure fullType)
+  pure (m, sig)
+
+#if MIN_VERSION_template_haskell(2,17,0)
+mkPlainTV :: Name -> TyVarBndr Specificity
+mkPlainTV n = PlainTV n SpecifiedSpec
+#else
+mkPlainTV :: Name -> TyVarBndr
+mkPlainTV n = PlainTV n
+#endif
