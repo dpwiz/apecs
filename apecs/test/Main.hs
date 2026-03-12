@@ -238,7 +238,7 @@ prop_count_combinations t12s t3s = assertSys initWorldEnumerable $ do
   forM_ t3s $ \(e, t3) -> set e t3
 
   entities <- worldEntityIds
-  combos <- countCombinations entities entityTags
+  combos <- countCombinations entities
 
   let has_t12s = S.fromList (map (unEntity . fst) t12s)
   let has_t3s = S.fromList (map (unEntity . fst) t3s)
