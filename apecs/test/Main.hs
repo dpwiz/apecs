@@ -185,6 +185,14 @@ prop_tags dels t12s t3s = assertSys initWorldEnumerable $ do
   let it = show (eav :: M.Map Entity (M.Map WorldEnumerableTag WorldEnumerableSum))
   guard (length it > 0)
 
+  forM_ t12s $ \(e, _) -> do
+    tags <- getWorldEnumerableTags e
+    guard (TT1 `elem` tags && TT2 `elem` tags)
+
+  forM_ t3s $ \(e, _) -> do
+    tags <- getWorldEnumerableTags e
+    guard (TT3 `elem` tags)
+
   pure True
 
 prop_setGetTuple = genericSetGet initTuples (undefined :: (T1,T2,T3))
