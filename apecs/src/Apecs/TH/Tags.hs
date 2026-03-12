@@ -163,7 +163,8 @@ makeHasTagsInstance worldName tagType getTagsFunName cTypes = do
   m <- newName "m"
   let worldT = ConT worldN
       mT     = VarT m
-      constraints = [ foldl AppT (ConT ''Get) [worldT, mT, ConT c] | c <- cTypes ]
+      constraints = AppT (ConT ''Monad) mT
+                  : [ foldl AppT (ConT ''Get) [worldT, mT, ConT c] | c <- cTypes ]
       instHead = AppT (AppT (ConT ''HasTags) worldT) mT
       instBody = [ValD (VarP 'entityTags) (NormalB (VarE getTagsN)) []]
       instDec = InstanceD Nothing constraints instHead instBody
