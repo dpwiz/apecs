@@ -176,6 +176,15 @@ prop_tags dels t12s t3s = assertSys initWorldEnumerable $ do
   forM_ t12s $ \(e, (t1, t2)) -> set e t1 >> set e t2
   forM_ t3s $ \(e, t3) -> set e t3
 
+  let allEntities = S.toList $ S.fromList (map (unEntity . fst) t12s ++ map (unEntity . fst) t3s)
+  forM_ allEntities $ \eInt -> do
+    let e = Entity eInt
+    tags <- getWorldEnumerableTags e
+    let has12 = e `elem` map fst t12s
+        has3  = e `elem` map fst t3s
+        expected = (if has12 then [TT1, TT2] else []) ++ (if has3 then [TT3] else [])
+    guard (tags == expected)
+
   entities <- worldEntityIds
 
   eav <- fmap M.fromList . forM (map Entity $ S.toList entities) $ \e -> do
@@ -184,14 +193,6 @@ prop_tags dels t12s t3s = assertSys initWorldEnumerable $ do
 
   let it = show (eav :: M.Map Entity (M.Map WorldEnumerableTag WorldEnumerableSum))
   guard (length it > 0)
-
-  forM_ t12s $ \(e, _) -> do
-    tags <- getWorldEnumerableTags e
-    guard (TT1 `elem` tags && TT2 `elem` tags)
-
-  forM_ t3s $ \(e, _) -> do
-    tags <- getWorldEnumerableTags e
-    guard (TT3 `elem` tags)
 
   pure True
 
