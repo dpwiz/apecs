@@ -30,6 +30,16 @@ mkPlainTV :: Name -> TyVarBndr
 mkPlainTV n = PlainTV n
 #endif
 
+-- | Build a @forall m. (Cls World m C1, ...) => body@ type signature,
+--   returning the fresh @m@ 'Name' for use in the function body.
+forallMSig :: Name -> Name -> Name -> [Name] -> (Name -> Type) -> Q (Name, Dec)
+forallMSig fName cls worldN cTypes mkBody = do
+  m <- newName "m"
+  let constraints = [ foldl AppT (ConT cls) [ConT worldN, VarT m, ConT c] | c <- cTypes ]
+      fullType = ForallT [mkPlainTV m] constraints (mkBody m)
+  sig <- sigD fName (pure fullType)
+  pure (m, sig)
+
 makeTaggedComponents :: String -> [Name] -> Q [Dec]
 makeTaggedComponents worldName cTypes = do
   tags <- makeComponentTags tagType tagPrefix cTypes
@@ -76,16 +86,10 @@ makeComponentSum typeName consPrefix cTypes = pure [decl]
 
 makeTagLookup :: String -> String -> String -> String -> String -> String -> [Name] -> Q [Dec]
 makeTagLookup funName worldName tagType tagPrefix sumType sumPrefix cTypes = do
-  m <- newName "m"
-  let worldT = ConT worldN
-      tagT   = ConT tagN
-      sumT   = ConT sumN
-      constraints = [ foldl AppT (ConT ''Get) [worldT, VarT m, ConT c] | c <- cTypes ]
-      bodyType = AppT (AppT ArrowT (ConT ''Entity))
-                   (AppT (AppT ArrowT tagT)
-                     (foldl AppT (ConT ''SystemT) [worldT, VarT m, AppT (ConT ''Maybe) sumT]))
-      fullType = ForallT [mkPlainTV m] constraints bodyType
-  sig <- sigD fName (pure fullType)
+  (_, sig) <- forallMSig fName ''Get worldN cTypes $ \m ->
+    AppT (AppT ArrowT (ConT ''Entity))
+      (AppT (AppT ArrowT (ConT tagN))
+        (foldl AppT (ConT ''SystemT) [ConT worldN, VarT m, AppT (ConT ''Maybe) (ConT sumN)]))
   e <- newName "e"
   matches <- mapM (makeMatch e) cTypes
   t <- newName "t"
@@ -124,14 +128,9 @@ makeTagFromSum funName tagType tagPrefix sumType sumPrefix cTypes = do
 -- | For each component type, get store and use explExists on the given entity
 makeGetTags :: String -> String -> String -> String -> [Name] -> Q [Dec]
 makeGetTags funName worldName tagType tagPrefix cTypes = do
-  m <- newName "m"
-  let worldT = ConT worldN
-      tagT   = ConT tagN
-      constraints = [ foldl AppT (ConT ''Get) [worldT, VarT m, ConT c] | c <- cTypes ]
-      bodyType = AppT (AppT ArrowT (ConT ''Entity))
-                   (foldl AppT (ConT ''SystemT) [worldT, VarT m, AppT ListT tagT])
-      fullType = ForallT [mkPlainTV m] constraints bodyType
-  sig <- sigD fName (pure fullType)
+  (m, sig) <- forallMSig fName ''Get worldN cTypes $ \m ->
+    AppT (AppT ArrowT (ConT ''Entity))
+      (foldl AppT (ConT ''SystemT) [ConT worldN, VarT m, AppT ListT (ConT tagN)])
   e <- newName "e"
   stmts <- mapM (makeStmt m e) cTypes
   decl <- funD fName [clause [varP e] (bodyS stmts) []]
@@ -183,14 +182,9 @@ makeHasTagsInstance worldName tagType getTagsFunName cTypes = do
 -- | For each component type with ExplMembers, count the number of entities that have that component.
 makeCountComponents :: String -> String -> String -> String -> [Name] -> Q [Dec]
 makeCountComponents funName worldName tagType tagPrefix cTypes = do
-  m <- newName "m"
-  let worldT = ConT worldN
-      tagT   = ConT tagN
-      constraints = [ foldl AppT (ConT ''Members) [worldT, VarT m, ConT c] | c <- cTypes ]
-      bodyType = foldl AppT (ConT ''SystemT)
-                   [worldT, VarT m, AppT ListT (foldl AppT (TupleT 2) [tagT, ConT ''Int])]
-      fullType = ForallT [mkPlainTV m] constraints bodyType
-  sig <- sigD fName (pure fullType)
+  (m, sig) <- forallMSig fName ''Members worldN cTypes $ \m ->
+    foldl AppT (ConT ''SystemT)
+      [ConT worldN, VarT m, AppT ListT (foldl AppT (TupleT 2) [ConT tagN, ConT ''Int])]
   stmts <- mapM (makeStmt m) cTypes
   decl <- funD fName [clause [] (bodyS stmts) []]
   pure [sig, decl]
