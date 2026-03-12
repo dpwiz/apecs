@@ -13,16 +13,11 @@ module Apecs.TH.Tags
   ) where
 
 import           Control.Monad        (filterM)
-import           Control.Monad.Trans.Reader (asks)
 import           Control.Monad.Trans.Class (lift)
-import           Data.Traversable     (for)
 import           Language.Haskell.TH
 
-import           Apecs.Core
-import           Apecs.Stores
-
-import           Apecs.Util           (EntityCounter)
-import           Apecs.TH             (hasStoreInstance)
+import Apecs.Core
+import Apecs.TH (hasStoreInstance)
 
 makeTaggedComponents :: String -> [Name] -> Q [Dec]
 makeTaggedComponents worldName cTypes = do
@@ -100,28 +95,29 @@ makeTagFromSum funName tagType tagPrefix sumType sumPrefix cTypes = do
     tagN  = mkName tagType
     sumN  = mkName sumType
 
+-- | For each component type, get store and use explExists on the given entity
 makeGetTags :: String -> String -> String -> String -> [Name] -> Q [Dec]
 makeGetTags funName worldName tagType tagPrefix cTypes = do
-  e <- newName "e"
-
   sig <- sigD fName [t| Entity -> SystemT $(conT worldN) IO [$(conT tagN)] |]
-
+  e <- newName "e"
   stmts <- mapM (makeStmt e) cTypes
-  let returnE = noBindS (appE (varE 'return) (appE (varE 'concat) (listE (map (varE . mkName . ("tag_" ++) . nameBase) cTypes))))
-  let body = doE (map pure stmts ++ [returnE])
-
-  decl <- funD fName [clause [varP e] (normalB body) []]
+  decl <- funD fName [clause [varP e] (bodyS stmts) []]
   pure [sig, decl]
   where
     fName = mkName funName
     tagN = mkName tagType
     worldN = mkName worldName
-
-    makeStmt e cType = do
-      let tagCon = mkName (tagPrefix ++ nameBase cType)
-          tagName = mkName ("tag_" ++ nameBase cType)
-      -- We need to give the store a specific type: Storage ComponentType
-      bindS (varP tagName) [| do
-        s <- getStore :: SystemT $(conT (mkName worldName)) IO (Storage $(conT cType))
-        has <- lift $ explExists s (unEntity $(varE e))
-        return (if has then [$(conE tagCon)] else []) |]
+    makeStmt e cType = bindS (varP tagName) body
+      where
+        tagName = mkName ("tag_" ++ nameBase cType)
+        tagCon = mkName (tagPrefix ++ nameBase cType)
+        body = [|
+          do
+            s <- getStore :: SystemT $(conT (mkName worldName)) IO (Storage $(conT cType))
+            has <- lift $ explExists s (unEntity $(varE e))
+            pure [$(conE tagCon) | has]
+          |]
+    bodyS stmts = normalB . doE $ map pure stmts ++ [resultE]
+      where
+        tagNames = map (varE . mkName . ("tag_" ++) . nameBase) cTypes
+        resultE = noBindS . appE (varE 'pure) $ appE (varE 'concat) $ listE tagNames
