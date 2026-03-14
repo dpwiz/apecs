@@ -64,14 +64,17 @@ makeComponentSum typeName consPrefix cTypes = pure [decl]
   where
     decl = DataD [] (mkName typeName) [] Nothing cons derivs
     cons = map (\c -> NormalC (mkName $ consPrefix ++ nameBase c) [(Bang NoSourceUnpackedness NoSourceStrictness, ConT c)]) cTypes
-    derivs = [ DerivClause Nothing (map ConT [''Show]) ]
+    derivs = [ DerivClause Nothing [ConT ''Show] ]
 
 makeTagLookup :: String -> String -> String -> String -> String -> String -> [Name] -> Q [Dec]
 makeTagLookup funName worldName tagType tagPrefix sumType sumPrefix cTypes = do
-  (_, sig) <- forallMSig fName ''Get worldN cTypes $ \m ->
-    AppT (AppT ArrowT (ConT ''Entity))
-      (AppT (AppT ArrowT (ConT tagN))
-        (foldl AppT (ConT ''SystemT) [ConT worldN, VarT m, AppT (ConT ''Maybe) (ConT sumN)]))
+  m <- newName "m"
+  sig <- forallCompClsSig fName ''Get worldN m cTypes
+    [t|
+      Entity ->
+      $(conT (mkName tagType)) ->
+      SystemT $(conT worldN) $(varT m) (Maybe $(conT (mkName sumType)))
+    |]
   e <- newName "e"
   matches <- mapM (makeMatch e) cTypes
   t <- newName "t"
@@ -79,13 +82,12 @@ makeTagLookup funName worldName tagType tagPrefix sumType sumPrefix cTypes = do
   decl <- funD fName [clause [varP e, varP t] (normalB body) []]
   pure [sig, decl]
   where
-    makeMatch e cType = match (conP tagCon []) (normalB [| fmap $(conE sumCon) <$> get $(varE e) |]) []
+    makeMatch e cType = match (conP tagCon []) (normalB matchBody) []
       where
+        matchBody = [| fmap $(conE sumCon) <$> get $(varE e) |]
         tagCon = mkName (tagPrefix ++ nameBase cType)
         sumCon = mkName (sumPrefix ++ nameBase cType)
     fName = mkName funName
-    tagN  = mkName tagType
-    sumN  = mkName sumType
     worldN = mkName worldName
 
 makeTagFromSum :: String -> String -> String -> String -> String -> [Name] -> Q [Dec]
@@ -110,16 +112,18 @@ makeTagFromSum funName tagType tagPrefix sumType sumPrefix cTypes = do
 -- | For each component type, get store and use explExists on the given entity
 makeGetTags :: String -> String -> String -> String -> [Name] -> Q [Dec]
 makeGetTags funName worldName tagType tagPrefix cTypes = do
-  (m, sig) <- forallMSig fName ''Get worldN cTypes $ \m ->
-    AppT (AppT ArrowT (ConT ''Entity))
-      (foldl AppT (ConT ''SystemT) [ConT worldN, VarT m, AppT ListT (ConT tagN)])
+  m <- newName "m"
+  sig <- forallCompClsSig fName ''Get worldN m cTypes
+    [t|
+      Entity ->
+      SystemT $(conT worldN) $(varT m) [$(conT $ mkName tagType)]
+    |]
   e <- newName "e"
   stmts <- mapM (makeStmt m e) cTypes
   decl <- funD fName [clause [varP e] (bodyS stmts) []]
   pure [sig, decl]
   where
     fName = mkName funName
-    tagN = mkName tagType
     worldN = mkName worldName
     makeStmt m e cType = bindS (varP tagName) body
       where
@@ -127,7 +131,7 @@ makeGetTags funName worldName tagType tagPrefix cTypes = do
         tagCon = mkName (tagPrefix ++ nameBase cType)
         body = [|
           do
-            s <- getStore :: SystemT $(conT (mkName worldName)) $(varT m) (Storage $(conT cType))
+            s <- getStore :: SystemT $(conT worldN) $(varT m) (Storage $(conT cType))
             has <- lift $ explExists s (unEntity $(varE e))
             pure [$(conE tagCon) | has]
           |]
@@ -142,31 +146,32 @@ makeGetTags funName worldName tagType tagPrefix cTypes = do
 makeHasTagsInstance :: String -> String -> String -> [Name] -> Q [Dec]
 makeHasTagsInstance worldName tagType getTagsFunName cTypes = do
   m <- newName "m"
-  let worldT = ConT worldN
-      mT     = VarT m
-      constraints = AppT (ConT ''Monad) mT
-                  : [ foldl AppT (ConT ''Get) [worldT, mT, ConT c] | c <- cTypes ]
-      instHead = AppT (AppT (ConT ''HasTags) worldT) mT
-      instBody = [ValD (VarP 'entityTags) (NormalB (VarE getTagsN)) []]
-      instDec = InstanceD Nothing constraints instHead instBody
-      tySynDec =
+  instDec <- instanceD
+    ((:) <$> [t| Monad $(varT m) |] <*> worldConstraints ''Get worldN m cTypes)
+    [t| HasTags $(conT worldN) $(varT m) |]
+    [ valD
+          (varP 'entityTags)
+          (normalB . varE $ mkName getTagsFunName)
+          []
+      ]
+
+  let tySynDec =
 #if MIN_VERSION_template_haskell(2,15,0)
-        TySynInstD (TySynEqn Nothing (AppT (ConT ''WTag) worldT) (ConT tagN))
+        TySynInstD $ TySynEqn Nothing (ConT ''WTag `AppT` ConT worldN) (ConT tagN)
 #else
-        TySynInstD ''WTag (TySynEqn [worldT] (ConT tagN))
+        TySynInstD ''WTag $ TySynEqn [ConT worldN] (ConT tagN)
 #endif
   pure [tySynDec, instDec]
   where
     worldN = mkName worldName
     tagN = mkName tagType
-    getTagsN = mkName getTagsFunName
 
 -- | For each component type with ExplMembers, count the number of entities that have that component.
 makeCountComponents :: String -> String -> String -> String -> [Name] -> Q [Dec]
 makeCountComponents funName worldName tagType tagPrefix cTypes = do
-  (m, sig) <- forallMSig fName ''Members worldN cTypes $ \m ->
-    foldl AppT (ConT ''SystemT)
-      [ConT worldN, VarT m, AppT ListT (foldl AppT (TupleT 2) [ConT tagN, ConT ''Int])]
+  m <- newName "m"
+  sig <- forallCompClsSig fName ''Members worldN m cTypes
+    [t| SystemT $(conT worldN) $(varT m) [($(conT tagN), Int)] |]
   stmts <- mapM (makeStmt m) cTypes
   decl <- funD fName [clause [] (bodyS stmts) []]
   pure [sig, decl]
@@ -189,20 +194,19 @@ makeCountComponents funName worldName tagType tagPrefix cTypes = do
         countNames = map (varE . mkName . ("count_" ++) . nameBase) cTypes
         resultE = noBindS . appE (varE 'pure) $ listE countNames
 
--- | Build a @forall m. (Cls World m C1, ...) => body@ type signature,
---   returning the fresh @m@ 'Name' for use in the function body.
-forallMSig :: Name -> Name -> Name -> [Name] -> (Name -> Type) -> Q (Name, Dec)
-forallMSig fName cls worldN cTypes mkBody = do
-  m <- newName "m"
-  let constraints = [ foldl AppT (ConT cls) [ConT worldN, VarT m, ConT c] | c <- cTypes ]
-      fullType = ForallT [mkPlainTV m] constraints (mkBody m)
-  sig <- sigD fName (pure fullType)
-  pure (m, sig)
+-- | Build a @f :: forall m. (Cls World m C1, ...) => body@ type signature
+forallCompClsSig :: Name -> Name -> Name -> Name -> [Name] -> Q Type -> Q Dec
+forallCompClsSig fName cls worldN m cTypes mkBody =
+  sigD fName $ forallT [mkPlainTV m] (worldConstraints cls worldN m cTypes) mkBody
+
+worldConstraints :: Name -> Name -> Name -> [Name] -> Q Cxt
+worldConstraints cls worldN m = traverse $ \c ->
+  [t| $(conT cls) $(conT worldN) $(varT m) $(conT c) |]
 
 #if MIN_VERSION_template_haskell(2,17,0)
 mkPlainTV :: Name -> TyVarBndr Specificity
 mkPlainTV n = PlainTV n SpecifiedSpec
 #else
 mkPlainTV :: Name -> TyVarBndr
-mkPlainTV n = PlainTV n
+mkPlainTV = PlainTV
 #endif
