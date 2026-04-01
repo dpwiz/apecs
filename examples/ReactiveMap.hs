@@ -8,37 +8,35 @@
 import Apecs
 import Apecs.Experimental.Reactive
 
-newtype Color = Color String deriving (Show, Eq, Ord)
-newtype Position = Position Int deriving (Show, Num)
+data Position = Position { x :: Int, y :: Int } deriving (Show, Eq, Ord)
 
--- We use an OrdMap for the Color component
-instance Component Color where type Storage Color = Reactive (OrdMap Color) (Map Color)
-instance Component Position where type Storage Position = Map Position
+-- We use an OrdMap for the Position component
+instance Component Position where type Storage Position = Reactive (OrdMap Position) (Map Position)
 
 -- We also demonstrate EnumMap
 data Status = Offline | Online | Away deriving (Show, Eq, Enum)
 instance Component Status where type Storage Status = Reactive (EnumMap Status) (Map Status)
 
-makeWorld "World" [''Color, ''Position, ''Status]
+makeWorld "World" [''Position, ''Status]
 
 game :: System World ()
 game = do
   -- Create some entities
-  newEntity (Color "red", Position 0, Online)
-  newEntity (Color "green", Position 1, Offline)
-  newEntity (Color "blue", Position 2, Online)
-  newEntity (Color "red", Position 3, Offline)
-  newEntity (Color "red", Position 4, Away)
-  newEntity (Color "blue", Position 5, Away)
+  newEntity (Position 0 0, Online)
+  newEntity (Position 1 1, Offline)
+  newEntity (Position 2 2, Online)
+  newEntity (Position 0 0, Offline)
+  newEntity (Position 0 0, Away)
+  newEntity (Position 2 2, Away)
 
-  -- Look up entities by color using the reactive OrdMap
-  redEntities <- withReactive $ ordLookup (Color "red")
-  blueEntities <- withReactive $ ordLookup (Color "blue")
-  greenEntities <- withReactive $ ordLookup (Color "green")
+  -- Look up entities by position using the reactive OrdMap
+  originEntities <- withReactive $ ordLookup (Position 0 0)
+  twotwoEntities <- withReactive $ ordLookup (Position 2 2)
+  oneoneEntities <- withReactive $ ordLookup (Position 1 1)
 
-  liftIO $ putStrLn $ "Red entities: " ++ show redEntities
-  liftIO $ putStrLn $ "Blue entities: " ++ show blueEntities
-  liftIO $ putStrLn $ "Green entities: " ++ show greenEntities
+  liftIO $ putStrLn $ "Entities at (0,0): " ++ show originEntities
+  liftIO $ putStrLn $ "Entities at (2,2): " ++ show twotwoEntities
+  liftIO $ putStrLn $ "Entities at (1,1): " ++ show oneoneEntities
 
   -- Look up entities by status using the reactive EnumMap
   onlineEntities <- withReactive $ enumLookup Online
@@ -50,19 +48,19 @@ game = do
   liftIO $ putStrLn $ "Offline entities: " ++ show offlineEntities
   liftIO $ putStrLn $ "Away entities: " ++ show awayEntities
 
-  -- Change a color and a status
-  cmap $ \(Color c, Position p) -> if c == "red" then Color "yellow" else Color c
+  -- Move entities at (0,0) to (3,3), and change Away to Online
+  cmap $ \(Position px py) -> if px == 0 && py == 0 then Position 3 3 else Position px py
   cmap $ \s -> if s == Away then Online else s
 
-  -- Look up entities by color and status again
-  redEntities' <- withReactive $ ordLookup (Color "red")
-  yellowEntities <- withReactive $ ordLookup (Color "yellow")
+  -- Look up entities by position and status again
+  originEntities' <- withReactive $ ordLookup (Position 0 0)
+  threethreeEntities <- withReactive $ ordLookup (Position 3 3)
   onlineEntities' <- withReactive $ enumLookup Online
   awayEntities' <- withReactive $ enumLookup Away
 
-  liftIO $ putStrLn "\nAfter changing red to yellow, and Away to Online:"
-  liftIO $ putStrLn $ "Red entities: " ++ show redEntities'
-  liftIO $ putStrLn $ "Yellow entities: " ++ show yellowEntities
+  liftIO $ putStrLn "\nAfter moving (0,0) to (3,3), and changing Away to Online:"
+  liftIO $ putStrLn $ "Entities at (0,0): " ++ show originEntities'
+  liftIO $ putStrLn $ "Entities at (3,3): " ++ show threethreeEntities
   liftIO $ putStrLn $ "Online entities: " ++ show onlineEntities'
   liftIO $ putStrLn $ "Away entities: " ++ show awayEntities'
 
