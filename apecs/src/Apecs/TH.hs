@@ -17,13 +17,19 @@ module Apecs.TH
   ) where
 
 import           Control.Monad        (filterM)
+import           Control.Monad.IO.Class (MonadIO)
 import           Control.Monad.Trans.Reader (asks)
 import           Data.Traversable     (for)
+import qualified Data.Kind as TL
 import           Language.Haskell.TH
 
 import           Apecs.Core
 import           Apecs.Stores
 import           Apecs.Util           (EntityCounter)
+
+type family WorldInitConstraints cs (m :: TL.Type -> TL.Type) :: TL.Constraint where
+  WorldInitConstraints () m = ()
+  WorldInitConstraints (c, cs) m = (ExplInit m (Storage c), WorldInitConstraints cs m)
 
 -- | Same as 'makeWorld', but does not include an 'EntityCounter'
 --   You don't typically want to use this, but it's exposed in case you know what you're doing.
@@ -40,7 +46,15 @@ makeWorldNoEC worldName cTypes = do
     dataD (pure []) world [] Nothing [normalC world fields] []
   -- World initialization
   init_world <- do
-    sig  <- sigD initWorldName [t| IO $(conT world) |]
+    m <- newName "m"
+    let mkNestedTupleT [] = ConT ''()
+        mkNestedTupleT (x:xs) = AppT (AppT (TupleT 2) (ConT x)) (mkNestedTupleT xs)
+        compTupleTy = mkNestedTupleT cTypes
+    let constraints =
+          [ AppT (ConT ''MonadIO) (VarT m)
+          , AppT (AppT (ConT ''WorldInitConstraints) compTupleTy) (VarT m)
+          ]
+    sig <- sigD initWorldName $  forallT [] (pure constraints) [t| $(varT m) $(conT world) |]
     decl <- funD initWorldName
       [ clause []
         (normalB $ foldl (\e _ -> [| $e <*> explInit |])
