@@ -146,6 +146,12 @@ instance Semigroup ShowVision where _ <> b = b
 instance Monoid ShowVision where mempty = ShowVision False
 instance Component ShowVision where type Storage ShowVision = Global ShowVision
 
+-- | Whether to draw the attack-range overlay. A 'Global' toggled from input.
+newtype ShowRange = ShowRange Bool
+instance Semigroup ShowRange where _ <> b = b
+instance Monoid ShowRange where mempty = ShowRange False
+instance Component ShowRange where type Storage ShowRange = Global ShowRange
+
 -- | Every component an entity owns, so we can delete it in one go (the extra
 -- deletes are harmless no-ops for entities that lack a component).
 type All = (Position, Health, Team, Kind, UnitType)
@@ -163,6 +169,7 @@ makeWorld
   , ''Phase
   , ''Plans
   , ''ShowVision
+  , ''ShowRange
   , ''Camera
   ]
 
@@ -706,7 +713,11 @@ draw = do
           )
           (mempty, 0 :: Int, 0 :: Int)
       ShowVision showV <- get global
-      visionPic <- if showV then visionOverlay else pure mempty
+      ShowRange showR <- get global
+      visionPic <-
+        mappend
+          <$> (if showV then visionOverlay else pure mempty)
+          <*> (if showR then rangeOverlay else pure mempty)
       ks <- get global :: SystemSTM KillScore
       wns <- get global :: SystemSTM Wins
       ph <- get global :: SystemSTM Phase
@@ -717,7 +728,7 @@ draw = do
   let hud =
         label (teamColor Red) (-310) 210 ("RED   pop " ++ show redPop ++ "   next " ++ show (planNext rPlan) ++ "   kills " ++ show kr ++ "   wins " ++ show wr)
           <> label (teamColor Blue) (-310) 190 ("BLUE  pop " ++ show bluePop ++ "   next " ++ show (planNext bPlan) ++ "   kills " ++ show kb ++ "   wins " ++ show wb)
-          <> label (greyN 0.5) (-310) (-230) "v: vision   esc: quit"
+          <> label (greyN 0.5) (-310) (-230) "v: vision   r: attack range   esc: quit"
       overlay = case phase of
         Playing -> mempty
         RoundOver w ->
@@ -765,9 +776,20 @@ visionOverlay = do
           ]
   pure (baseDiscs <> unitDiscs)
 
+-- | An unfilled ring at each soldier's attack reach, so Siege's longer bite is
+-- visible at a glance.
+rangeOverlay :: SystemSTM Picture
+rangeOverlay =
+  cfoldM
+    ( \acc (t :: Team, ut :: UnitType, Position (V2 x y)) ->
+        pure $ acc <> translate x y (color (withAlpha 0.5 (teamColor t)) (circle (typeRange ut)))
+    )
+    mempty
+
 handleEvent :: Event -> SystemIO ()
 handleEvent (EventKey (SpecialKey KeyEsc) Down _ _) = liftIO exitSuccess
 handleEvent (EventKey (Char 'v') Down _ _) = modify global (\(ShowVision b) -> ShowVision (not b))
+handleEvent (EventKey (Char 'r') Down _ _) = modify global (\(ShowRange b) -> ShowRange (not b))
 handleEvent _ = pure ()
 
 -- | Deliberately empty: all game logic runs on the forked threads.
@@ -784,6 +806,7 @@ main = do
   runWith w $ do
     set global (Camera 0 1)
     set global (ShowVision False)
+    set global (ShowRange False)
     void $ forkSys (coordinator cfg)
     if cHeadless cfg
       then do
