@@ -78,6 +78,21 @@ executable children
 
   default-language: Haskell2010
 
+executable stm-colony-war
+  hs-source-dirs:   .
+  main-is:          ColonyWar.hs
+  build-depends:
+      apecs
+    , apecs-gloss
+    , apecs-stm
+    , base         >=4.9 && <5
+    , linear
+    , random
+    , stm
+
+  default-language: Haskell2010
+  ghc-options:      -Wall -threaded -rtsopts "-with-rtsopts=-N"
+
 executable reactive-map
   main-is:          ReactiveMap.hs
   build-depends:
