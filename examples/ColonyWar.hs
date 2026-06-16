@@ -59,6 +59,8 @@ Build with @-threaded -N@ so the threads actually run in parallel.
 module Main (main) where
 
 import Control.Monad (forM_, void, when)
+import Data.List (intercalate)
+import qualified Data.Map.Strict as DM
 import Debug.Trace (traceM)
 import System.Environment (getArgs)
 
@@ -76,7 +78,7 @@ instance Component Position where type Storage Position = Map Position
 newtype Health = Health Float deriving (Show)
 instance Component Health where type Storage Health = Map Health
 
-data Team = Red | Blue deriving (Eq, Show)
+data Team = Red | Blue deriving (Eq, Ord, Show)
 instance Component Team where type Storage Team = Map Team
 
 -- | What an entity /is/. Soldiers fight and move; a Base is the stationary
@@ -85,7 +87,7 @@ data Kind = Soldier | Base deriving (Eq, Show)
 instance Component Kind where type Storage Kind = Map Kind
 
 -- | The rock-paper-scissors triad. Only soldiers carry one.
-data UnitType = Warrior | Scout | Siege deriving (Eq, Show, Enum, Bounded)
+data UnitType = Warrior | Scout | Siege deriving (Eq, Ord, Show, Enum, Bounded)
 instance Component UnitType where type Storage UnitType = Map UnitType
 
 -- | Kills scored this round, by (Red, Blue). A 'Global'.
@@ -95,6 +97,18 @@ instance Semigroup KillScore where
 instance Monoid KillScore where
   mempty = KillScore 0 0
 instance Component KillScore where type Storage KillScore = Global KillScore
+
+-- | Per-round damage ledger: how much damage each team's attacker type dealt
+-- to each enemy defender type. Keyed by (attacker team, attacker type,
+-- defender type). A shared 'Global' every attacker pokes -- the system is
+-- already all-conflicting through the position reads, so this hot cell adds
+-- little: it just rides the existing serialisation.
+newtype DamageLog = DamageLog (DM.Map (Team, UnitType, UnitType) Float)
+instance Semigroup DamageLog where
+  DamageLog a <> DamageLog b = DamageLog (DM.unionWith (+) a b)
+instance Monoid DamageLog where
+  mempty = DamageLog DM.empty
+instance Component DamageLog where type Storage DamageLog = Global DamageLog
 
 -- | Rounds won across the whole match, by (Red, Blue). A 'Global'.
 data Wins = Wins !Int !Int deriving (Show)
@@ -144,6 +158,7 @@ makeWorld
   , ''Kind
   , ''UnitType
   , ''KillScore
+  , ''DamageLog
   , ''Wins
   , ''Phase
   , ''Plans
@@ -296,6 +311,19 @@ addWin :: Team -> Wins -> Wins
 addWin Red (Wins r b) = Wins (r + 1) b
 addWin Blue (Wins r b) = Wins r (b + 1)
 
+-- | Record that @team@'s @atk@-type dealt @d@ damage to an enemy @def@-type.
+logDamage :: Team -> UnitType -> UnitType -> Float -> DamageLog -> DamageLog
+logDamage team atk def d (DamageLog m) = DamageLog (DM.insertWith (+) (team, atk, def) d m)
+
+-- | A team's ledger as one row per attacker type, each carrying the damage it
+-- dealt to (Warrior, Scout, Siege) defenders.
+teamMatrix :: Team -> DamageLog -> [(UnitType, (Int, Int, Int))]
+teamMatrix team (DamageLog m) =
+  [ (atk, (val atk Warrior, val atk Scout, val atk Siege)) | atk <- [Warrior, Scout, Siege]
+  ]
+  where
+    val atk def = round (DM.findWithDefault 0 (team, atk, def) m)
+
 teamPlan :: Team -> Plans -> TeamPlan
 teamPlan Red (Plans r _) = r
 teamPlan Blue (Plans _ b) = b
@@ -393,11 +421,14 @@ attack killer atkType victim = do
   when stillThere $ do
     Health h <- get victim
     k <- get victim
-    dmg <- case k of
-      Base -> pure (typeDamage atkType * (if atkType == Siege then 2 else 1))
+    (dmg, mDef) <- case k of
+      Base -> pure (typeDamage atkType * (if atkType == Siege then 2 else 1), Nothing)
       Soldier -> do
         defType <- get victim
-        pure (typeDamage atkType * advantage atkType defType)
+        pure (typeDamage atkType * advantage atkType defType, Just defType)
+    -- Ledger soldier-vs-soldier damage (the part actually applied).
+    forM_ mDef $ \defType ->
+      modify global (logDamage killer atkType defType (min dmg h))
     if h - dmg <= 0
       then do
         destroy victim (Proxy @All)
@@ -538,6 +569,7 @@ startRound cfg = do
   atomically $ do
     cmapM_ $ \(_ :: Team, e :: Entity) -> destroy e (Proxy @All)
     set global (mempty :: KillScore)
+    set global (mempty :: DamageLog)
     set global (Plans (initialPlan Red) (initialPlan Blue))
     set global Playing
   redBase <- atomically $ newEntity (Red, Base, Position (basePos Red), Health baseHp)
@@ -575,15 +607,17 @@ coordinator cfg = loop (1 :: Int)
     -- A gated 2 Hz pulse of each colony's live composition and current plan,
     -- so you can watch the triad counter-play shift through the fog.
     heartbeat = do
-      (ph, rc, bc, Plans rp bp) <- atomically $ do
+      (ph, rc, bc, Plans rp bp, DamageLog dm) <- atomically $ do
         ph <- get global
         rc <- teamCensus Red
         bc <- teamCensus Blue
         pl <- get global
-        pure (ph, rc, bc, pl)
+        dl <- get global
+        pure (ph, rc, bc, pl, dl)
+      let teamDmg t = round (sum [v | ((t', _, _), v) <- DM.toList dm, t' == t]) :: Int
       traceM $
-        "[hb] R " ++ showCensus rc ++ " next=" ++ show (planNext rp)
-          ++ " | B " ++ showCensus bc ++ " next=" ++ show (planNext bp)
+        "[hb] R " ++ showCensus rc ++ " next=" ++ show (planNext rp) ++ " dmg=" ++ show (teamDmg Red)
+          ++ " | B " ++ showCensus bc ++ " next=" ++ show (planNext bp) ++ " dmg=" ++ show (teamDmg Blue)
       when (isPlaying ph) (threadDelay 500000 >> heartbeat)
 
     teamCensus team =
@@ -602,8 +636,8 @@ coordinator cfg = loop (1 :: Int)
         Nothing -> threadDelay (cPoll cfg) >> waitWinner redBase blueBase
 
     report n winner = do
-      KillScore kr kb <- atomically (get global)
-      Wins wr wb <- atomically (get global)
+      (KillScore kr kb, Wins wr wb, dl) <-
+        atomically ((,,) <$> get global <*> get global <*> get global)
       liftIO . putStrLn $
         concat
           [ "Round "
@@ -619,6 +653,13 @@ coordinator cfg = loop (1 :: Int)
           , "/"
           , show wb
           ]
+      liftIO $ putStrLn ("  RED  " ++ matrixLine (teamMatrix Red dl))
+      liftIO $ putStrLn ("  BLUE " ++ matrixLine (teamMatrix Blue dl))
+
+    -- One-line ledger: each attacker type with the damage it dealt to
+    -- (vs Warrior / vs Scout / vs Siege).
+    matrixLine rows =
+      "damage " ++ intercalate "  " [show atk ++ " " ++ show (w, s, c) | (atk, (w, s, c)) <- rows]
 
 -- Rendering & input (main thread) -------------------------------------------
 
@@ -644,7 +685,7 @@ draw = do
   -- never a half-destroyed unit, even with hundreds of threads mutating the
   -- stores. Bases, soldiers, populations and the optional vision overlay all
   -- come from this one snapshot.
-  (visionPic, basePic, soldierPic, redPop, bluePop, KillScore kr kb, Wins wr wb, phase, Plans rPlan bPlan) <-
+  (visionPic, basePic, soldierPic, redPop, bluePop, KillScore kr kb, Wins wr wb, phase, Plans rPlan bPlan, dl) <-
     atomically $ do
       basePic <-
         cfoldM
@@ -670,7 +711,8 @@ draw = do
       wns <- get global :: SystemSTM Wins
       ph <- get global :: SystemSTM Phase
       pl <- get global :: SystemSTM Plans
-      pure (visionPic, basePic, soldierPic, rp, bp, ks, wns, ph, pl)
+      dmg <- get global :: SystemSTM DamageLog
+      pure (visionPic, basePic, soldierPic, rp, bp, ks, wns, ph, pl, dmg)
   -- Two left-aligned rows: a single long row clips off the right window edge.
   let hud =
         label (teamColor Red) (-310) 210 ("RED   pop " ++ show redPop ++ "   next " ++ show (planNext rPlan) ++ "   kills " ++ show kr ++ "   wins " ++ show wr)
@@ -679,12 +721,30 @@ draw = do
       overlay = case phase of
         Playing -> mempty
         RoundOver w ->
-          color (withAlpha 0.6 black) (rectangleSolid 660 500)
-            <> label white (-150) 60 "ROUND OVER"
-            <> label (teamColor w) (-150) 10 (show w ++ " TEAM WINS")
-            <> label white (-150) (-40) ("kills  R " ++ show kr ++ "   B " ++ show kb)
-            <> label white (-150) (-80) ("match  R " ++ show wr ++ "   B " ++ show wb)
+          color (withAlpha 0.74 black) (rectangleSolid 660 500)
+            <> label white (-58) 215 "ROUND OVER"
+            <> label (teamColor w) (-85) 185 (show w ++ " TEAM WINS")
+            <> label white (-150) 158 ("kills R " ++ show kr ++ " / B " ++ show kb ++ "     match R " ++ show wr ++ " / B " ++ show wb)
+            <> damageBlock (teamColor Red) (-312) 116 "RED damage  (attacker vs defender)" (teamMatrix Red dl)
+            <> damageBlock (teamColor Blue) (-312) (-24) "BLUE damage  (attacker vs defender)" (teamMatrix Blue dl)
   pure (visionPic <> basePic <> soldierPic <> hud <> overlay)
+
+-- | A round-end ledger block: a title and one line per attacker type listing
+-- the damage it dealt to (vs Warrior / vs Scout / vs Siege).
+damageBlock :: Color -> Float -> Float -> String -> [(UnitType, (Int, Int, Int))] -> Picture
+damageBlock col x y title rows =
+  smallLabel col x y title
+    <> mconcat
+      [ smallLabel col x (y - 18 * fromIntegral (i + 1)) (rowText atk w s c)
+      | (i, (atk, (w, s, c))) <- zip [0 :: Int ..] rows
+      ]
+  where
+    rowText atk w s c =
+      pad 9 (show atk) ++ "vsW " ++ pad 6 (show w) ++ "vsS " ++ pad 6 (show s) ++ "vsC " ++ show c
+    pad n s = take n (s ++ repeat ' ')
+
+smallLabel :: Color -> Float -> Float -> String -> Picture
+smallLabel col x y = color col . translate x y . scale 0.1 0.1 . Text
 
 -- | Faint discs for every sight source: a big one per base, a small one per
 -- soldier (Scouts reach furthest). Overlapping discs build up where a colony's
@@ -728,5 +788,12 @@ main = do
     if cHeadless cfg
       then do
         threadDelay (cMaxSeconds cfg * 1000000)
-        liftIO $ putStrLn "=== headless time limit reached ==="
+        dl <- atomically (get global)
+        liftIO $ do
+          putStrLn "=== headless time limit reached ==="
+          putStrLn ("  RED  " ++ matrixDump (teamMatrix Red dl))
+          putStrLn ("  BLUE " ++ matrixDump (teamMatrix Blue dl))
       else play (InWindow "STM Colony War" (660, 500) (10, 10)) black 60 draw handleEvent step
+  where
+    matrixDump rows =
+      "damage " ++ intercalate "  " [show atk ++ " " ++ show wsc | (atk, wsc) <- rows]

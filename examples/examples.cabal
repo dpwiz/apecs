@@ -86,6 +86,7 @@ executable stm-colony-war
     , apecs-gloss
     , apecs-stm
     , base         >=4.9 && <5
+    , containers
     , linear
     , random
     , stm
