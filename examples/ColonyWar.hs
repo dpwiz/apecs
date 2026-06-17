@@ -176,6 +176,34 @@ instance Monoid Plans where
   mempty = Plans (TeamPlan Hunter (V2 0 0) 1) (TeamPlan Hunter (V2 0 0) 1)
 instance Component Plans where type Storage Plans = Global Plans
 
+-- | A colony's fading recollection of where it has /seen/ the enemy: decaying
+-- enemy weight on the top (+y) and bottom (-y) flank, plus the flank it has
+-- committed its maneuver force to. Memory, not a live read -- so a colony still
+-- defends/avoids an axis after the enemy slips back into the fog, and the two
+-- colonies (seeing different things) diverge instead of mirroring.
+data Threat = Threat
+  { thUp :: !Float
+  , thDown :: !Float
+  , thGap :: !Float
+  }
+  deriving (Show)
+
+-- | Both colonies' threat memory, by (Red, Blue). Seeded /asymmetrically/ (Red
+-- favours the top flank, Blue the bottom) so the opening is not a mirror.
+data ThreatMem = ThreatMem Threat Threat deriving (Show)
+instance Semigroup ThreatMem where _ <> b = b
+instance Monoid ThreatMem where
+  mempty = ThreatMem (Threat 0 0 1) (Threat 0 0 (-1))
+instance Component ThreatMem where type Storage ThreatMem = Global ThreatMem
+
+teamThreat :: Team -> ThreatMem -> Threat
+teamThreat Red (ThreatMem r _) = r
+teamThreat Blue (ThreatMem _ b) = b
+
+setTeamThreat :: Team -> Threat -> ThreatMem -> ThreatMem
+setTeamThreat Red t (ThreatMem _ b) = ThreatMem t b
+setTeamThreat Blue t (ThreatMem r _) = ThreatMem r t
+
 -- | Whether to draw the vision overlay. A 'Global' toggled from input.
 newtype ShowVision = ShowVision Bool
 instance Semigroup ShowVision where _ <> b = b
@@ -222,6 +250,7 @@ makeWorld
   , ''Wins
   , ''Phase
   , ''Plans
+  , ''ThreatMem
   , ''ShowVision
   , ''ShowRange
   , ''ShowAttacks
@@ -812,19 +841,37 @@ planFor team = do
     cfold
       (\acc (t :: Team, ut :: UnitType) -> if t == team then bumpType ut acc else acc)
       (0, 0, 0)
+  Threat up0 down0 g0 <- teamThreat team <$> get global
   let visible = [(q, ut) | (q, ut) <- enemies, seenBy sources q]
       census = foldr (bumpType . snd) (0, 0, 0) visible
       waypoint = chooseWaypoint team (map fst visible)
-      -- The open flank for the maneuver force: the vertical half (top +y /
-      -- bottom -y) holding fewer of the enemies we can see. Recon pull -- the
-      -- gap is chosen from what the fog actually reveals. Ties / a dark field
-      -- default to the top.
-      up = length [() | (V2 _ y, _) <- visible, y > 0]
-      down = length [() | (V2 _ y, _) <- visible, y <= 0]
-      gap = if down < up then -1 else 1
+      -- Fold this pass's sightings into the decaying flank memory, then commit
+      -- the maneuver to the flank the colony /remembers/ as emptier (with
+      -- hysteresis). Memory, not a live read, so the choice persists after the
+      -- enemy slips into the fog -- and the two colonies, seeing different
+      -- things, diverge instead of both lunging at the same flank.
+      upSeen = fromIntegral (length [() | (V2 _ y, _) <- visible, y > 0])
+      downSeen = fromIntegral (length [() | (V2 _ y, _) <- visible, y <= 0])
+      up' = up0 * threatDecay + upSeen
+      down' = down0 * threatDecay + downSeen
+      gap = chooseGap g0 up' down'
+  modify global (setTeamThreat team (Threat up' down' gap))
   modify global (setTeamPlan team (TeamPlan (planNextFor own (length visible) census) waypoint gap))
   where
     seenBy srcs q = any (\(s, r) -> quadrance (q - s) <= r * r) srcs
+
+-- | How fast flank memory fades each planning pass (0 = goldfish, 1 = elephant).
+threatDecay :: Float
+threatDecay = 0.75
+
+-- | Commit the maneuver to the flank remembered as emptier, with hysteresis:
+-- only switch when the other flank is clearly (≥40%) lighter, so the force does
+-- not dither between flanks every planning tick.
+chooseGap :: Float -> Float -> Float -> Float
+chooseGap g0 up down
+  | up < down * 0.6 = 1 -- top clearly emptier -> flank top
+  | down < up * 0.6 = -1 -- bottom clearly emptier -> flank bottom
+  | otherwise = g0 -- ambiguous: hold the committed flank
 
 -- | Muster on the enemy the colony can see; with the field dark, press forward
 -- and march on the enemy base so a won fight turns into a breakthrough instead
@@ -920,6 +967,7 @@ startRound cfg = do
     set global (mempty :: KillScore)
     set global (mempty :: DamageLog)
     set global (Plans (initialPlan Red) (initialPlan Blue))
+    set global (mempty :: ThreatMem) -- asymmetric flank seed: Red top, Blue bottom
     set global Playing
   redBase <- atomically $ newEntity (Red, Base, Position (basePos Red), Health baseHp)
   blueBase <- atomically $ newEntity (Blue, Base, Position (basePos Blue), Health baseHp)

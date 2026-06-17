@@ -72,9 +72,35 @@ base dealing no damage.
   unambiguously the **mirror-flank symmetry**, not the razing. Process lesson
   saved to memory: instrument *objective accomplishment*, not just existence.
 
-### Next (the real blocker)
-- **Threat memory (point 2) + break the mirror:** drive the gap from each side's
-  own (different, fog-limited) recon memory of where the enemy massed → divergent
-  flanks → a flank finds a genuinely undefended base. Memory does double duty:
-  anticipation *and* the symmetry-break.
+## Increment 3: threat memory — and rounds finally END
+
+Also: rounds now start **from scratch** (no opening platoon) — the opening is a
+recon-and-build contest.
+
+Added a per-team **`Threat`** memory (Global `ThreatMem`): decaying enemy weight
+on the top/bottom flank, from *that* team's own fog-limited sightings, plus the
+flank it has committed its maneuver force to. Each planning pass decays the
+memory (`threatDecay`=0.75), folds in this pass's sightings, and `chooseGap`
+commits the maneuver to the remembered-emptier flank with hysteresis. Crucially
+the memory is **seeded asymmetrically** — Red favours the top flank, Blue the
+bottom — so the opening is not a mirror.
+
+### Result — the stalemate is broken
+- **Rounds resolve**: 3 rounds in a 180 s headless run (~60 s each), both sides
+  winning (2 Blue / 1 Red). The asymmetric flanks no longer collide; a flank
+  reaches the lightly-held base (`siege`>0, base HP falls).
+- **Real battles, not grinds**: 20–50 kills/round (was 1000+ symmetric).
+- **Maneuver beats attrition**: Round 3 Red *won while losing the body-count
+  36/48* — it razed the base by maneuver. Exactly the MCDP1 outcome we wanted.
+
+This is the milestone the whole arc was blocked on. The combination that did it:
+emergent cycle + press + fix-and-flank task forces + recon saturation + mixed
+builds + the base-razing fix + **asymmetric memory-driven flanks**.
+
+### Next
+- **Defensive anticipation (point 2, the other half):** the same memory should
+  make a colony *screen its own threatened flank* — right now nobody defends, so
+  the flank razes a free base (rounds may end too cheaply). Defense makes the
+  flank *earn* it → counterplay and drama.
 - **Mass-before-commit** for the flank; remove the last gladiatorial nudge.
+- A ~100-round batch to certify fairness (Wilson CI), once it feels right.
