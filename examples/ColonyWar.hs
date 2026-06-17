@@ -66,6 +66,7 @@ import Control.Monad (foldM, forM_, void, when)
 import Data.Bits (shiftR, xor)
 import Data.Char (toLower)
 import Data.List (intercalate, isPrefixOf, partition)
+import Data.Maybe (isJust)
 import qualified Data.Map.Strict as DM
 import Debug.Trace (traceM)
 import System.Environment (getArgs)
@@ -166,10 +167,18 @@ instance Monoid Wins where
   mempty = Wins 0 0
 instance Component Wins where type Storage Wins = Global Wins
 
--- | The shared round state. A 'Global'; last write wins. 'RoundDraw' is a
--- legitimate mutual loss: both spawners fell within the grace countdown, so both
--- colonies committed equally suicidally.
-data Phase = Playing | RoundOver Team | RoundDraw deriving (Eq, Show)
+-- | Why a round drew. 'MutualFall' = both spawners fell within the grace
+-- countdown (both committed equally suicidally). 'Stalemate' = the round cap was
+-- hit with both spawners still standing (neither could crack the other) -- these
+-- read very differently and must never be conflated.
+data DrawReason = MutualFall | Stalemate deriving (Eq, Show)
+
+-- | The outcome of a round, as decided by the coordinator.
+data Outcome = Win Team | Draw DrawReason deriving (Eq, Show)
+
+-- | The shared round state. A 'Global'; last write wins. 'RoundDraw' carries the
+-- reason so the scoreboard tells the truth about which kind of draw it was.
+data Phase = Playing | RoundOver Team | RoundDraw DrawReason deriving (Eq, Show)
 instance Semigroup Phase where _ <> b = b
 instance Monoid Phase where mempty = Playing
 instance Component Phase where type Storage Phase = Global Phase
@@ -182,6 +191,17 @@ data TeamPlan = TeamPlan
   { planNext :: !UnitType
   , planWaypoint :: !(V2 Float)
   , planGap :: !Float
+  , -- | The enemy spawner's position, /once a friendly unit has actually seen it/.
+    -- 'Nothing' until discovered: the strike force may not be aimed at a base it
+    -- has never laid eyes on -- recon must re-acquire it each round. Sticky within
+    -- a round (remembered after it slips back into the fog); reset at round start.
+    planEnemyBase :: !(Maybe (V2 Float))
+  , -- | The earned centroid of where the enemy actually IS, from sightings. The
+    -- colony does not know which way the enemy lies -- recon must find it. While
+    -- this is 'Nothing' the colony is blind: recon explores outward in every
+    -- bearing and the force holds at home (no compass to rush). Once recon makes
+    -- contact the force is /pulled/ to it. Sticky within a round.
+    planContact :: !(Maybe (V2 Float))
   }
   deriving (Show)
 
@@ -190,7 +210,7 @@ data TeamPlan = TeamPlan
 data Plans = Plans TeamPlan TeamPlan deriving (Show)
 instance Semigroup Plans where _ <> b = b
 instance Monoid Plans where
-  mempty = Plans (TeamPlan Hunter (V2 0 0) 1) (TeamPlan Hunter (V2 0 0) 1)
+  mempty = Plans (TeamPlan Hunter (V2 0 0) 1 Nothing Nothing) (TeamPlan Hunter (V2 0 0) 1 Nothing Nothing)
 instance Component Plans where type Storage Plans = Global Plans
 
 -- | A colony's fading recollection of where it has /seen/ the enemy: decaying
@@ -321,10 +341,6 @@ data Config = Config
   , cKite :: Bool
   -- ^ Whether a soldier that out-ranges /and/ out-runs its target kites it
   -- (fires while backing off to hold the range gap). Ablation flag for exp 003.
-  , cTriad :: Bool
-  -- ^ Legacy: whether the old rock-paper-scissors /damage multiplier/ applies.
-  -- Off in the live game (the cycle is emergent now); kept so the harness can
-  -- still reproduce the pre-redesign stat-triad experiments with @--triad@.
   , cArena :: Float
   -- ^ Matchup harness only: if > 0, clamp positions to a +/- this square so
   -- kiters can be cornered (0 = unbounded). The full game uses its own field.
@@ -345,7 +361,6 @@ displayCfg =
     , cDebug = False
     , cMuster = True
     , cKite = True
-    , cTriad = False
     , cArena = 0
     }
 
@@ -364,7 +379,6 @@ headlessCfg =
     , cDebug = True
     , cMuster = True
     , cKite = True
-    , cTriad = False
     , cArena = 0
     }
 
@@ -373,8 +387,13 @@ dbg cfg msg = when (cDebug cfg) (traceM msg)
 
 -- Tunables ------------------------------------------------------------------
 
+-- | Population ceiling per colony. We want this in the thousands (it's a
+-- concurrency lab; green threads are cheap) -- but the per-tick neighbour scan is
+-- currently O(n^2) (every unit folds over every entity), so the sim, not the
+-- threads, is the wall. Held at an interim smooth value until a spatial index
+-- makes neighbour queries O(1) and we can truly let them rip.
 capPerTeam :: Int
-capPerTeam = 34
+capPerTeam = 64
 
 baseHp :: Float
 baseHp = 380
@@ -403,12 +422,6 @@ musterMin = 3
 flankY, flankTurnIn :: Float
 flankY = 250
 flankTurnIn = 150
-
--- | A team's staging point: in front of its base, on the line to the enemy.
-rallyPoint :: Team -> V2 Float
-rallyPoint team = b + normalize (basePos (enemyOf team) - b) ^* rallyDist
-  where
-    b = basePos team
 
 -- | Soldiers shove each other apart so they don't stack into one pixel. This
 -- packing is deliberately tight: concentration is what lets a winning army
@@ -547,12 +560,10 @@ setTeamPlan :: Team -> TeamPlan -> Plans -> Plans
 setTeamPlan Red p (Plans _ b) = Plans p b
 setTeamPlan Blue p (Plans r _) = Plans r p
 
--- | A forward muster point at round start: a third of the way to the foe.
+-- | At round start a colony is blind: it musters at home and knows neither where
+-- the enemy is nor which way it lies. Recon must find out.
 initialPlan :: Team -> TeamPlan
-initialPlan team = TeamPlan Hunter (b + (e - b) ^* 0.35) 1
-  where
-    b = basePos team
-    e = basePos (enemyOf team)
+initialPlan team = TeamPlan Hunter (basePos team) 1 Nothing Nothing
 
 -- Per-soldier AI ------------------------------------------------------------
 
@@ -612,7 +623,7 @@ stepUnit cfg ety = do
             (s : _) -> Just s
             [] -> Nothing
       case struck of
-        Just (tEnt, _) -> attack cfg myTeam myType tEnt
+        Just (tEnt, _) -> attack myTeam myType tEnt
         Nothing -> pure ()
       -- Record (display only) a tracer to whatever we hit, or clear last tick's.
       when (not (cHeadless cfg)) $ case struck of
@@ -630,7 +641,6 @@ stepUnit cfg ety = do
       let wp = planWaypoint plan
           gap = planGap plan
           supported = not (cMuster cfg) || allyNear + 1 >= musterMin
-          rally = rallyPoint myTeam
           -- Kiting: if I out-range and out-run my target, hold it at the edge of
           -- my reach -- close in if it slips out, back straight off if it gets
           -- too near -- so I keep firing while it never lands a blow.
@@ -645,30 +655,55 @@ stepUnit cfg ety = do
                    in Just (p + away ^* 60) -- too close: back off, still firing
               | otherwise -> Nothing -- in the sweet spot: hold and fire
             _ -> Nothing
-          -- The maneuver path: sweep wide to (enemyBaseX, gap*flankY), clear of
-          -- the frontal grind, then turn in and crash the lightly-held base.
-          enemyBase = basePos (enemyOf myTeam)
-          flankDest =
-            let V2 ebx _ = enemyBase
-                V2 px _ = p
-             in if abs (px - ebx) > flankTurnIn then V2 ebx (gap * flankY) else enemyBase
-          -- Recon saturates the WHOLE field -- own half (security / early warning
-          -- of a backstab) through the enemy half -- via a low-discrepancy
-          -- (golden-ratio) scatter over depth and height, so it covers ground
-          -- instead of forming a rigid line.
+          -- The colony assumes NOTHING about where the enemy is. The strike may
+          -- only be aimed at a spawner recon has SEEN ('planEnemyBase'); the force
+          -- only knows where the enemy lies once recon makes contact
+          -- ('planContact'). Both are earned, never handed out.
+          mEnemyBase = planEnemyBase plan
+          mContact = planContact plan
           homeBase = basePos myTeam
-          reconScout =
-            let V2 ebx _ = enemyBase
-                V2 obx _ = homeBase
-                Entity eid = ety
-                frac z = z - fromIntegral (floor z :: Int)
-                -- R2 (Roberts) low-discrepancy sequence: two INDEPENDENT
-                -- irrationals (1/plastic, 1/plastic^2). The old pair (0.618,
-                -- 0.382 = 1-0.618) was linearly dependent, collapsing the scatter
-                -- onto a line; these genuinely tile the 2D field.
-                sx = frac (fromIntegral eid * 0.7548776662)
-                sy = frac (fromIntegral eid * 0.5698402910) * 2 - 1
-             in V2 (obx + (ebx - obx) * sx) (sy * 280)
+          Entity eid = ety
+          frac z = z - fromIntegral (floor z :: Int)
+          -- A distinct bearing + depth per unit (R2/Roberts: two INDEPENDENT
+          -- irrationals 1/plastic, 1/plastic^2 -- the old 0.618/0.382 pair was
+          -- linearly dependent and collapsed onto a line).
+          uang = 2 * pi * frac (fromIntegral eid * 0.5698402910)
+          udepth = frac (fromIntegral eid * 0.7548776662)
+          udir = V2 (cos uang) (sin uang)
+          -- The home holding ring: where the force waits when it has no contact
+          -- and so no direction to commit to -- fanned by bearing to watch every
+          -- approach, not bunched on the spawner.
+          stagePoint = homeBase + udir ^* rallyDist
+          -- The maneuver path, once the base is known: sweep wide along the open
+          -- flank (clear of the y≈0 grind) then turn in and crash it.
+          flankDest eb =
+            let V2 ebx _ = eb
+                V2 px _ = p
+             in if abs (px - ebx) > flankTurnIn then V2 ebx (gap * flankY) else eb
+          -- Recon explores to FIND the enemy, then keeps eyes on him. Blind, it
+          -- fans out in every bearing from home, ranging deep (the enemy could be
+          -- any direction). In contact, it closes on the contact area to map the
+          -- force and hunt the spawner. With the spawner found, half the scouts
+          -- picket it (keep the fix fresh) while the rest track the force.
+          picket = even (mix64 eid)
+          reconScout = case (mEnemyBase, mContact) of
+            (Just eb, _)
+              | picket -> eb + udir ^* (typeVision myType * 0.85)
+              | otherwise -> eb + udir ^* (60 + 200 * udepth)
+            -- In contact, spawner still hidden: do NOT abandon the posts and pile
+            -- onto the fight. Hold a distributed observation NET -- each scout keeps
+            -- its own bearing (tilted toward the contact sector, spread retained)
+            -- and its own depth, the net spanning from the approach out to where the
+            -- base must be. Shallow posts keep the field watched; the deepest probe
+            -- through toward the spawner. Coverage is maintained, not collapsed.
+            (Nothing, Just c) ->
+              let toC = c - homeBase
+                  dist = sqrt (quadrance toC)
+                  bear = if dist > 1 then toC ^/ dist else udir
+                  mixed = bear ^* 0.6 + udir ^* 0.4
+                  mdir = if quadrance mixed > 1e-6 then normalize mixed else bear
+               in homeBase + mdir ^* (max 200 dist * (0.4 + 1.6 * udepth))
+            (Nothing, Nothing) -> homeBase + udir ^* (220 + 760 * udepth)
           -- Counter-recon: an enemy /scout/ nearby gets hunted (deny their eyes);
           -- a real threat it can't kite gets fled (a scout rarely outvalues itself).
           enemyScoutNear = mUnitType == Just Hunter && case mUnit of
@@ -686,15 +721,27 @@ stepUnit cfg ety = do
           -- slipping under a too-distant ring while the defenders hold position,
           -- blind, as the base is razed behind them.
           ringPoint =
-            let Entity eid = ety
-                ang = fromIntegral eid * 2.39996323
-             in homeBase + V2 (cos ang) (sin ang) ^* (baseRadius * 2.5)
+            let rang = fromIntegral eid * 2.39996323
+             in homeBase + V2 (cos rang) (sin rang) ^* (baseRadius * 2.5)
           homeThreatR2 = sq 240
           dest = case myRole of
-            -- Maneuver force: ignore the frontal fight, head for the base.
-            Flank -> Just flankDest
+            -- Maneuver force: once recon has FOUND the spawner, ignore the frontal
+            -- fight and crash it. Until then, do not march on a rumour -- stage
+            -- forward at the muster and let recon acquire it; and if it blunders
+            -- into trouble in the dark, pull back rather than feed itself in.
+            Flank -> case mEnemyBase of
+              -- Spawner found: commit -- sweep wide and crash it.
+              Just eb -> Just (flankDest eb)
+              Nothing -> case mContact of
+                -- In contact but spawner not yet found: advance to the contact
+                -- muster to support the find; pull back if it hits trouble blind.
+                Just _
+                  | reconDanger -> Just fleePoint
+                  | otherwise -> Just wp
+                -- No contact at all: hold the home ring -- no bearing to commit to.
+                Nothing -> Just stagePoint
             -- Recon: kite what it can, hunt enemy scouts, flee what would kill it,
-            -- otherwise spread and scout the whole field.
+            -- otherwise explore/observe per reconScout.
             Recon
               | Just kd <- kiteDest -> Just kd
               | enemyScoutNear -> case mUnit of Just (_, tPos, _) -> Just tPos; Nothing -> Just reconScout
@@ -704,16 +751,21 @@ stepUnit cfg ety = do
             Defend -> case mUnit of
               Just (_, tPos, _) | quadrance (tPos - homeBase) <= homeThreatR2 -> Just tPos
               _ -> Just ringPoint
-            -- Main body: fix the enemy front (press into melee when supported,
-            -- else fall back and mass at the rally point).
+            -- Main body: when recon has made contact, fix the enemy front (press
+            -- into melee when supported, else mass at the home ring). With no
+            -- contact, hold the home ring -- there is no front to march on yet.
             MainBody
               | Just kd <- kiteDest -> Just kd
               | supported -> case target of
                   Just (_, tPos, _) -> Just tPos
-                  Nothing
-                    | quadrance (wp - p) > waypointReach2 -> Just wp
-                    | otherwise -> Nothing
-              | quadrance (rally - p) > waypointReach2 -> Just rally
+                  Nothing -> case mContact of
+                    Just _
+                      | quadrance (wp - p) > waypointReach2 -> Just wp
+                      | otherwise -> Nothing
+                    Nothing
+                      | quadrance (stagePoint - p) > waypointReach2 -> Just stagePoint
+                      | otherwise -> Nothing
+              | quadrance (stagePoint - p) > waypointReach2 -> Just stagePoint
               | otherwise -> Nothing
           approach = case dest of
             Just d -> normalize (d - p) ^* (speed * dt)
@@ -730,7 +782,12 @@ stepUnit cfg ety = do
             (_, Just _) -> V2 0 0
             _ | quadrance coh > 1e-6 -> normalize coh ^* cohesionPull
               | otherwise -> V2 0 0
-      set ety (Position (p + approach + sep + cohesion))
+      -- Cap the summed separation to a few advance-steps so a dense crowd still
+      -- flows toward its objective (a big pile sums many small pushes); enough to
+      -- spread the spawn, not so much it overwhelms the advance.
+      let sepCap = speed * dt * 4
+          sepClamped = if quadrance sep > sepCap * sepCap then normalize sep ^* sepCap else sep
+      set ety (Position (p + approach + sepClamped + cohesion))
       pure True
   where
     dt = fromIntegral (cTick cfg) / 1e6
@@ -742,8 +799,13 @@ stepUnit cfg ety = do
         seen = t /= myTeam && d2 <= vis2
         sep'
           | k == Soldier && e /= ety && d2 > 1e-6 && d2 < collideDist2 =
+              -- Linear falloff (sepStrength at contact, 0 at collideDist) instead
+              -- of the old 1/d term that blew up as d->0 -- at high density a pile
+              -- of near-coincident units produced an unbounded force that swamped
+              -- the advance step and gridlocked the crowd. Direction only; the
+              -- total is magnitude-capped at the integration site.
               let d = sqrt d2
-               in sep + (p - q) ^* ((collideDist - d) / d * sepStrength)
+               in sep + normalize (p - q) ^* (sepStrength * (collideDist - d) / collideDist)
           | otherwise = sep
         -- Friendly soldiers close enough to count as local support.
         allies'
@@ -767,12 +829,12 @@ stepUnit cfg ety = do
       _ -> Just (e, q, d2)
 
 {- | Deal damage to a victim within the caller's transaction. Soldier-vs-soldier
-damage is flat (the counter cycle is emergent, not a multiplier) unless 'cTriad'
-is on for a legacy experiment; a Lance does double against a base. Soldier kills
-score; razing a base does not (the coordinator notices that separately).
+damage is flat -- the counter cycle is emergent (range/speed/HP + kiting), not a
+multiplier; a Lance does double against a base. Soldier kills score; razing a base
+does not (the coordinator notices that separately).
 -}
-attack :: Config -> Team -> UnitType -> Entity -> SystemSTM ()
-attack cfg killer atkType victim = do
+attack :: Team -> UnitType -> Entity -> SystemSTM ()
+attack killer atkType victim = do
   stillThere <- exists victim (Proxy @Health)
   when stillThere $ do
     Health h <- get victim
@@ -781,8 +843,7 @@ attack cfg killer atkType victim = do
       Base -> pure (typeDamage atkType * (if atkType == Lance then 2 else 1), Nothing)
       Soldier -> do
         defType <- get victim
-        let mult = if cTriad cfg then advantage atkType defType else 1.0
-        pure (typeDamage atkType * mult, Just defType)
+        pure (typeDamage atkType, Just defType)
     -- Ledger the applied damage: soldier-vs-soldier into the type matrix, base
     -- damage into the center-of-gravity ledger.
     case mDef of
@@ -844,6 +905,14 @@ minDiversity = 0.2
 confidentSightings :: Int
 confidentSightings = 10
 
+-- | Telemetry reference: the force size at which a colony counts as fully
+-- "present" for the security metric. `sec` is the unseen fraction GATED by
+-- presence = min 1 (force/secRef), so a wiped or vanishing army reads ~0 instead
+-- of the degenerate "0/0 = perfectly hidden", while any real force (>= secRef) is
+-- scored on denial quality as before. See exp 011.
+secRef :: Float
+secRef = 12
+
 -- | The type a team has fewest of (ties to the lighter type by 'Ord') -- used to
 -- even out a force when there is nothing reliable to counter.
 leastOf :: Census -> UnitType
@@ -884,6 +953,26 @@ enemyCoverage team = do
       []
   let seen = length [() | q <- enemies, any (\(s, r) -> quadrance (q - s) <= r * r) sources]
   pure (seen, length enemies)
+
+-- | Telemetry: recon REDUNDANCY -- the mean number of OTHER friendly scouts whose
+-- vision heavily overlaps each scout's (centre within one vision radius). This is
+-- the instrument the plain 'recon' coverage metric was missing. Coverage
+-- (seen/total) is an outcome and is /satisfied by piling/: two scouts stacked in
+-- one cone see the same enemies, gaining nothing, yet coverage never flags the
+-- wasted unit -- so the AI happily wastes a whole swarm covering one cone with
+-- overlapping ranges. Redundancy makes the waste visible: ~0 means the vision
+-- disks tile fresh ground (each scout earns its keep); a high value means scouts
+-- are stacked, re-covering the same cone. The lesson generalises: an outcome
+-- metric with no EFFICIENCY/overlap term rewards redundancy and hides waste.
+reconOverlap :: Team -> SystemSTM Float
+reconOverlap team = do
+  scouts <-
+    cfold
+      (\acc (t :: Team, r :: Role, ut :: UnitType, Position q, e :: Entity) -> if t == team && r == Recon then (e, q, typeVision ut) : acc else acc)
+      []
+  let n = length scouts
+      degree (e1, q1, vr) = length [() | (e2, q2, _) <- scouts, e1 /= e2, quadrance (q1 - q2) < vr * vr]
+  pure (if n == 0 then 0 else fromIntegral (sum (map degree scouts)) / fromIntegral n)
 
 -- | Telemetry: a team's soldier front as (mean x, max |y|), so a pinned-at-centre
 -- front (no travel) and the y-spread vs vision radius (how 2D the fight really
@@ -1006,7 +1095,24 @@ planFor team = do
       (\acc (t :: Team, ut :: UnitType) -> if t == team then bumpType ut acc else acc)
       (0, 0, 0)
   Threat up0 down0 g0 surp0 kl0 <- teamThreat team <$> get global
-  let visible = [(q, ut) | (q, ut) <- enemies, seenBy sources q]
+  prevPlan <- teamPlan team <$> get global
+  let prevBase = planEnemyBase prevPlan
+      prevContact = planContact prevPlan
+      visible = [(q, ut) | (q, ut) <- enemies, seenBy sources q]
+      -- Discover the enemy spawner: once any friendly source covers its position
+      -- it is known and remembered for the round; until then the strike force is
+      -- aiming at a rumour and must not commit. Sticky so it survives the fog.
+      ebPos = basePos (enemyOf team)
+      enemyBaseSeen = case prevBase of
+        Just b -> Just b
+        Nothing -> if seenBy sources ebPos then Just ebPos else Nothing
+      -- Contact: the earned centroid of where the enemy actually is. Updated from
+      -- this pass's sightings, sticky through the fog. Nothing == still blind, so
+      -- recon explores and the force holds. This is what makes the force orient on
+      -- the enemy it has FOUND rather than a direction it was handed.
+      contact' = case map fst visible of
+        [] -> prevContact
+        ps -> Just (foldr (+) (V2 0 0) ps ^/ fromIntegral (length ps))
       census = foldr (bumpType . snd) (0, 0, 0) visible
       waypoint = chooseWaypoint team (map fst visible)
       -- Fold this pass's sightings into the decaying flank memory, then commit
@@ -1026,7 +1132,7 @@ planFor team = do
       -- scorecard; held over passes with no sighting.
       (surp', kl') = beliefSurprise (up0, down0) (up', down') (upSeen, downSeen) surp0 kl0
   modify global (setTeamThreat team (Threat up' down' gap surp' kl'))
-  modify global (setTeamPlan team (TeamPlan (planNextFor own (length visible) census) waypoint gap))
+  modify global (setTeamPlan team (TeamPlan (planNextFor own (length visible) census) waypoint gap enemyBaseSeen contact'))
   where
     seenBy srcs q = any (\(s, r) -> quadrance (q - s) <= r * r) srcs
 
@@ -1073,11 +1179,11 @@ chooseGap g0 up down
   | down < up * 0.6 = -1 -- bottom clearly emptier -> flank bottom
   | otherwise = g0 -- ambiguous: hold the committed flank
 
--- | Muster on the enemy the colony can see; with the field dark, press forward
--- and march on the enemy base so a won fight turns into a breakthrough instead
--- of milling at the centre line.
+-- | Muster on the enemy the colony can see; with the field dark, muster at HOME
+-- -- the colony has no idea which way the enemy lies, so it does not stream off
+-- on a bearing it was never given. The force holds while recon finds the enemy.
 chooseWaypoint :: Team -> [V2 Float] -> V2 Float
-chooseWaypoint team [] = basePos (enemyOf team)
+chooseWaypoint team [] = basePos team
 chooseWaypoint _ ps = foldr (+) (V2 0 0) ps ^/ fromIntegral (length ps)
 
 -- | A colony's strategist thread: re-plan from the fog until the round ends.
@@ -1205,14 +1311,14 @@ coordinator cfg = loop (1 :: Int)
       when (cDebug cfg) (void $ forkSys heartbeat)
       outcome <- waitWinner redBase blueBase
       atomically $ case outcome of
-        Just winner -> modify global (addWin winner) >> set global (RoundOver winner)
-        Nothing -> set global RoundDraw
+        Win winner -> modify global (addWin winner) >> set global (RoundOver winner)
+        Draw reason -> set global (RoundDraw reason)
       report n outcome
       threadDelay (cOver cfg)
       loop (n + 1)
 
     -- A gated 2 Hz pulse of each colony's live composition and current plan,
-    -- so you can watch the triad counter-play shift through the fog.
+    -- so you can watch the counter-play shift through the fog.
     heartbeat = do
       (ph, rc, bc, Plans rp bp, DamageLog dm, rHp, bHp, rCov, bCov, rFront, bFront, rBad, bBad, rConc, bConc, BaseDamage bdR bdB) <- atomically $ do
         ph <- get global
@@ -1233,34 +1339,56 @@ coordinator cfg = loop (1 :: Int)
         bconc <- concentration Blue
         rgrp <- groupCount Red
         bgrp <- groupCount Blue
+        rovl <- reconOverlap Red
+        bovl <- reconOverlap Blue
         tm <- get global
         bd <- get global
-        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf, (rbad, rout, rsg), (bbad, bout, bsg), (rconc, rgrp, teamThreat Red tm), (bconc, bgrp, teamThreat Blue tm), bd)
+        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf, (rbad, rout, rsg), (bbad, bout, bsg), (rconc, rgrp, rovl, teamThreat Red tm), (bconc, bgrp, bovl, teamThreat Blue tm), bd)
       let teamDmgF t = sum [v | ((t', _, _), v) <- DM.toList dm, t' == t]
           teamDmg t = round (teamDmgF t) :: Int
+      let foundFlag p = (if isJust (planContact p) then "c" else "-") ++ (if isJust (planEnemyBase p) then "B" else "-")
       traceM $
-        "[hb] R " ++ showCensus rc ++ " base=" ++ show (round rHp :: Int) ++ " next=" ++ show (planNext rp) ++ " dmg=" ++ show (teamDmg Red) ++ " " ++ showTel rCov rFront rBad
-          ++ " | B " ++ showCensus bc ++ " base=" ++ show (round bHp :: Int) ++ " next=" ++ show (planNext bp) ++ " dmg=" ++ show (teamDmg Blue) ++ " " ++ showTel bCov bFront bBad
+        "[hb] R " ++ showCensus rc ++ " base=" ++ show (round rHp :: Int) ++ " next=" ++ show (planNext rp) ++ " find=" ++ foundFlag rp ++ " dmg=" ++ show (teamDmg Red) ++ " " ++ showTel rCov rFront rBad
+          ++ " | B " ++ showCensus bc ++ " base=" ++ show (round bHp :: Int) ++ " next=" ++ show (planNext bp) ++ " find=" ++ foundFlag bp ++ " dmg=" ++ show (teamDmg Blue) ++ " " ++ showTel bCov bFront bBad
       -- Warfighting adherence scorecard (exp 008), per side.
       traceM $
         "[score] R " ++ scoreLine Red rCov bCov rc rFront rConc (teamDmgF Red) bdR
           ++ " | B " ++ scoreLine Blue bCov rCov bc bFront bConc (teamDmgF Blue) bdB
       when (isPlaying ph) (threadDelay 500000 >> heartbeat)
 
-    -- recon = my coverage of the enemy; sec = 1 - the enemy's coverage of me;
-    -- arms = combined-arms mix entropy; init = how deep my front is in his half;
+    -- recon = my coverage of the enemy; sec = my hidden-force count / secRef (NOT
+    -- the unseen fraction -- annihilation must not read as perfect security);
+    -- ovl = recon REDUNDANCY (mean overlapping scouts per scout) -- the efficiency
+    -- term coverage alone lacks: high ovl with low recon == a swarm piled in one
+    -- cone, re-covering the same ground; arms = combined-arms mix entropy; init = how deep my front is in his half;
     -- focus = force concentration; grp = number of distinct groups (smear vs
-    -- cohere); cog = share of my damage on his base. unc/surp/kl = the in-the-
+    -- cohere); cog = base-damage share * base-worth landed (a scratch reads ~0).
+    -- unc/surp/kl = the in-the-
     -- moment information dynamics of my belief over the enemy flank (bits):
     -- uncertainty (entropy), surprisal (prediction error), Bayesian surprise.
-    scoreLine team myCov foeCov census (mx, _) (conc, grp, thr) soldierDmg baseDmg =
+    scoreLine team myCov foeCov census (mx, _) (conc, grp, ovl, thr) soldierDmg baseDmg =
       let frac (s, t) = if t == 0 then 0 :: Float else fromIntegral s / fromIntegral t
           pct x = show (round (x * 100) :: Int)
           bits x = show (fromIntegral (round (x * 100) :: Int) / 100 :: Float)
-       in "recon=" ++ pct (frac myCov) ++ " sec=" ++ pct (1 - frac foeCov)
+          -- Security = the unseen fraction (denial quality, discriminating) GATED
+          -- by force presence, so it stays informative in normal play but a wiped
+          -- (or vanishing) army reads ~0 instead of "0/0 = perfectly hidden"
+          -- (exp 011). presence saturates at 1 for any real force (>= secRef).
+          secScore =
+            let (s, t) = foeCov
+                unseenFrac = if t == 0 then 0 else fromIntegral (max 0 (t - s)) / fromIntegral t
+                presence = min 1 (fromIntegral t / secRef)
+             in unseenFrac * presence
+          -- CoG focus paired with MAGNITUDE: the share of damage on the base, times
+          -- how much of a base's worth has actually landed. A single scratch (share
+          -- 1.0 but ~0 damage) no longer reads as a decisive strike (exp 011).
+          cogShare = if soldierDmg + baseDmg <= 0 then 0 else baseDmg / (soldierDmg + baseDmg)
+          cogScore = cogShare * min 1 (baseDmg / baseHp)
+       in "recon=" ++ pct (frac myCov) ++ " sec=" ++ pct secScore
+            ++ " ovl=" ++ bits ovl
             ++ " arms=" ++ pct (armsEntropy census) ++ " init=" ++ pct (initiative team mx)
             ++ " focus=" ++ pct conc ++ " grp=" ++ show grp
-            ++ " cog=" ++ pct (if soldierDmg + baseDmg <= 0 then 0 else baseDmg / (soldierDmg + baseDmg))
+            ++ " cog=" ++ pct cogScore
             ++ " unc=" ++ bits (beliefEntropy (thUp thr) (thDown thr))
             ++ " surp=" ++ bits (thSurprise thr) ++ " kl=" ++ bits (thKL thr)
 
@@ -1294,22 +1422,23 @@ coordinator cfg = loop (1 :: Int)
           if ra && ba
             then
               if k <= (0 :: Int)
-                then pure Nothing
+                then pure (Draw Stalemate)
                 else threadDelay (cPoll cfg) >> poll (k - 1)
             else do
               threadDelay (cGrace cfg)
               (ra', ba') <- bothAlive redBase blueBase
               pure $ case (ra', ba') of
-                (False, False) -> Nothing
-                (True, _) -> Just Red
-                (_, True) -> Just Blue
+                (False, False) -> Draw MutualFall
+                (True, _) -> Win Red
+                (_, True) -> Win Blue
 
     report n outcome = do
       (KillScore kr kb, Wins wr wb, dl) <-
         atomically ((,,) <$> get global <*> get global <*> get global)
       let result = case outcome of
-            Just w -> show w ++ " wins"
-            Nothing -> "Draw (both spawners fell)"
+            Win w -> show w ++ " wins"
+            Draw MutualFall -> "Draw (both spawners fell)"
+            Draw Stalemate -> "Draw (stalemate -- round cap, both standing)"
       liftIO . putStrLn $
         concat
           [ "Round "
@@ -1337,6 +1466,11 @@ coordinator cfg = loop (1 :: Int)
 
 label :: Color -> Float -> Float -> String -> Picture
 label col x y = color col . translate x y . scale 0.12 0.12 . Text
+
+-- | Honest on-screen subtitle for each kind of draw.
+drawText :: DrawReason -> String
+drawText MutualFall = "BOTH SPAWNERS FELL"
+drawText Stalemate = "STALEMATE -- ROUND CAP, BOTH STANDING"
 
 -- | A soldier glyph, distinct per type: small Hunter dot, Guard disc, and a
 -- bigger ringed disc for the heavy Lance (a filled circle with a darker rim).
@@ -1436,8 +1570,8 @@ draw = do
         Playing -> mempty
         RoundOver w ->
           scoreCard (label white (-58) 215 "ROUND OVER" <> label (teamColor w) (-85) 185 (show w ++ " TEAM WINS"))
-        RoundDraw ->
-          scoreCard (label white (-32) 215 "DRAW" <> label (greyN 0.7) (-200) 185 "BOTH SPAWNERS FELL")
+        RoundDraw reason ->
+          scoreCard (label white (-32) 215 "DRAW" <> label (greyN 0.7) (-200) 185 (drawText reason))
   -- Fog wash sits under the glyphs; tracers go on /top/ (a hit fires within attack
   -- range, so the line is short and would otherwise hide under the units).
   pure (fogPic <> visionPic <> basePic <> soldierPic <> attackPic <> hud <> overlay)
@@ -1531,9 +1665,9 @@ sweep the type x type grid at equal numbers and read off who actually wins.
 
   > stm-colony-war --matchup hunter:10 guard:10 [reps] [--muster]
 -}
-matchupCfg :: Bool -> Bool -> Bool -> Float -> Config
-matchupCfg muster kite triad arena =
-  headlessCfg {cTick = 16000, cDebug = False, cMuster = muster, cKite = kite, cTriad = triad, cArena = arena}
+matchupCfg :: Bool -> Bool -> Float -> Config
+matchupCfg muster kite arena =
+  headlessCfg {cTick = 16000, cDebug = False, cMuster = muster, cKite = kite, cArena = arena}
 
 -- | Parse @"hunter:10,lance:5"@ into a unit roster.
 parseComp :: String -> [(UnitType, Int)]
@@ -1615,17 +1749,16 @@ runBattle cfg = loop (0 :: Int)
 -- | Run @reps@ battles of one matchup and print a single structured RESULT line.
 runMatchups :: [String] -> IO ()
 runMatchups args = do
-  -- Defaults mirror the live combat model (kiting on, no triad multiplier);
-  -- ablate with --nokite / --triad. Muster stays off to isolate raw combat.
+  -- Defaults mirror the live combat model (kiting on); ablate with --nokite.
+  -- Muster stays off to isolate raw combat.
   let muster = "--muster" `elem` args
       kite = not ("--nokite" `elem` args)
-      triad = "--triad" `elem` args
       arena = if "--arena" `elem` args then 160 else 0
       positional = filter (not . isPrefixOf "--") args
   case positional of
     (redS : blueS : rest) -> do
       let reps = case rest of (r : _) -> read r; _ -> 200 :: Int
-          cfg = matchupCfg muster kite triad arena
+          cfg = matchupCfg muster kite arena
           redC = parseComp redS
           blueC = parseComp blueS
       w <- initWorld
@@ -1649,7 +1782,6 @@ runMatchups args = do
           , "reps=" ++ show reps
           , "muster=" ++ show muster
           , "kite=" ++ show kite
-          , "triad=" ++ show triad
           , "red_wins=" ++ show rw
           , "blue_wins=" ++ show bw
           , "draws=" ++ show dr
