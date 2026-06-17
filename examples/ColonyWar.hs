@@ -107,6 +107,16 @@ instance Component Kind where type Storage Kind = Map Kind
 data UnitType = Hunter | Guard | Lance deriving (Eq, Ord, Show, Enum, Bounded)
 instance Component UnitType where type Storage UnitType = Map UnitType
 
+-- | A soldier's task-force role (maneuver warfare, exp 007), assigned at spawn.
+--
+--   * 'MainBody' fixes the enemy front -- engages and holds, the base case.
+--   * 'Flank' is the main effort: it avoids the enemy line and sweeps wide
+--     through the open flank to strike the lightly-held enemy base.
+--   * 'Recon' screens and scouts -- spreads out to light up the map and watch
+--     the team's own flanks against a backstab.
+data Role = MainBody | Flank | Recon deriving (Eq, Show)
+instance Component Role where type Storage Role = Map Role
+
 -- | A transient marker on a soldier that struck this tick, carrying the point
 -- it struck at. Set/cleared each turn by 'stepUnit', read only by the renderer
 -- to draw a tracer line from attacker to victim. Carries no game meaning.
@@ -147,11 +157,14 @@ instance Semigroup Phase where _ <> b = b
 instance Monoid Phase where mempty = Playing
 instance Component Phase where type Storage Phase = Global Phase
 
--- | One colony's standing orders: which type to enlist next, and where to
--- muster. Set by the strategist, read by the spawner and every unit.
+-- | One colony's standing orders: which type to enlist next, where the main
+-- body musters, and which vertical flank (+1 top / -1 bottom) the strategist has
+-- judged the open gap for the flanking force. Set by the strategist, read by the
+-- spawner and every unit.
 data TeamPlan = TeamPlan
   { planNext :: !UnitType
   , planWaypoint :: !(V2 Float)
+  , planGap :: !Float
   }
   deriving (Show)
 
@@ -160,7 +173,7 @@ data TeamPlan = TeamPlan
 data Plans = Plans TeamPlan TeamPlan deriving (Show)
 instance Semigroup Plans where _ <> b = b
 instance Monoid Plans where
-  mempty = Plans (TeamPlan Hunter (V2 0 0)) (TeamPlan Hunter (V2 0 0))
+  mempty = Plans (TeamPlan Hunter (V2 0 0) 1) (TeamPlan Hunter (V2 0 0) 1)
 instance Component Plans where type Storage Plans = Global Plans
 
 -- | Whether to draw the vision overlay. A 'Global' toggled from input.
@@ -193,7 +206,7 @@ instance Component Viewpoint where type Storage Viewpoint = Global Viewpoint
 
 -- | Every component an entity owns, so we can delete it in one go (the extra
 -- deletes are harmless no-ops for entities that lack a component).
-type All = (Position, Health, Team, Kind, UnitType, Attacking)
+type All = (Position, Health, Team, Kind, UnitType, Attacking, Role)
 
 makeWorld
   "World"
@@ -203,6 +216,7 @@ makeWorld
   , ''Kind
   , ''UnitType
   , ''Attacking
+  , ''Role
   , ''KillScore
   , ''DamageLog
   , ''Wins
@@ -315,6 +329,13 @@ musterRadius2 = musterRadius * musterRadius
 
 musterMin :: Int
 musterMin = 6
+
+-- | Flanking maneuver (exp 007): the flanking force sweeps to this vertical
+-- offset (well clear of the y≈0 frontal grind) along the open flank, then turns
+-- in to the enemy base once within 'flankTurnIn' of the base's x.
+flankY, flankTurnIn :: Float
+flankY = 250
+flankTurnIn = 150
 
 -- | A team's staging point: in front of its base, on the line to the enemy.
 rallyPoint :: Team -> V2 Float
@@ -434,7 +455,7 @@ setTeamPlan Blue p (Plans r _) = Plans r p
 
 -- | A forward muster point at round start: a third of the way to the foe.
 initialPlan :: Team -> TeamPlan
-initialPlan team = TeamPlan Hunter (b + (e - b) ^* 0.35)
+initialPlan team = TeamPlan Hunter (b + (e - b) ^* 0.35) 1
   where
     b = basePos team
     e = basePos (enemyOf team)
@@ -499,8 +520,11 @@ stepUnit cfg ety = do
       -- soldier falls back to the rally point to mass up first, rather than feed
       -- itself piecemeal into the enemy blob. With no enemy in sight, it marches
       -- to the muster waypoint.
-      wp <- planWaypoint . teamPlan myTeam <$> get global
-      let supported = not (cMuster cfg) || allyNear + 1 >= musterMin
+      plan <- teamPlan myTeam <$> get global
+      myRole <- get ety
+      let wp = planWaypoint plan
+          gap = planGap plan
+          supported = not (cMuster cfg) || allyNear + 1 >= musterMin
           rally = rallyPoint myTeam
           -- Kiting: if I out-range and out-run my target, hold it at the edge of
           -- my reach -- close in if it slips out, back straight off if it gets
@@ -516,15 +540,29 @@ stepUnit cfg ety = do
                    in Just (p + away ^* 60) -- too close: back off, still firing
               | otherwise -> Nothing -- in the sweet spot: hold and fire
             _ -> Nothing
-          dest
-            | Just kd <- kiteDest = Just kd
-            | supported = case target of
-                Just (_, tPos, _) -> Just tPos -- press into melee, don't hold at range
-                Nothing
-                  | quadrance (wp - p) > waypointReach2 -> Just wp
-                  | otherwise -> Nothing
-            | quadrance (rally - p) > waypointReach2 = Just rally
-            | otherwise = Nothing
+          -- The maneuver path: sweep wide to (enemyBaseX, gap*flankY), clear of
+          -- the frontal grind, then turn in and crash the lightly-held base.
+          enemyBase = basePos (enemyOf myTeam)
+          flankDest =
+            let V2 ebx _ = enemyBase
+                V2 px _ = p
+             in if abs (px - ebx) > flankTurnIn then V2 ebx (gap * flankY) else enemyBase
+          dest = case myRole of
+            -- Maneuver force: ignore the frontal fight, head for the base.
+            Flank -> Just flankDest
+            -- Recon: scout the open flank toward the enemy; kite/harass if met.
+            Recon -> case kiteDest of Just kd -> Just kd; Nothing -> Just flankDest
+            -- Main body: fix the enemy front (press into melee when supported,
+            -- else fall back and mass at the rally point).
+            MainBody
+              | Just kd <- kiteDest -> Just kd
+              | supported -> case target of
+                  Just (_, tPos, _) -> Just tPos
+                  Nothing
+                    | quadrance (wp - p) > waypointReach2 -> Just wp
+                    | otherwise -> Nothing
+              | quadrance (rally - p) > waypointReach2 -> Just rally
+              | otherwise -> Nothing
           approach = case dest of
             Just d -> normalize (d - p) ^* (speed * dt)
             Nothing -> V2 0 0
@@ -712,7 +750,14 @@ planFor team = do
   let visible = [(q, ut) | (q, ut) <- enemies, seenBy sources q]
       census = foldr (bumpType . snd) (0, 0, 0) visible
       waypoint = chooseWaypoint team (map fst visible)
-  modify global (setTeamPlan team (TeamPlan (chooseNext census) waypoint))
+      -- The open flank for the maneuver force: the vertical half (top +y /
+      -- bottom -y) holding fewer of the enemies we can see. Recon pull -- the
+      -- gap is chosen from what the fog actually reveals. Ties / a dark field
+      -- default to the top.
+      up = length [() | (V2 _ y, _) <- visible, y > 0]
+      down = length [() | (V2 _ y, _) <- visible, y <= 0]
+      gap = if down < up then -1 else 1
+  modify global (setTeamPlan team (TeamPlan (chooseNext census) waypoint gap))
   where
     seenBy srcs q = any (\(s, r) -> quadrance (q - s) <= r * r) srcs
 
@@ -737,6 +782,16 @@ strategist cfg team base = loop
       when continue (threadDelay (cStrategy cfg) >> loop)
 
 -- Spawning ------------------------------------------------------------------
+
+-- | The share of (non-Hunter) reinforcements peeled off as the flanking force.
+flankShare :: Double
+flankShare = 0.35
+
+-- | Task-force role for a fresh soldier (exp 007): Hunters scout (Recon); the
+-- rest mostly hold the line, with 'flankShare' peeling off to strike the base.
+rollRole :: UnitType -> Double -> Role
+rollRole Hunter _ = Recon
+rollRole _ r = if r < flankShare then Flank else MainBody
 
 -- | Where a fresh soldier appears: on the base perimeter at 'spawnRadius', in
 -- the direction of the muster waypoint, nudged sideways by the given tangential
@@ -766,6 +821,7 @@ spawnerThread cfg base team = loop
   where
     loop = do
       tang <- liftIO (randomRIO (-spawnRadius, spawnRadius))
+      roleRoll <- liftIO (randomRIO (0, 1) :: IO Double)
       mE <- atomically $ do
         baseAlive <- exists base (Proxy @Health)
         ph <- get global
@@ -777,7 +833,8 @@ spawnerThread cfg base team = loop
             plan <- teamPlan team <$> get global
             let ut = planNext plan
                 pos = edgeSpawn team (planWaypoint plan) tang
-            Just <$> newEntity (team, Soldier, ut, Position pos, Health (typeHp ut))
+                role = rollRole ut roleRoll
+            Just <$> newEntity (team, Soldier, ut, Position pos, Health (typeHp ut), role)
       case mE of
         Nothing -> pure () -- base dead or round over: retire
         Just e -> do
@@ -808,7 +865,7 @@ startRound cfg = do
     forM [Red, Blue] $ \team -> do
       let wp = planWaypoint (initialPlan team)
           off = (fromIntegral i - fromIntegral (initialPlatoon - 1) / 2) * lineSpacing
-      atomically $ newEntity (team, Soldier, Guard, Position (edgeSpawn team wp off), Health (typeHp Guard))
+      atomically $ newEntity (team, Soldier, Guard, Position (edgeSpawn team wp off), Health (typeHp Guard), MainBody)
   forM_ (concat units) (void . forkSys . unitAI cfg)
   void $ forkSys (spawnerThread cfg redBase Red)
   void $ forkSys (spawnerThread cfg blueBase Blue)
@@ -1138,7 +1195,7 @@ spawnArmy team comp (V2 ax ay) =
         gx = face * fromIntegral (i `mod` 5) * 9
         gy = fromIntegral (i `div` 5) * 9 - 16
     void . atomically $
-      newEntity (team, Soldier, ut, Position (V2 (ax + gx) (ay + gy)), Health (typeHp ut))
+      newEntity (team, Soldier, ut, Position (V2 (ax + gx) (ay + gy)), Health (typeHp ut), MainBody)
   where
     roster = concat [replicate n ut | (ut, n) <- comp]
 
