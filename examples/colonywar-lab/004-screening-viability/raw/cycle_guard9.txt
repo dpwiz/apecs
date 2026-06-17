@@ -1,0 +1,7 @@
+# Guard dmg 14->9: retest cycle, --kite --notriad
+## H>L scout vs siege
+RESULT red=scout:12 blue=siege:12 reps=400 muster=False kite=True screen=False triad=False red_wins=400 blue_wins=0 draws=0
+## G>H warrior vs scout
+RESULT red=warrior:12 blue=scout:12 reps=400 muster=False kite=True screen=False triad=False red_wins=400 blue_wins=0 draws=0
+## L>G siege vs warrior
+RESULT red=siege:12 blue=warrior:12 reps=400 muster=False kite=True screen=False triad=False red_wins=400 blue_wins=0 draws=0

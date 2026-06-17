@@ -68,7 +68,7 @@ import System.Environment (getArgs)
 
 import Apecs.Gloss
 import Apecs.STM.Prelude
-import Linear (V2 (..), normalize, quadrance, (^*), (^/))
+import Linear (V2 (..), dot, normalize, quadrance, (^*), (^/))
 import System.Exit (exitSuccess)
 import System.IO (BufferMode (LineBuffering), hSetBuffering, stderr, stdout)
 import System.Random (randomRIO)
@@ -219,6 +219,13 @@ data Config = Config
   , cKite :: Bool
   -- ^ Whether a soldier that out-ranges /and/ out-runs its target kites it
   -- (fires while backing off to hold the range gap). Ablation flag for exp 003.
+  , cScreen :: Bool
+  -- ^ Whether a screening unit (the Guard archetype) fans laterally into a wall
+  -- that spans the field, denying a kiter the room to orbit. Flag for exp 004.
+  , cTriad :: Bool
+  -- ^ Whether the rock-paper-scissors damage multiplier applies. On in the live
+  -- game; off in behaviour experiments to isolate a *geometric* counter (exp 004)
+  -- from the stat-table counter, so combat is symmetric and only behaviour wins.
   , cArena :: Float
   -- ^ Matchup harness only: if > 0, clamp positions to a +/- this square so
   -- kiters can be cornered (0 = unbounded). The full game uses its own field.
@@ -237,6 +244,8 @@ displayCfg =
     , cDebug = False
     , cMuster = True
     , cKite = False
+    , cScreen = False
+    , cTriad = True
     , cArena = 0
     }
 
@@ -253,6 +262,8 @@ headlessCfg =
     , cDebug = True
     , cMuster = True
     , cKite = False
+    , cScreen = False
+    , cTriad = True
     , cArena = 0
     }
 
@@ -308,6 +319,25 @@ lineSpacing = 16
 collideDist2, waypointReach2 :: Float
 collideDist2 = collideDist * collideDist
 waypointReach2 = waypointReach * waypointReach
+
+-- | Screening (exp 004): a Guard repels nearby allied Guards along the axis
+-- /perpendicular/ to its line to the enemy, fanning a clump into a tall wall
+-- that spans the field so a kiter can't slide along the boundary to escape.
+-- Wider radius and stronger push than the cosmetic 'collideDist' separation,
+-- and lateral-only, so the front spreads instead of balling up.
+screenRadius, screenStrength :: Float
+screenRadius = 46
+screenStrength = 1.1
+
+screenRadius2 :: Float
+screenRadius2 = screenRadius * screenRadius
+
+-- | The archetype that screens. Warrior stands in for the Guard while the
+-- behaviour cycle is being proven in the harness; gating on type means a mixed
+-- army screens only with its Guards.
+isScreener :: UnitType -> Bool
+isScreener Warrior = True
+isScreener _ = False
 
 sq :: Float -> Float
 sq x = x * x
@@ -447,7 +477,7 @@ stepUnit cfg ety = do
             Just _ -> True
             Nothing -> False
       case struck of
-        Just (tEnt, _) -> attack myTeam myType tEnt
+        Just (tEnt, _) -> attack cfg myTeam myType tEnt
         Nothing -> pure ()
       -- Record (display only) a tracer to whatever we hit, or clear last tick's.
       when (not (cHeadless cfg)) $ case struck of
@@ -488,7 +518,16 @@ stepUnit cfg ety = do
           approach = case dest of
             Just d -> normalize (d - p) ^* (speed * dt)
             Nothing -> V2 0 0
-      set ety (Position (p + approach + sep))
+      -- Screening: fan laterally into a spanning wall (only the Guard archetype,
+      -- only with an enemy in sight to orient the perpendicular). Gated off in
+      -- the live game, so it pays nothing there.
+      screenForce <-
+        if cScreen cfg && isScreener myType
+          then case mUnit of
+            Just (_, tPos, _) -> screenSpread ety p myTeam (tPos - p)
+            Nothing -> pure (V2 0 0)
+          else pure (V2 0 0)
+      set ety (Position (p + approach + sep + screenForce))
       pure True
   where
     dt = fromIntegral (cTick cfg) / 1e6
@@ -517,12 +556,37 @@ stepUnit cfg ety = do
       Just (_, _, best) | best <= d2 -> acc
       _ -> Just (e, q, d2)
 
+{- | The lateral spread that makes a screen. Repel every nearby allied screener
+along the axis perpendicular to my line to the enemy, scaled by how close it is,
+so a clustered column fans out into a tall wall facing the foe (front-to-back
+crowding is left to the normal 'sep'). A kiter sliding along the arena boundary
+then meets a Guard at every height and is forced to brawl instead of orbiting.
+-}
+screenSpread :: Entity -> V2 Float -> Team -> V2 Float -> SystemSTM (V2 Float)
+screenSpread ety p myTeam enemyDir = cfoldM accum (V2 0 0)
+  where
+    perp =
+      let len = sqrt (quadrance enemyDir)
+          V2 ex ey = enemyDir
+       in if len > 1e-6 then V2 (-ey / len) (ex / len) else V2 0 1
+    accum !acc (t :: Team, k :: Kind, ut :: UnitType, Position q, e :: Entity) =
+      pure $
+        let off = p - q
+            d2 = quadrance off
+         in if t == myTeam && k == Soldier && isScreener ut && e /= ety && d2 > 1e-6 && d2 < screenRadius2
+              then
+                let lat = off `dot` perp -- signed lateral gap to this neighbour
+                    d = sqrt d2
+                    mag = (screenRadius - d) / screenRadius * screenStrength
+                 in acc + perp ^* (signum lat * mag)
+              else acc
+
 {- | Deal damage to a victim within the caller's transaction. Triad advantage
 scales soldier-vs-soldier damage; Siege does double against a base. Soldier
 kills score; razing a base does not (the coordinator notices that separately).
 -}
-attack :: Team -> UnitType -> Entity -> SystemSTM ()
-attack killer atkType victim = do
+attack :: Config -> Team -> UnitType -> Entity -> SystemSTM ()
+attack cfg killer atkType victim = do
   stillThere <- exists victim (Proxy @Health)
   when stillThere $ do
     Health h <- get victim
@@ -531,7 +595,8 @@ attack killer atkType victim = do
       Base -> pure (typeDamage atkType * (if atkType == Siege then 2 else 1), Nothing)
       Soldier -> do
         defType <- get victim
-        pure (typeDamage atkType * advantage atkType defType, Just defType)
+        let mult = if cTriad cfg then advantage atkType defType else 1.0
+        pure (typeDamage atkType * mult, Just defType)
     -- Ledger soldier-vs-soldier damage (the part actually applied).
     forM_ mDef $ \defType ->
       modify global (logDamage killer atkType defType (min dmg h))
@@ -956,9 +1021,9 @@ sweep the type x type grid at equal numbers and read off who actually wins.
 
   > stm-colony-war --matchup warrior:10 scout:10 [reps] [--muster]
 -}
-matchupCfg :: Bool -> Bool -> Float -> Config
-matchupCfg muster kite arena =
-  headlessCfg {cTick = 16000, cDebug = False, cMuster = muster, cKite = kite, cArena = arena}
+matchupCfg :: Bool -> Bool -> Bool -> Bool -> Float -> Config
+matchupCfg muster kite screen triad arena =
+  headlessCfg {cTick = 16000, cDebug = False, cMuster = muster, cKite = kite, cScreen = screen, cTriad = triad, cArena = arena}
 
 -- | Parse @"warrior:10,siege:5"@ into a unit roster.
 parseComp :: String -> [(UnitType, Int)]
@@ -1042,12 +1107,14 @@ runMatchups :: [String] -> IO ()
 runMatchups args = do
   let muster = "--muster" `elem` args
       kite = "--kite" `elem` args
+      screen = "--screen" `elem` args
+      triad = not ("--notriad" `elem` args)
       arena = if "--arena" `elem` args then 160 else 0
       positional = filter (not . isPrefixOf "--") args
   case positional of
     (redS : blueS : rest) -> do
       let reps = case rest of (r : _) -> read r; _ -> 200 :: Int
-          cfg = matchupCfg muster kite arena
+          cfg = matchupCfg muster kite screen triad arena
           redC = parseComp redS
           blueC = parseComp blueS
       w <- initWorld
@@ -1071,6 +1138,8 @@ runMatchups args = do
           , "reps=" ++ show reps
           , "muster=" ++ show muster
           , "kite=" ++ show kite
+          , "screen=" ++ show screen
+          , "triad=" ++ show triad
           , "red_wins=" ++ show rw
           , "blue_wins=" ++ show bw
           , "draws=" ++ show dr

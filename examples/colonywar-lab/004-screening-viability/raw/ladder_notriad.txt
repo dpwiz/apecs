@@ -1,0 +1,11 @@
+# Guard(warrior) vs Hunter(scout, range16), 12v12, 400 reps, TRIAD OFF (only behaviour decides)
+## stand-up (no behaviours)
+RESULT red=warrior:12 blue=scout:12 reps=400 muster=False kite=False screen=False triad=False red_wins=400 blue_wins=0 draws=0
+## open kite
+RESULT red=warrior:12 blue=scout:12 reps=400 muster=False kite=True screen=False triad=False red_wins=0 blue_wins=400 draws=0
+## cornered clump (kite+arena, no screen)
+RESULT red=warrior:12 blue=scout:12 reps=400 muster=False kite=True screen=False triad=False red_wins=1 blue_wins=399 draws=0
+## SCREEN (kite+screen+arena)
+RESULT red=warrior:12 blue=scout:12 reps=400 muster=False kite=True screen=True triad=False red_wins=0 blue_wins=400 draws=0
+## screen, no walls (kite+screen, open field)
+RESULT red=warrior:12 blue=scout:12 reps=400 muster=False kite=True screen=True triad=False red_wins=0 blue_wins=400 draws=0
