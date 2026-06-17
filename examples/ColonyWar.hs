@@ -421,13 +421,15 @@ waypointReach = 28
 -- 'musterRadius' is "under-supported": rather than charge a blob that would melt
 -- it, it falls back to a staging point 'rallyDist' in front of its base and
 -- waits for the clump to build, committing only once it is strong enough.
+-- Kept low (declumping spread units out, so a too-high threshold left them
+-- perpetually under-supported and timid).
 musterRadius, rallyDist, musterRadius2 :: Float
 musterRadius = 58
 rallyDist = 95
 musterRadius2 = musterRadius * musterRadius
 
 musterMin :: Int
-musterMin = 3
+musterMin = 2
 
 -- | Flanking maneuver (exp 007): the flanking force sweeps to this vertical
 -- offset (well clear of the y≈0 frontal grind) along the open flank, then turns
