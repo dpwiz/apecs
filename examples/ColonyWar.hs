@@ -472,9 +472,6 @@ stepUnit cfg ety = do
       let struck = case target of
             Just (tEnt, tPos, d2) | d2 <= range2 -> Just (tEnt, tPos)
             _ -> Nothing
-          fighting = case struck of
-            Just _ -> True
-            Nothing -> False
       case struck of
         Just (tEnt, _) -> attack cfg myTeam myType tEnt
         Nothing -> pure ()
@@ -482,10 +479,14 @@ stepUnit cfg ety = do
       when (not (cHeadless cfg)) $ case struck of
         Just (_, tPos) -> set ety (Attacking tPos)
         Nothing -> destroy ety (Proxy @Attacking)
-      -- Move. A soldier already trading blows holds and fights. One with enough
-      -- friends nearby presses the target (or marches to the muster). One that
-      -- is under-supported falls back to the rally point to mass up first,
-      -- rather than feed itself piecemeal into the enemy blob.
+      -- Move. A soldier with enough friends nearby presses its target into
+      -- melee -- it does not hold at max range, or two long-ranged lines just sit
+      -- and trade forever without either breaking. Closing packs the fight tight
+      -- so a local edge snowballs into a breakthrough (which is how a round ends).
+      -- A kiter is the exception: it holds the range gap. An under-supported
+      -- soldier falls back to the rally point to mass up first, rather than feed
+      -- itself piecemeal into the enemy blob. With no enemy in sight, it marches
+      -- to the muster waypoint.
       wp <- planWaypoint . teamPlan myTeam <$> get global
       let supported = not (cMuster cfg) || allyNear + 1 >= musterMin
           rally = rallyPoint myTeam
@@ -505,10 +506,8 @@ stepUnit cfg ety = do
             _ -> Nothing
           dest
             | Just kd <- kiteDest = Just kd
-            | fighting = Nothing
             | supported = case target of
-                Just (_, tPos, d2) | d2 > range2 -> Just tPos
-                Just _ -> Nothing
+                Just (_, tPos, _) -> Just tPos -- press into melee, don't hold at range
                 Nothing
                   | quadrance (wp - p) > waypointReach2 -> Just wp
                   | otherwise -> Nothing

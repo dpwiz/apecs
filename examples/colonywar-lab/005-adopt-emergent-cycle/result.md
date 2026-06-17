@@ -50,7 +50,44 @@ not end rounds (the static line persisted), and it **broke the L>G edge**
 range-chip during the Lance's approach — the very margin L>G depends on. So the
 cycle is *tuning-fragile* and round-ending needs more than a damage knob.
 
+## Three targeted fixes tried — none end rounds (root cause is structural)
+
+| fix | intent | cycle? | rounds end? |
+|---|---|---|---|
+| **press into melee** (supported units close, don't hold at range) | break static range-18 lines | ✅ holds, and makes **L>G robust** (200/0 — the range-chip that made it fragile is gone) | ❌ no |
+| **2× damage** (with press) | faster kills → routs → breakthroughs | ✅ holds (uniform scaling is now L>G-safe with press) | ❌ no |
+| **cap 34→16** | comp advantage wipes the *whole* enemy army → clear field to march | n/a | ❌ no |
+
+In every case the bases stay pinned at full 380 — **no unit ever reaches a base.**
+The heartbeat shows why: two equally-competent strategists counter-chase
+(R: Lance→Guard→Hunter, B chasing the counter), continuous respawn keeps both
+armies at full cap, and the front never clears. A unit only marches on the enemy
+base when it sees *no* enemy (clear-field waypoint), which never happens. The
+stalemate is a **perpetual-respawn symmetric equilibrium**, immune to combat
+decisiveness or army size. The old game escaped it only because the 2× triad
+burst occasionally landed a comp-counter hard enough to rout-and-march before the
+re-counter arrived; the smoother emergent cycle removes that.
+
+**Kept:** the press behaviour (a genuine improvement — fixes static lines, makes
+L>G robust, cycle-safe). Reverted: the 2× damage and cap experiments (didn't
+help; left at cycle baseline 8/9/22, cap 34).
+
 ## Decision needed (design fork)
+
+The root cause is the win model, not the numbers. Options:
+
+- **A. Exhaustible reinforcements / attrition economy (recommended).** Each base
+  gets a finite reinforcement pool per round; when spent, no respawn → attrition
+  forces a winner, whose survivors then march and raze. Kills the perpetual-
+  respawn equilibrium directly, adds husbanding strategy, fits the "spawn-heart"
+  theme. Guarantees endings.
+- **B. Round timer + tiebreak.** Hard per-round time cap; if no base falls, award
+  the win on base HP / kills / proximity-to-enemy-base. Simple, guaranteed
+  endings, but the climax becomes a clock rather than a breakthrough.
+- **C. De-symmetrise the counter-chase.** Make strategists committal / imperfect
+  so a comp advantage persists long enough to convert (with press + decisive
+  combat). Preserves unlimited respawn, but risks re-introducing imbalance and
+  may still stalemate.
 
 Two broad directions to make rounds resolve dramatically:
 
