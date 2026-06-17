@@ -664,6 +664,33 @@ teamFront team = do
       (0, 0, 0)
   pure (if n == 0 then 0 else sx / fromIntegral n, maxY)
 
+-- | Telemetry (over-eager assaults). Two measurable faces of "too eager to
+-- advance into certain death", per team:
+--   * bad  = fraction of soldiers whose /nearest/ enemy hard-counters them (a
+--     fight they should be kiting away from, not standing in);
+--   * out  = fraction locally outnumbered -- more enemies than friends within a
+--     skirmish radius -- i.e. charging into superior force instead of massing.
+engageRates :: SystemSTM (Float, Float, Float, Float)
+engageRates = do
+  sol <- cfold (\acc (t :: Team, ut :: UnitType, Position q) -> (t, ut, q) : acc) []
+  let (rb, ro) = ratesFor Red sol
+      (bb, bo) = ratesFor Blue sol
+  pure (rb, bb, ro, bo)
+  where
+    skirmish2 = 70 * 70
+    ratesFor team sol =
+      let mine = [(ut, q) | (t, ut, q) <- sol, t == team]
+          foes = [(ut, q) | (t, ut, q) <- sol, t /= team]
+          near c pts = length [() | (_, q) <- pts, quadrance (q - c) <= skirmish2]
+          inBad (ut, q) = case nearest q foes of Just fut -> beats fut ut; Nothing -> False
+          outnum (_, q) = near q foes > near q mine -- mine includes self, so strict >
+          n = length mine
+          frac p = if n == 0 then 0 else fromIntegral (length (filter p mine)) / fromIntegral n
+       in (frac inBad, frac outnum)
+    nearest q foes = case foes of
+      [] -> Nothing
+      _ -> Just (snd (minimum [(quadrance (q - fq), fut) | (fut, fq) <- foes]))
+
 {- | One planning pass for a colony, run as a transaction. It looks through the
 fog -- the union of its base's sight and every friendly soldier's recon -- to
 census the enemies it can see, then writes the counter-type and a muster
@@ -811,7 +838,7 @@ coordinator cfg = loop (1 :: Int)
     -- A gated 2 Hz pulse of each colony's live composition and current plan,
     -- so you can watch the triad counter-play shift through the fog.
     heartbeat = do
-      (ph, rc, bc, Plans rp bp, DamageLog dm, rHp, bHp, rCov, bCov, rFront, bFront) <- atomically $ do
+      (ph, rc, bc, Plans rp bp, DamageLog dm, rHp, bHp, rCov, bCov, rFront, bFront, rBad, bBad) <- atomically $ do
         ph <- get global
         rc <- teamCensus Red
         bc <- teamCensus Blue
@@ -823,16 +850,19 @@ coordinator cfg = loop (1 :: Int)
         bcov <- enemyCoverage Blue
         rf <- teamFront Red
         bf <- teamFront Blue
-        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf)
+        (rbad, bbad, rout, bout) <- engageRates
+        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf, (rbad, rout), (bbad, bout))
       let teamDmg t = round (sum [v | ((t', _, _), v) <- DM.toList dm, t' == t]) :: Int
       traceM $
-        "[hb] R " ++ showCensus rc ++ " base=" ++ show (round rHp :: Int) ++ " next=" ++ show (planNext rp) ++ " dmg=" ++ show (teamDmg Red) ++ " " ++ showTel rCov rFront
-          ++ " | B " ++ showCensus bc ++ " base=" ++ show (round bHp :: Int) ++ " next=" ++ show (planNext bp) ++ " dmg=" ++ show (teamDmg Blue) ++ " " ++ showTel bCov bFront
+        "[hb] R " ++ showCensus rc ++ " base=" ++ show (round rHp :: Int) ++ " next=" ++ show (planNext rp) ++ " dmg=" ++ show (teamDmg Red) ++ " " ++ showTel rCov rFront rBad
+          ++ " | B " ++ showCensus bc ++ " base=" ++ show (round bHp :: Int) ++ " next=" ++ show (planNext bp) ++ " dmg=" ++ show (teamDmg Blue) ++ " " ++ showTel bCov bFront bBad
       when (isPlaying ph) (threadDelay 500000 >> heartbeat)
 
-    -- Coverage seen/total enemies, front mean-x, and combat y-spread.
-    showTel (seen, tot) (cx, maxY) =
+    -- Coverage seen/total enemies, front mean-x, combat y-spread, and the
+    -- over-eager pair (bad = nearest foe counters me, out = locally outnumbered).
+    showTel (seen, tot) (cx, maxY) (bad, out) =
       "cov=" ++ show seen ++ "/" ++ show tot ++ " frontx=" ++ show (round cx :: Int) ++ " ymax=" ++ show (round maxY :: Int)
+        ++ " bad=" ++ show (round (bad * 100) :: Int) ++ "% out=" ++ show (round (out * 100) :: Int) ++ "%"
 
     baseHpOf team =
       cfold (\acc (t :: Team, k :: Kind, Health h) -> if t == team && k == Base then h else acc) baseHp

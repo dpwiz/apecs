@@ -28,9 +28,29 @@ Make the battlefield genuinely 2D so vision (and thus knowledge) is partial:
   real investment with real payoff, and the counter-game uncertain → divergent,
   decisive rounds.
 
-## Still to add (engagement-quality + decisiveness instruments)
+## Wider field (bases ±480) already restores fog
 
-- **Kill matrix** by (attacker→victim) type → feed-rate (units dying into losing
-  matchups) to measure the *suicidal advance* problem.
+Side effect of the 2× field: enemy coverage drops from 34/34 to **~5–17/34**
+each side — fog is consequential from arena size alone, before any vision tuning.
+
+## Over-eager instruments: bad-fight + outnumbered rates
+
+Added `engageRates` to the heartbeat, per team:
+- **bad** = fraction whose nearest enemy hard-counters them (a fight to avoid),
+- **out** = fraction locally outnumbered within a 70px skirmish radius.
+
+Headless reads **both low** (mostly 0%, rare 3–15% spikes). Units are *not*
+systematically standing in counter matchups (the two sides keep mirrored comps,
+so nearest-enemy is usually the same type) nor charging into superior local
+force. So the "too eager to advance into certain death" the user saw is most
+likely the **relentless press-into-melee** itself (units always close, added to
+break the stalemate) rather than bad target selection — a behaviour to temper
+carefully (tempering risks re-stalemating). Needs the user's live read on the new
+(wider-field) build to confirm before changing the press.
+
+## Still to add
+
 - **Per-round draw terminator** (`cRoundCap`) so draw-rate is countable, plus a
-  per-round summary aggregator (divergence, lead-flips, front travel).
+  per-round aggregator (divergence, lead-flips, front travel).
+- Possibly **trade efficiency** (per-unit damage dealt before death) if bad/out
+  prove too coarse for the feeding the user observed.
