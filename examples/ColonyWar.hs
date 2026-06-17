@@ -305,6 +305,12 @@ data Config = Config
   -- ^ After the first base falls, how long (microseconds) to wait before scoring.
   -- If the other base also falls within this window the round is a draw -- a
   -- mutual strike that traded both spawners is not a win for whoever landed first.
+  , cRoundCap :: Int
+  -- ^ A round with no spawner razed by this wall-clock (microseconds; 0 ==
+  -- unbounded) is a legitimate draw: two competent defenses neither side could
+  -- crack. Not a rig -- the defenders /held/; the attackers simply did not earn
+  -- a breach. (The cure for too many of these is a real breakthrough avenue, not
+  -- a weaker garrison.)
   , cMaxSeconds :: Int
   -- ^ Headless wall-clock budget before the process exits (0 == unbounded).
   , cDebug :: Bool
@@ -334,6 +340,7 @@ displayCfg =
     , cPoll = 100000
     , cOver = 4000000
     , cGrace = 2500000
+    , cRoundCap = 90000000
     , cMaxSeconds = 0
     , cDebug = False
     , cMuster = True
@@ -352,6 +359,7 @@ headlessCfg =
     , cPoll = 5000
     , cOver = 300000
     , cGrace = 2500000
+    , cRoundCap = 90000000
     , cMaxSeconds = 180
     , cDebug = True
     , cMuster = True
@@ -569,12 +577,16 @@ stepUnit cfg ety = do
     else do
       myTeam <- get ety
       myType <- get ety
+      myRole <- get ety
       Position p <- get ety
       let vis2 = sq (typeVision myType)
           range2 = sq (typeRange myType)
           speed = typeSpeed myType
+      -- Cohesion is /role-local/: a unit pulls only toward same-role friends, so
+      -- the flank coheres into its own fist (concentration at the decisive point)
+      -- rather than being sucked into the main-body blob.
       (mUnit, mBase, sep, allyNear, coh) <-
-        cfoldM (gather p myTeam vis2) (Nothing, Nothing, V2 0 0, 0 :: Int, V2 0 0)
+        cfoldM (gather p myTeam myRole vis2) (Nothing, Nothing, V2 0 0, 0 :: Int, V2 0 0)
       -- The nearest enemy /soldier/'s type, for the kiting decision (one read,
       -- same transaction/snapshot as the gather, so it is consistent). Only
       -- needed when kiting is enabled, so the normal game pays nothing.
@@ -584,7 +596,6 @@ stepUnit cfg ety = do
             Just (e, _, _) -> Just <$> get e
             Nothing -> pure Nothing
           else pure Nothing
-      myRole <- get ety
       -- The movement target: close on the nearest enemy soldier, or the base
       -- once their soldiers clear.
       let target = case mUnit of
@@ -651,8 +662,12 @@ stepUnit cfg ety = do
                 V2 obx _ = homeBase
                 Entity eid = ety
                 frac z = z - fromIntegral (floor z :: Int)
-                sx = frac (fromIntegral eid * 0.6180339887)
-                sy = frac (fromIntegral eid * 0.3819660113) * 2 - 1
+                -- R2 (Roberts) low-discrepancy sequence: two INDEPENDENT
+                -- irrationals (1/plastic, 1/plastic^2). The old pair (0.618,
+                -- 0.382 = 1-0.618) was linearly dependent, collapsing the scatter
+                -- onto a line; these genuinely tile the 2D field.
+                sx = frac (fromIntegral eid * 0.7548776662)
+                sy = frac (fromIntegral eid * 0.5698402910) * 2 - 1
              in V2 (obx + (ebx - obx) * sx) (sy * 280)
           -- Counter-recon: an enemy /scout/ nearby gets hunted (deny their eyes);
           -- a real threat it can't kite gets fled (a scout rarely outvalues itself).
@@ -703,19 +718,23 @@ stepUnit cfg ety = do
           approach = case dest of
             Just d -> normalize (d - p) ^* (speed * dt)
             Nothing -> V2 0 0
-          -- Only the main body coheres, into the fixing front -- and even then
-          -- not once it is in reach of a target (else two cohered blobs bounce
-          -- off each other and the front freezes). The flank must stay free to
-          -- peel off to the base; cohering it just sucks it back into the front
-          -- blob. Recon and the garrison never cohere.
+          -- Main body and flank both cohere -- now role-locally (the gather only
+          -- summed same-role friends), so the flank forms its own fist (mass at
+          -- the decisive point) instead of merging into the front. A unit in
+          -- reach of a target releases cohesion and presses (else two cohered
+          -- blobs bounce off and the front freezes). Recon and the garrison
+          -- spread, never cohere.
           cohesion = case (myRole, struck) of
-            (MainBody, Nothing) | quadrance coh > 1e-6 -> normalize coh ^* cohesionPull
-            _ -> V2 0 0
+            (Recon, _) -> V2 0 0
+            (Defend, _) -> V2 0 0
+            (_, Just _) -> V2 0 0
+            _ | quadrance coh > 1e-6 -> normalize coh ^* cohesionPull
+              | otherwise -> V2 0 0
       set ety (Position (p + approach + sep + cohesion))
       pure True
   where
     dt = fromIntegral (cTick cfg) / 1e6
-    gather p myTeam vis2 (mUnit, mBase, sep, allies, coh) (t :: Team, k :: Kind, Position q, e) =
+    gather p myTeam myRole vis2 (mUnit, mBase, sep, allies, coh) (t :: Team, k :: Kind, Position q, r :: Role, e) =
       pure (mUnit', mBase', sep', allies', coh')
       where
         dv = q - p
@@ -730,12 +749,12 @@ stepUnit cfg ety = do
         allies'
           | t == myTeam && k == Soldier && e /= ety && d2 <= musterRadius2 = allies + 1
           | otherwise = allies
-        -- Cohesion: pull toward friendly soldiers in the band just beyond the
-        -- shoving range and within 'cohesionRadius', so the force draws together
-        -- into local groups that move and fight as one (no more trickle) instead
-        -- of smearing toward a central waypoint as isolated specks.
+        -- Cohesion: pull toward friendly soldiers /of my own role/ in the band
+        -- beyond shoving range out to 'cohesionRadius', so each task force draws
+        -- into its own local group -- the flank into a concentrated fist, the
+        -- main body into the front -- rather than smearing or merging together.
         coh'
-          | t == myTeam && k == Soldier && e /= ety && d2 > collideDist2 && d2 < cohesionRadius2 = coh + dv
+          | t == myTeam && k == Soldier && r == myRole && e /= ety && d2 > collideDist2 && d2 < cohesionRadius2 = coh + dv
           | otherwise = coh
         mUnit'
           | seen && k == Soldier = closer mUnit e q d2
@@ -1080,7 +1099,7 @@ strategist cfg team base = loop
 -- a flanking force, a home garrison, and the main body (the remainder).
 flankShare, defendShare :: Double
 flankShare = 0.45
-defendShare = 0.1
+defendShare = 0.2
 
 -- | Task-force role for a fresh soldier (exp 007): Hunters scout + screen
 -- (Recon); the rest split into the Flank (strike the base), a Defend garrison
@@ -1163,8 +1182,10 @@ startRound cfg n = do
     set global (Plans (initialPlan Red) (initialPlan Blue))
     set global (ThreatMem (Threat 0 0 pick 0 0) (Threat 0 0 (negate pick) 0 0))
     set global Playing
-  redBase <- atomically $ newEntity (Red, Base, Position (basePos Red), Health baseHp)
-  blueBase <- atomically $ newEntity (Blue, Base, Position (basePos Blue), Health baseHp)
+  -- Bases carry a (behaviourally inert) Role only so the role-aware gather fold
+  -- still sees them as targets; Defend reads sensibly for the thing defended.
+  redBase <- atomically $ newEntity (Red, Base, Position (basePos Red), Health baseHp, Defend)
+  blueBase <- atomically $ newEntity (Blue, Base, Position (basePos Blue), Health baseHp, Defend)
   void $ forkSys (spawnerThread cfg redBase Red)
   void $ forkSys (spawnerThread cfg blueBase Blue)
   void $ forkSys (strategist cfg Red redBase)
@@ -1261,20 +1282,27 @@ coordinator cfg = loop (1 :: Int)
     bothAlive redBase blueBase =
       atomically ((,) <$> exists redBase (Proxy @Health) <*> exists blueBase (Proxy @Health))
 
-    -- Wait until a base falls, then hold a grace countdown: if the other base
-    -- falls within it too, the round is a draw (a mutual strike traded both
-    -- spawners); otherwise the surviving side wins. Returns Nothing for a draw.
-    waitWinner redBase blueBase = do
-      (ra, ba) <- bothAlive redBase blueBase
-      if ra && ba
-        then threadDelay (cPoll cfg) >> waitWinner redBase blueBase
-        else do
-          threadDelay (cGrace cfg)
-          (ra', ba') <- bothAlive redBase blueBase
-          pure $ case (ra', ba') of
-            (False, False) -> Nothing
-            (True, _) -> Just Red
-            (_, True) -> Just Blue
+    -- Poll until a base falls (or the round cap is hit -- a stalemate draw, two
+    -- competent defenses neither could crack), then hold a grace countdown: if
+    -- the other base falls within it too, that is also a draw (a mutual strike
+    -- traded both spawners); otherwise the survivor wins. Nothing == draw.
+    waitWinner redBase blueBase = poll cap
+      where
+        cap = if cRoundCap cfg <= 0 then maxBound else cRoundCap cfg `div` max 1 (cPoll cfg)
+        poll k = do
+          (ra, ba) <- bothAlive redBase blueBase
+          if ra && ba
+            then
+              if k <= (0 :: Int)
+                then pure Nothing
+                else threadDelay (cPoll cfg) >> poll (k - 1)
+            else do
+              threadDelay (cGrace cfg)
+              (ra', ba') <- bothAlive redBase blueBase
+              pure $ case (ra', ba') of
+                (False, False) -> Nothing
+                (True, _) -> Just Red
+                (_, True) -> Just Blue
 
     report n outcome = do
       (KillScore kr kb, Wins wr wb, dl) <-
