@@ -402,12 +402,11 @@ dbg cfg msg = when (cDebug cfg) (traceM msg)
 -- Tunables ------------------------------------------------------------------
 
 -- | Population ceiling per colony. We want this in the thousands (it's a
--- concurrency lab; green threads are cheap) -- but the per-tick neighbour scan is
--- currently O(n^2) (every unit folds over every entity), so the sim, not the
--- threads, is the wall. Held at an interim smooth value until a spatial index
--- makes neighbour queries O(1) and we can truly let them rip.
+-- concurrency lab; green threads are cheap). The per-tick neighbour scan is now
+-- O(local density) via the spatial grid rather than O(n) per unit, so the cap can
+-- climb -- raised toward that as the grid and declumping let it run smoothly.
 capPerTeam :: Int
-capPerTeam = 64
+capPerTeam = 128
 
 baseHp :: Float
 baseHp = 380
@@ -447,7 +446,7 @@ flankTurnIn = 150
 -- the clump enough to read.
 baseRadius, collideDist, sepStrength, spawnRadius :: Float
 baseRadius = 22
-collideDist = 16
+collideDist = 20
 sepStrength = 0.6
 spawnRadius = 40
 
@@ -796,15 +795,13 @@ stepUnit cfg ety = do
             Just (_, tPos, _) -> p + (let v = p - tPos in if quadrance v > 1e-6 then normalize v else V2 0 1) ^* 90
             Nothing -> p
           reconDanger = case mUnit of Just (_, _, d2) -> d2 < dangerR2; Nothing -> False
-          -- Home garrison: ring the base (a golden-angle slot per unit, so they
-          -- cover every approach) and intercept anything that reaches it. The
-          -- ring sits INSIDE the garrison's own sight radius, so an attacker that
-          -- closes onto the base stays visible and gets answered -- rather than
-          -- slipping under a too-distant ring while the defenders hold position,
-          -- blind, as the base is razed behind them.
-          ringPoint =
-            let rang = fromIntegral eid * 2.39996323
-             in homeBase + V2 (cos rang) (sin rang) ^* (baseRadius * 2.5)
+          -- Home garrison: screen the base and intercept anything that reaches it.
+          -- Each defender takes a distinct bearing AND a distinct radius (R2 over
+          -- an annulus: sqrt(udepth) for even area density), so they spread into a
+          -- defensive disc instead of squatting on each other along one thin ring.
+          -- The annulus stays close enough that an attacker on the base is still in
+          -- sight and gets answered.
+          ringPoint = homeBase + udir ^* (baseRadius * 1.6 + sqrt udepth * 60)
           homeThreatR2 = sq 240
           dest = case myRole of
             -- Maneuver force: once recon has FOUND the spawner, ignore the frontal
