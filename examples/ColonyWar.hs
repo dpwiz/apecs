@@ -65,7 +65,7 @@ module Main (main) where
 import Control.Monad (foldM, forM_, void, when)
 import Data.Bits (shiftR, xor)
 import Data.Char (toLower)
-import Data.List (intercalate, isPrefixOf, partition)
+import Data.List (foldl', intercalate, isPrefixOf, partition)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as DM
 import Debug.Trace (traceM)
@@ -276,6 +276,19 @@ instance Semigroup Viewpoint where _ <> b = b
 instance Monoid Viewpoint where mempty = ViewAll
 instance Component Viewpoint where type Storage Viewpoint = Global Viewpoint
 
+-- | A snapshot spatial index: occupied cells -> the units/bases in them. Rebuilt
+-- once per tick by a single refresher, read by every unit, so a unit's neighbour
+-- query (separation, cohesion, target) scans only its 3x3 cell block instead of
+-- folding over ALL entities -- turning the per-tick cost from O(n) per unit
+-- (O(n^2) overall) into O(local density). The snapshot is at most one tick stale,
+-- which is fine for forces that already act on independent clocks. A 'Global'.
+type GridEntry = (Team, Kind, Role, Entity, V2 Float)
+
+newtype Grid = Grid (DM.Map (Int, Int) [GridEntry])
+instance Semigroup Grid where _ <> b = b
+instance Monoid Grid where mempty = Grid DM.empty
+instance Component Grid where type Storage Grid = Global Grid
+
 -- | Every component an entity owns, so we can delete it in one go (the extra
 -- deletes are harmless no-ops for entities that lack a component).
 type All = (Position, Health, Team, Kind, UnitType, Attacking, Role)
@@ -300,6 +313,7 @@ makeWorld
   , ''ShowRange
   , ''ShowAttacks
   , ''Viewpoint
+  , ''Grid
   , ''Camera
   ]
 
@@ -565,6 +579,68 @@ setTeamPlan Blue p (Plans r _) = Plans r p
 initialPlan :: Team -> TeamPlan
 initialPlan team = TeamPlan Hunter (basePos team) 1 Nothing Nothing
 
+-- Spatial index --------------------------------------------------------------
+
+-- | Grid cell size = the largest neighbour-query radius (max unit vision), so a
+-- unit's own cell plus its 8 neighbours is guaranteed to contain every entity
+-- within its vision -- no query needs to look further than one cell away.
+gridCellSize :: Float
+gridCellSize = 170
+
+gridCell :: V2 Float -> (Int, Int)
+gridCell (V2 x y) = (floor (x / gridCellSize), floor (y / gridCellSize))
+
+-- | Rebuild the snapshot in one transaction. Used by the synchronous matchup
+-- harness, where there is no concurrent writer to contend with. Bases carry a
+-- Role too, so they land in the grid and stay visible as targets.
+rebuildGrid :: SystemSTM ()
+rebuildGrid = do
+  m <-
+    cfold
+      (\acc (t :: Team, k :: Kind, r :: Role, Position q, e :: Entity) -> DM.insertWith (++) (gridCell q) [(t, k, r, e, q)] acc)
+      DM.empty
+  set global (Grid m)
+
+-- | Every entity in the 3x3 cell block around a point -- the candidate neighbours.
+gridNeighbors :: Grid -> V2 Float -> [GridEntry]
+gridNeighbors (Grid m) p =
+  let (cx, cy) = gridCell p
+   in concat [DM.findWithDefault [] (cx + dx, cy + dy) m | dx <- [-1, 0, 1], dy <- [-1, 0, 1]]
+
+-- | How often the spatial snapshot is rebuilt. Deliberately MUCH coarser than the
+-- unit tick: every unit reads the grid, so a frequent rewrite would invalidate
+-- their in-flight transactions and cause an STM retry storm (it is a single-
+-- writer/many-reader hot cell). At ~25 ms the snapshot is only a few px stale --
+-- negligible against a 170 px cell -- while the rewrite barely contends.
+gridRefreshUs :: Int
+gridRefreshUs = 25000
+
+-- | A standalone thread that refreshes the spatial snapshot for the whole match
+-- (across rounds). The naive version -- read EVERY position in one transaction --
+-- livelocks: with the unit threads constantly writing positions, a single giant
+-- read set can never commit, so it spins forever burning a core and starving the
+-- sim. Instead: list the entities by their STATIC attrs (Team/Kind/Role/Entity --
+-- never written after spawn, so conflict-free with movement), then read each
+-- position in its own tiny transaction (conflicts only with that one unit, and
+-- only briefly). The snapshot is mildly inconsistent across entities, which is
+-- fine -- it is already a stale approximation.
+gridRefresher :: Config -> SystemIO ()
+gridRefresher _cfg = loop
+  where
+    loop = do
+      ents <- atomically $ cfold (\acc (t :: Team, k :: Kind, r :: Role, e :: Entity) -> (t, k, r, e) : acc) []
+      entries <- foldM addEntry [] ents
+      atomically $ set global (Grid (DM.fromListWith (++) entries))
+      threadDelay gridRefreshUs
+      loop
+    addEntry acc (t, k, r, e) = do
+      mq <- atomically $ do
+        ok <- exists e (Proxy @Position)
+        if ok then (\(Position q) -> Just q) <$> get e else pure Nothing
+      pure $ case mq of
+        Just q -> (gridCell q, [(t, k, r, e, q)]) : acc
+        Nothing -> acc
+
 -- Per-soldier AI ------------------------------------------------------------
 
 {- | One atomic turn for a single soldier. Returns whether it is still alive
@@ -596,15 +672,18 @@ stepUnit cfg ety = do
       -- Cohesion is /role-local/: a unit pulls only toward same-role friends, so
       -- the flank coheres into its own fist (concentration at the decisive point)
       -- rather than being sucked into the main-body blob.
-      (mUnit, mBase, sep, allyNear, coh) <-
-        cfoldM (gather p myTeam myRole vis2) (Nothing, Nothing, V2 0 0, 0 :: Int, V2 0 0)
-      -- The nearest enemy /soldier/'s type, for the kiting decision (one read,
-      -- same transaction/snapshot as the gather, so it is consistent). Only
-      -- needed when kiting is enabled, so the normal game pays nothing.
+      grid <- get global
+      let (mUnit, mBase, sep, allyNear, coh) =
+            foldl' (gather p myTeam myRole vis2) (Nothing, Nothing, V2 0 0, 0 :: Int, V2 0 0) (gridNeighbors grid p)
+      -- The nearest enemy /soldier/'s type, for the kiting decision. The target
+      -- comes from the (slightly stale) grid snapshot, so it may have died since;
+      -- guard the read -- a missing type just means "don't kite this tick".
       mUnitType <-
         if cKite cfg
           then case mUnit of
-            Just (e, _, _) -> Just <$> get e
+            Just (e, _, _) -> do
+              ok <- exists e (Proxy @UnitType)
+              if ok then Just <$> get e else pure Nothing
             Nothing -> pure Nothing
           else pure Nothing
       -- The movement target: close on the nearest enemy soldier, or the base
@@ -791,8 +870,8 @@ stepUnit cfg ety = do
       pure True
   where
     dt = fromIntegral (cTick cfg) / 1e6
-    gather p myTeam myRole vis2 (mUnit, mBase, sep, allies, coh) (t :: Team, k :: Kind, Position q, r :: Role, e) =
-      pure (mUnit', mBase', sep', allies', coh')
+    gather p myTeam myRole vis2 (mUnit, mBase, sep, allies, coh) (t, k, r, e, q) =
+      (mUnit', mBase', sep', allies', coh')
       where
         dv = q - p
         d2 = quadrance dv
@@ -1728,6 +1807,7 @@ runBattle cfg = loop (0 :: Int)
             atomically $
               cfold (\acc (k :: Kind, e :: Entity) -> if k == Soldier then e : acc else acc) []
           order <- liftIO (shuffleIO ents)
+          atomically rebuildGrid
           mapM_ (\e -> atomically (void (stepUnit cfg e))) order
           when (cArena cfg > 0) $
             atomically $
@@ -1768,6 +1848,18 @@ runMatchups args = do
               atomically $ cmapM_ (\(_ :: Team, e :: Entity) -> destroy e (Proxy @All))
               spawnArmy Red redC (V2 (-70) 0)
               spawnArmy Blue blueC (V2 70 0)
+              -- There is no strategist in the harness, so hand each side a standing
+              -- plan that points at the other: contact at the enemy column so the
+              -- main body closes and fights (without it, short-sighted units never
+              -- make contact and every non-Hunter matchup draws). Raw combat, which
+              -- is what the harness is meant to measure.
+              atomically $
+                set
+                  global
+                  ( Plans
+                      (TeamPlan Hunter (V2 70 0) 1 Nothing (Just (V2 70 0)))
+                      (TeamPlan Hunter (V2 (-70) 0) 1 Nothing (Just (V2 (-70) 0)))
+                  )
               o <- runBattle cfg
               pure $ case o of
                 Just Red -> (r + 1, b, d)
@@ -1815,6 +1907,7 @@ runGame args = do
     set global (ShowRange False)
     set global (ShowAttacks True)
     set global (ViewAll :: Viewpoint)
+    void $ forkSys (gridRefresher cfg)
     void $ forkSys (coordinator cfg)
     if cHeadless cfg
       then do
