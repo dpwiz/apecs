@@ -182,6 +182,15 @@ instance Semigroup ShowAttacks where _ <> b = b
 instance Monoid ShowAttacks where mempty = ShowAttacks True
 instance Component ShowAttacks where type Storage ShowAttacks = Global ShowAttacks
 
+-- | Whose fog to render through. 'ViewAll' draws everything (omniscient, the
+-- default); 'ViewSide' t draws only what team @t@ can actually see -- its own
+-- units and bases, plus enemies inside its vision -- so you can watch the battle
+-- through one colony's partial information. Toggled with the @[@ and @]@ keys.
+data Viewpoint = ViewAll | ViewSide Team
+instance Semigroup Viewpoint where _ <> b = b
+instance Monoid Viewpoint where mempty = ViewAll
+instance Component Viewpoint where type Storage Viewpoint = Global Viewpoint
+
 -- | Every component an entity owns, so we can delete it in one go (the extra
 -- deletes are harmless no-ops for entities that lack a component).
 type All = (Position, Health, Team, Kind, UnitType, Attacking)
@@ -202,6 +211,7 @@ makeWorld
   , ''ShowVision
   , ''ShowRange
   , ''ShowAttacks
+  , ''Viewpoint
   , ''Camera
   ]
 
@@ -374,10 +384,12 @@ advantage atk def
   | beats def atk = 0.5
   | otherwise = 1.0
 
--- | Spawn anchor for a team, at the left/right edge of the battlefield.
+-- | Spawn anchor for a team, at the left/right edge of the battlefield. Set wide
+-- (the field is ~2x the old one) so there is room to manoeuvre and so a base's
+-- own sight no longer spans midfield -- recon has to earn the picture.
 basePos :: Team -> V2 Float
-basePos Red = V2 (-260) 0
-basePos Blue = V2 260 0
+basePos Red = V2 (-480) 0
+basePos Blue = V2 480 0
 
 enemyOf :: Team -> Team
 enemyOf Red = Blue
@@ -892,20 +904,37 @@ draw = do
   -- never a half-destroyed unit, even with hundreds of threads mutating the
   -- stores. Bases, soldiers, populations and the optional vision overlay all
   -- come from this one snapshot.
-  (visionPic, attackPic, basePic, soldierPic, redPop, bluePop, KillScore kr kb, Wins wr wb, phase, Plans rPlan bPlan, dl) <-
+  (visionPic, attackPic, basePic, soldierPic, fogPic, vp, redPop, bluePop, KillScore kr kb, Wins wr wb, phase, Plans rPlan bPlan, dl) <-
     atomically $ do
+      vp <- get global :: SystemSTM Viewpoint
+      -- When viewing through one side's eyes, gather that side's sight sources
+      -- (its base plus every friendly soldier's recon); enemies outside them are
+      -- hidden. 'vis t q' = is a thing of team t at q visible to the viewer?
+      let viewer = case vp of ViewAll -> Nothing; ViewSide s -> Just s
+      sources <- case viewer of
+        Nothing -> pure []
+        Just s -> do
+          us <-
+            cfold
+              (\acc (t :: Team, ut :: UnitType, Position q) -> if t == s then (q, typeVision ut) : acc else acc)
+              []
+          pure ((basePos s, baseVision) : us)
+      let vis t q = case viewer of
+            Nothing -> True
+            Just s -> t == s || any (\(c, r) -> quadrance (q - c) <= r * r) sources
       basePic <-
         cfoldM
           ( \acc (t :: Team, k :: Kind, Position (V2 x y), Health hp) ->
               pure $ case k of
-                Base -> acc <> translate x y (baseGlyph t hp)
-                Soldier -> acc
+                Base | vis t (V2 x y) -> acc <> translate x y (baseGlyph t hp)
+                _ -> acc
           )
           mempty
+      -- Pop counts are the true totals (HUD meta), but only visible glyphs draw.
       (soldierPic, rp, bp) <-
         cfoldM
           ( \(!acc, !rp, !bp) (t :: Team, ut :: UnitType, Position (V2 x y)) ->
-              let acc' = acc <> translate x y (unitGlyph t ut)
+              let acc' = if vis t (V2 x y) then acc <> translate x y (unitGlyph t ut) else acc
                   (rp', bp') = case t of
                     Red -> (rp + 1, bp)
                     Blue -> (rp, bp + 1)
@@ -920,29 +949,40 @@ draw = do
           <$> (if showV then visionOverlay else pure mempty)
           <*> (if showR then rangeOverlay else pure mempty)
       attackPic <- if showA then attackLines else pure mempty
+      -- A faint wash over the viewer's own sight discs, marking the lit area so
+      -- the dark unseen field is obvious.
+      let fogPic = case viewer of
+            Nothing -> mempty
+            Just s -> mconcat [translate cx cy (color (withAlpha 0.05 (teamColor s)) (circleSolid r)) | (V2 cx cy, r) <- sources]
       ks <- get global :: SystemSTM KillScore
       wns <- get global :: SystemSTM Wins
       ph <- get global :: SystemSTM Phase
       pl <- get global :: SystemSTM Plans
       dmg <- get global :: SystemSTM DamageLog
-      pure (visionPic, attackPic, basePic, soldierPic, rp, bp, ks, wns, ph, pl, dmg)
-  -- Two left-aligned rows: a single long row clips off the right window edge.
-  let hud =
-        label (teamColor Red) (-310) 210 ("RED   pop " ++ show redPop ++ "   next " ++ show (planNext rPlan) ++ "   kills " ++ show kr ++ "   wins " ++ show wr)
-          <> label (teamColor Blue) (-310) 190 ("BLUE  pop " ++ show bluePop ++ "   next " ++ show (planNext bPlan) ++ "   kills " ++ show kb ++ "   wins " ++ show wb)
-          <> label (greyN 0.5) (-310) (-230) "v: vision   r: range   a: attacks   esc: quit"
+      pure (visionPic, attackPic, basePic, soldierPic, fogPic, vp, rp, bp, ks, wns, ph, pl, dmg)
+  -- Two left-aligned rows in the top-left of the (1600x900) window.
+  let viewLabel = case vp of
+        ViewAll -> "viewpoint: ALL (omniscient)"
+        ViewSide Red -> "viewpoint: RED  (fog -- only what Red sees)"
+        ViewSide Blue -> "viewpoint: BLUE (fog -- only what Blue sees)"
+      viewCol = case vp of ViewAll -> greyN 0.5; ViewSide t -> teamColor t
+      hud =
+        label (teamColor Red) (-780) 420 ("RED   pop " ++ show redPop ++ "   next " ++ show (planNext rPlan) ++ "   kills " ++ show kr ++ "   wins " ++ show wr)
+          <> label (teamColor Blue) (-780) 396 ("BLUE  pop " ++ show bluePop ++ "   next " ++ show (planNext bPlan) ++ "   kills " ++ show kb ++ "   wins " ++ show wb)
+          <> label viewCol (-780) 372 viewLabel
+          <> label (greyN 0.5) (-780) (-430) "v: vision   r: range   a: attacks   [ ]: viewpoint   esc: quit"
       overlay = case phase of
         Playing -> mempty
         RoundOver w ->
-          color (withAlpha 0.74 black) (rectangleSolid 660 500)
+          color (withAlpha 0.74 black) (rectangleSolid 1600 900)
             <> label white (-58) 215 "ROUND OVER"
             <> label (teamColor w) (-85) 185 (show w ++ " TEAM WINS")
             <> label white (-150) 158 ("kills R " ++ show kr ++ " / B " ++ show kb ++ "     match R " ++ show wr ++ " / B " ++ show wb)
             <> damageBlock (teamColor Red) (-312) 116 "RED damage  (attacker vs defender)" (teamMatrix Red dl)
             <> damageBlock (teamColor Blue) (-312) (-24) "BLUE damage  (attacker vs defender)" (teamMatrix Blue dl)
-  -- Tracers go on /top/ of the glyphs: a hit only fires within attack range, so
-  -- the line is short and would otherwise hide under the units it connects.
-  pure (visionPic <> basePic <> soldierPic <> attackPic <> hud <> overlay)
+  -- Fog wash sits under the glyphs; tracers go on /top/ (a hit fires within attack
+  -- range, so the line is short and would otherwise hide under the units).
+  pure (fogPic <> visionPic <> basePic <> soldierPic <> attackPic <> hud <> overlay)
 
 -- | A round-end ledger block: a title and one line per attacker type listing
 -- the damage it dealt to (vs Hunter / vs Guard / vs Lance).
@@ -1008,7 +1048,15 @@ handleEvent (EventKey (SpecialKey KeyEsc) Down _ _) = liftIO exitSuccess
 handleEvent (EventKey (Char 'v') Down _ _) = modify global (\(ShowVision b) -> ShowVision (not b))
 handleEvent (EventKey (Char 'r') Down _ _) = modify global (\(ShowRange b) -> ShowRange (not b))
 handleEvent (EventKey (Char 'a') Down _ _) = modify global (\(ShowAttacks b) -> ShowAttacks (not b))
+-- '[' views through Red (left), ']' through Blue (right); pressing the active
+-- side's key again clears back to the omniscient view.
+handleEvent (EventKey (Char '[') Down _ _) = modify global (toggleView Red)
+handleEvent (EventKey (Char ']') Down _ _) = modify global (toggleView Blue)
 handleEvent _ = pure ()
+
+toggleView :: Team -> Viewpoint -> Viewpoint
+toggleView t (ViewSide s) | s == t = ViewAll
+toggleView t _ = ViewSide t
 
 -- | Deliberately empty: all game logic runs on the forked threads.
 step :: Float -> SystemIO ()
@@ -1166,12 +1214,17 @@ runGame args = do
   let cfg
         | any (`elem` ["--headless", "headless"]) args = headlessCfg
         | otherwise = displayCfg
+      -- 16:9 window (fits a 1080p screen); --fullscreen for a true full-screen.
+      display
+        | "--fullscreen" `elem` args = FullScreen
+        | otherwise = InWindow "STM Colony War" (1600, 900) (10, 10)
   w <- initWorld
   runWith w $ do
     set global (Camera 0 1)
     set global (ShowVision False)
     set global (ShowRange False)
     set global (ShowAttacks True)
+    set global (ViewAll :: Viewpoint)
     void $ forkSys (coordinator cfg)
     if cHeadless cfg
       then do
@@ -1181,7 +1234,7 @@ runGame args = do
           putStrLn "=== headless time limit reached ==="
           putStrLn ("  RED  " ++ matrixDump (teamMatrix Red dl))
           putStrLn ("  BLUE " ++ matrixDump (teamMatrix Blue dl))
-      else play (InWindow "STM Colony War" (660, 500) (10, 10)) black 60 draw handleEvent step
+      else play display black 60 draw handleEvent step
   where
     matrixDump rows =
       "damage " ++ intercalate "  " [show atk ++ " " ++ show wsc | (atk, wsc) <- rows]
