@@ -406,7 +406,7 @@ dbg cfg msg = when (cDebug cfg) (traceM msg)
 -- O(local density) via the spatial grid rather than O(n) per unit, so the cap can
 -- climb -- raised toward that as the grid and declumping let it run smoothly.
 capPerTeam :: Int
-capPerTeam = 128
+capPerTeam = 256
 
 baseHp :: Float
 baseHp = 380
@@ -446,7 +446,7 @@ flankTurnIn = 150
 -- the clump enough to read.
 baseRadius, collideDist, sepStrength, spawnRadius :: Float
 baseRadius = 22
-collideDist = 20
+collideDist = 26
 sepStrength = 0.6
 spawnRadius = 40
 
@@ -771,19 +771,21 @@ stepUnit cfg ety = do
             (Just eb, _)
               | picket -> eb + udir ^* (typeVision myType * 0.85)
               | otherwise -> eb + udir ^* (60 + 200 * udepth)
-            -- In contact, spawner still hidden: do NOT abandon the posts and pile
-            -- onto the fight. Hold a distributed observation NET -- each scout keeps
-            -- its own bearing (tilted toward the contact sector, spread retained)
-            -- and its own depth, the net spanning from the approach out to where the
-            -- base must be. Shallow posts keep the field watched; the deepest probe
-            -- through toward the spawner. Coverage is maintained, not collapsed.
-            (Nothing, Just c) ->
-              let toC = c - homeBase
-                  dist = sqrt (quadrance toC)
-                  bear = if dist > 1 then toC ^/ dist else udir
-                  mixed = bear ^* 0.6 + udir ^* 0.4
-                  mdir = if quadrance mixed > 1e-6 then normalize mixed else bear
-               in homeBase + mdir ^* (max 200 dist * (0.4 + 1.6 * udepth))
+            -- In contact, spawner still hidden: do NOT all pile toward the fight.
+            -- SPLIT the scouts -- only the pickets man the contact net (a wide arc
+            -- leaning lightly toward the contact, spanning depth toward the base);
+            -- the rest keep fanning the whole field (security + other approaches).
+            -- Halving the scouts on the cone is what actually cuts its over-density
+            -- (ovl), independent of how many Hunters the build fields.
+            (Nothing, Just c)
+              | picket ->
+                  let toC = c - homeBase
+                      dist = sqrt (quadrance toC)
+                      bear = if dist > 1 then toC ^/ dist else udir
+                      mixed = bear ^* 0.45 + udir ^* 0.55
+                      mdir = if quadrance mixed > 1e-6 then normalize mixed else bear
+                   in homeBase + mdir ^* (max 200 dist * (0.4 + 1.6 * udepth))
+              | otherwise -> homeBase + udir ^* (220 + 760 * udepth)
             (Nothing, Nothing) -> homeBase + udir ^* (220 + 760 * udepth)
           -- Counter-recon: an enemy /scout/ nearby gets hunted (deny their eyes);
           -- a real threat it can't kite gets fled (a scout rarely outvalues itself).
@@ -826,10 +828,15 @@ stepUnit cfg ety = do
               | enemyScoutNear -> case mUnit of Just (_, tPos, _) -> Just tPos; Nothing -> Just reconScout
               | reconDanger -> Just fleePoint
               | otherwise -> Just reconScout
-            -- Garrison: intercept an enemy that has reached home, else hold a ring.
+            -- Garrison: intercept an enemy that has reached home, else hold a ring
+            -- slot -- but with a tolerance, so once it is roughly on its slot it
+            -- STOPS pulling back to the exact point. Without that, separation bumps
+            -- a defender a pixel off, it darts back, gets bumped again -- an endless
+            -- jitter; the deadzone lets the slots settle, spaced by separation.
             Defend -> case mUnit of
               Just (_, tPos, _) | quadrance (tPos - homeBase) <= homeThreatR2 -> Just tPos
-              _ -> Just ringPoint
+              _ | quadrance (ringPoint - p) <= sq (collideDist * 1.3) -> Nothing
+                | otherwise -> Just ringPoint
             -- Main body: when recon has made contact, fix the enemy front (press
             -- into melee when supported, else mass at the home ring). With no
             -- contact, hold the home ring -- there is no front to march on yet.
