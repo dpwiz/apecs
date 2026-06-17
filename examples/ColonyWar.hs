@@ -437,14 +437,17 @@ flankY, flankTurnIn :: Float
 flankY = 250
 flankTurnIn = 150
 
--- | Soldiers shove each other apart so they don't stack into one pixel. This
--- packing is deliberately tight: concentration is what lets a winning army
--- overwhelm a thinner one locally and break through, which is how a round
--- actually ends. (Roomy spacing was tried and turned every round into an
--- endless even-trade grind.)
+-- | Soldiers shove each other apart so they don't stack into one pixel. Packing
+-- stays fairly tight -- concentration is what lets a winning army overwhelm a
+-- thinner one locally and break through, which is how a round actually ends, and
+-- roomy spacing once turned every round into an endless even-trade grind -- but
+-- 'collideDist' sets the personal space a cohered group settles at, so an
+-- over-small value clumps units into an illegible (and, for the spatial grid,
+-- query-heavy) ball. Held at a value that keeps the breakthrough while spreading
+-- the clump enough to read.
 baseRadius, collideDist, sepStrength, spawnRadius :: Float
 baseRadius = 22
-collideDist = 11
+collideDist = 16
 sepStrength = 0.6
 spawnRadius = 40
 
