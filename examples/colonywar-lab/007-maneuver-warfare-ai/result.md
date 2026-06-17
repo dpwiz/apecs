@@ -97,6 +97,14 @@ This is the milestone the whole arc was blocked on. The combination that did it:
 emergent cycle + press + fix-and-flank task forces + recon saturation + mixed
 builds + the base-razing fix + **asymmetric memory-driven flanks**.
 
+### Increment 3.1: cheap PRNG so the flank pairing is unpredictable
+A fixed Red-top/Blue-bottom seed is bankable. Added a cheap SplitMix64 finalizer
+(`mix64`) + per-team seed from the spawner position (`teamSeed`, guaranteed
+distinct). Each round the two colonies still take **opposite** flanks (divergence
+→ rounds keep ending), but **which** side takes top vs bottom flips per round via
+a coin seeded from the round + both positions — neither the enemy nor the AI can
+bank on a pattern. Rounds still resolve (3 in 180s, both winning).
+
 ### Next
 - **Defensive anticipation (point 2, the other half):** the same memory should
   make a colony *screen its own threatened flank* — right now nobody defends, so

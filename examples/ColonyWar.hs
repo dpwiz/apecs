@@ -63,6 +63,7 @@ Build with @-threaded -N@ so the threads actually run in parallel.
 module Main (main) where
 
 import Control.Monad (foldM, forM_, void, when)
+import Data.Bits (shiftR, xor)
 import Data.Char (toLower)
 import Data.List (intercalate, isPrefixOf)
 import qualified Data.Map.Strict as DM
@@ -441,6 +442,24 @@ basePos Blue = V2 480 0
 enemyOf :: Team -> Team
 enemyOf Red = Blue
 enemyOf Blue = Red
+
+-- | A cheap deterministic PRNG -- a SplitMix64 finalizer -- for the few moments
+-- the AI ought to surprise itself and the enemy rather than follow a fixed,
+-- bankable pattern. Seeded per team from the spawner position ('teamSeed',
+-- guaranteed distinct between the two colonies), usually mixed with a per-round
+-- nonce so the draw varies each round.
+mix64 :: Int -> Int
+mix64 x0 =
+  let x1 = (x0 `xor` (x0 `shiftR` 33)) * 6364136223846793005
+      x2 = (x1 `xor` (x1 `shiftR` 29)) * 1442695040888963407
+   in x2 `xor` (x2 `shiftR` 32)
+
+teamSeed :: Team -> Int
+teamSeed team = let V2 x y = basePos team in round (x * 73856093 + y * 19349663)
+
+-- | A +/-1 coin from a seed.
+coinSign :: Int -> Float
+coinSign s = if even (mix64 s) then 1 else -1
 
 teamColor :: Team -> Color
 teamColor Red = makeColor 0.9 0.3 0.3 1
@@ -960,14 +979,19 @@ spawnerThread cfg base team = loop
 -- spawner + strategist thread. Both colonies grow their armies from scratch out
 -- of an empty field -- no starting platoon -- so the opening is itself a
 -- recon-and-build contest. Returns the base ids so the coordinator can watch them.
-startRound :: Config -> SystemIO (Entity, Entity)
-startRound cfg = do
+startRound :: Config -> Int -> SystemIO (Entity, Entity)
+startRound cfg n = do
+  -- The two colonies commit to OPPOSITE opening flanks (so the maneuvers don't
+  -- mirror and collide), but which colony takes top vs bottom flips
+  -- unpredictably each round -- a cheap coin seeded from the round and both
+  -- spawner positions, so neither the enemy nor the AI itself can bank on it.
+  let pick = coinSign (mix64 n + teamSeed Red + teamSeed Blue)
   atomically $ do
     cmapM_ $ \(_ :: Team, e :: Entity) -> destroy e (Proxy @All)
     set global (mempty :: KillScore)
     set global (mempty :: DamageLog)
     set global (Plans (initialPlan Red) (initialPlan Blue))
-    set global (mempty :: ThreatMem) -- asymmetric flank seed: Red top, Blue bottom
+    set global (ThreatMem (Threat 0 0 pick) (Threat 0 0 (negate pick)))
     set global Playing
   redBase <- atomically $ newEntity (Red, Base, Position (basePos Red), Health baseHp)
   blueBase <- atomically $ newEntity (Blue, Base, Position (basePos Blue), Health baseHp)
@@ -986,7 +1010,7 @@ coordinator :: Config -> SystemIO ()
 coordinator cfg = loop (1 :: Int)
   where
     loop n = do
-      (redBase, blueBase) <- startRound cfg
+      (redBase, blueBase) <- startRound cfg n
       when (cDebug cfg) (void $ forkSys heartbeat)
       winner <- waitWinner redBase blueBase
       atomically $ do
