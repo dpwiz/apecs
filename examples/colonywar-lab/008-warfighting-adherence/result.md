@@ -55,3 +55,20 @@ now the instrument to tell whether such a mechanic actually raises adherence.
   baseline.
 - **Memory-driven defense** (bias the garrison to the remembered-threatened
   flank) so a *read* enemy gamble is punished — closing the risk/reward loop.
+
+## Addendum: information dynamics (surprise / KL / free energy)
+
+The threat memory *is* a generative model — a belief over which flank the enemy
+occupies. So each planning pass yields, online, in bits (added to `[score]`):
+- **`unc`** = entropy of the (normalised) flank belief — the side's *uncertainty*.
+- **`surp`** = surprisal: cross-entropy of this pass's sightings against the
+  *prior* belief — the prediction error (the quantity free energy bounds).
+- **`kl`** = Bayesian surprise `D_KL(posterior ‖ prior)` — how far the belief moved.
+
+Measured over a round: **`unc`=1.0 (max), `surp`≈0.15, `kl`≈0.0**. A side floats at
+*maximum uncertainty yet is never surprised* — a flat information landscape, no
+sharp reads, no reorientations. That is the **entropy deficit, in bits**: drama
+needs a side to form a *confident* belief (low `unc`) that then gets *violated*
+(a `kl` spike), and nothing currently creates that. So a genuine "risky avenue"
+isn't just measurable by win-variance — it should show as **`kl` spikes** on the
+side that gets read/feinted. The free-energy lens is now the drama dial.

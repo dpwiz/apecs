@@ -200,6 +200,13 @@ data Threat = Threat
   { thUp :: !Float
   , thDown :: !Float
   , thGap :: !Float
+  , thSurprise :: !Float
+  -- ^ EMA of the per-pass /surprisal/ (bits): cross-entropy of the latest
+  -- sightings against the prior belief over enemy flank -- the colony's
+  -- in-the-moment prediction error / "free-energy" signal.
+  , thKL :: !Float
+  -- ^ EMA of the per-pass /Bayesian surprise/ (bits): how far the sighting moved
+  -- the belief, D_KL(posterior || prior).
   }
   deriving (Show)
 
@@ -208,7 +215,7 @@ data Threat = Threat
 data ThreatMem = ThreatMem Threat Threat deriving (Show)
 instance Semigroup ThreatMem where _ <> b = b
 instance Monoid ThreatMem where
-  mempty = ThreatMem (Threat 0 0 1) (Threat 0 0 (-1))
+  mempty = ThreatMem (Threat 0 0 1 0 0) (Threat 0 0 (-1) 0 0)
 instance Component ThreatMem where type Storage ThreatMem = Global ThreatMem
 
 teamThreat :: Team -> ThreatMem -> Threat
@@ -964,7 +971,7 @@ planFor team = do
     cfold
       (\acc (t :: Team, ut :: UnitType) -> if t == team then bumpType ut acc else acc)
       (0, 0, 0)
-  Threat up0 down0 g0 <- teamThreat team <$> get global
+  Threat up0 down0 g0 surp0 kl0 <- teamThreat team <$> get global
   let visible = [(q, ut) | (q, ut) <- enemies, seenBy sources q]
       census = foldr (bumpType . snd) (0, 0, 0) visible
       waypoint = chooseWaypoint team (map fst visible)
@@ -978,7 +985,13 @@ planFor team = do
       up' = up0 * threatDecay + upSeen
       down' = down0 * threatDecay + downSeen
       gap = chooseGap g0 up' down'
-  modify global (setTeamThreat team (Threat up' down' gap))
+      -- Treat the (normalised) flank memory as a belief over where the enemy is,
+      -- and read off this pass's information dynamics: surprisal (cross-entropy
+      -- of the sightings against the PRIOR belief = prediction error), and the
+      -- Bayesian surprise KL(posterior || prior). Both EMA-smoothed for the
+      -- scorecard; held over passes with no sighting.
+      (surp', kl') = beliefSurprise (up0, down0) (up', down') (upSeen, downSeen) surp0 kl0
+  modify global (setTeamThreat team (Threat up' down' gap surp' kl'))
   modify global (setTeamPlan team (TeamPlan (planNextFor own (length visible) census) waypoint gap))
   where
     seenBy srcs q = any (\(s, r) -> quadrance (q - s) <= r * r) srcs
@@ -986,6 +999,36 @@ planFor team = do
 -- | How fast flank memory fades each planning pass (0 = goldfish, 1 = elephant).
 threatDecay :: Float
 threatDecay = 0.75
+
+-- | Information dynamics of one flank-belief update (all in bits). Inputs: the
+-- prior counts, the posterior counts, this pass's raw sightings, and the running
+-- EMAs. Returns the updated (surprisal, KL) EMAs -- surprisal = cross-entropy of
+-- the sightings against the /prior/ (prediction error / "free energy"), KL =
+-- D_KL(posterior || prior) (how much the belief moved). With no sighting the
+-- EMAs are held: nothing was observed, so there is no surprise.
+beliefSurprise :: (Float, Float) -> (Float, Float) -> (Float, Float) -> Float -> Float -> (Float, Float)
+beliefSurprise (u0, d0) (u1, d1) (us, ds) surp0 kl0
+  | us + ds <= 0 = (surp0, kl0)
+  | otherwise = (ema surp0 surprisal, ema kl0 kl)
+  where
+    eps = 0.5
+    norm a b = let s = a + b + 2 * eps in ((a + eps) / s, (b + eps) / s)
+    (pu0, pd0) = norm u0 d0
+    (pu1, pd1) = norm u1 d1
+    (ou, od) = let s = us + ds in (us / s, ds / s)
+    surprisal = negate (ou * logBase 2 pu0 + od * logBase 2 pd0)
+    kl = pu1 * logBase 2 (pu1 / pu0) + pd1 * logBase 2 (pd1 / pd0)
+    ema old new = old * 0.7 + new * 0.3
+
+-- | Entropy (bits) of a colony's belief over the enemy flank -- its uncertainty.
+beliefEntropy :: Float -> Float -> Float
+beliefEntropy u d =
+  let eps = 0.5
+      s = u + d + 2 * eps
+      pu = (u + eps) / s
+      pd = (d + eps) / s
+      h x = if x <= 0 then 0 else x * logBase 2 (1 / x)
+   in h pu + h pd
 
 -- | Commit the maneuver to the flank remembered as emptier, with hysteresis:
 -- only switch when the other flank is clearly (≥40%) lighter, so the force does
@@ -1103,7 +1146,7 @@ startRound cfg n = do
     set global (mempty :: DamageLog)
     set global (mempty :: BaseDamage)
     set global (Plans (initialPlan Red) (initialPlan Blue))
-    set global (ThreatMem (Threat 0 0 pick) (Threat 0 0 (negate pick)))
+    set global (ThreatMem (Threat 0 0 pick 0 0) (Threat 0 0 (negate pick) 0 0))
     set global Playing
   redBase <- atomically $ newEntity (Red, Base, Position (basePos Red), Health baseHp)
   blueBase <- atomically $ newEntity (Blue, Base, Position (basePos Blue), Health baseHp)
@@ -1154,8 +1197,9 @@ coordinator cfg = loop (1 :: Int)
         bconc <- concentration Blue
         rgrp <- groupCount Red
         bgrp <- groupCount Blue
+        tm <- get global
         bd <- get global
-        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf, (rbad, rout, rsg), (bbad, bout, bsg), (rconc, rgrp), (bconc, bgrp), bd)
+        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf, (rbad, rout, rsg), (bbad, bout, bsg), (rconc, rgrp, teamThreat Red tm), (bconc, bgrp, teamThreat Blue tm), bd)
       let teamDmgF t = sum [v | ((t', _, _), v) <- DM.toList dm, t' == t]
           teamDmg t = round (teamDmgF t) :: Int
       traceM $
@@ -1170,14 +1214,19 @@ coordinator cfg = loop (1 :: Int)
     -- recon = my coverage of the enemy; sec = 1 - the enemy's coverage of me;
     -- arms = combined-arms mix entropy; init = how deep my front is in his half;
     -- focus = force concentration; grp = number of distinct groups (smear vs
-    -- cohere); cog = share of my damage on his base.
-    scoreLine team myCov foeCov census (mx, _) (conc, grp) soldierDmg baseDmg =
+    -- cohere); cog = share of my damage on his base. unc/surp/kl = the in-the-
+    -- moment information dynamics of my belief over the enemy flank (bits):
+    -- uncertainty (entropy), surprisal (prediction error), Bayesian surprise.
+    scoreLine team myCov foeCov census (mx, _) (conc, grp, thr) soldierDmg baseDmg =
       let frac (s, t) = if t == 0 then 0 :: Float else fromIntegral s / fromIntegral t
           pct x = show (round (x * 100) :: Int)
+          bits x = show (fromIntegral (round (x * 100) :: Int) / 100 :: Float)
        in "recon=" ++ pct (frac myCov) ++ " sec=" ++ pct (1 - frac foeCov)
             ++ " arms=" ++ pct (armsEntropy census) ++ " init=" ++ pct (initiative team mx)
             ++ " focus=" ++ pct conc ++ " grp=" ++ show grp
             ++ " cog=" ++ pct (if soldierDmg + baseDmg <= 0 then 0 else baseDmg / (soldierDmg + baseDmg))
+            ++ " unc=" ++ bits (beliefEntropy (thUp thr) (thDown thr))
+            ++ " surp=" ++ bits (thSurprise thr) ++ " kl=" ++ bits (thKL thr)
 
     -- Coverage seen/total, front mean-x, combat y-spread, the over-eager pair
     -- (bad = nearest foe counters me, out = locally outnumbered), and siege =
