@@ -50,9 +50,31 @@ is the lack of information, and the counter to that is a balanced force."
 - **No memory** (point 2): forces don't anticipate a threat from a direction
   enemies were massing.
 
-### Next
-- **Increment 3 — threat memory (point 2):** remember last-seen enemy clusters
-  (decaying) to anticipate/defend a direction *and* drive the gap choice from each
-  side's own (different) recon picture → this should also **break the mirror**
-  (asymmetric memory → divergent flanks → a flank finds an undefended base).
-- **Mass-before-commit** for the flank, and remove the gladiatorial nudge.
+## Increment 2.5: bug fixes + objective-progress telemetry
+
+Playtest (0810aa6) caught two things — "2 hints for telemetry and its design
+process": a recon clumped as a rigid vertical line, and a unit sat *on* the enemy
+base dealing no damage.
+
+- **Bug fix — base never razed:** target selection always preferred the nearest
+  enemy *soldier*; a unit on the base, with any soldier in *vision* (even out of
+  range), targeted that soldier, failed the in-range check, and ignored the base
+  under it. Now: hit whatever is in reach; **Flank** units prioritize the base.
+- **Recon dispersion:** replaced the rigid per-id *lane* (a vertical line) with a
+  golden-ratio 2D scatter over the enemy half — natural saturation.
+- **Telemetry — `siege`** = own bodies within a few radii of the enemy base.
+  Read against the (already shown) enemy base HP, it makes "units squatting an
+  objective without reducing it" visible — which aggregate counts hid entirely.
+
+### What the new instrument revealed
+- **`siege=0` throughout** — flankers *never reach* the base; they collide in the
+  mirrored flank. So the base never falls and rounds never end. The blocker is
+  unambiguously the **mirror-flank symmetry**, not the razing. Process lesson
+  saved to memory: instrument *objective accomplishment*, not just existence.
+
+### Next (the real blocker)
+- **Threat memory (point 2) + break the mirror:** drive the gap from each side's
+  own (different, fog-limited) recon memory of where the enemy massed → divergent
+  flanks → a flank finds a genuinely undefended base. Memory does double duty:
+  anticipation *and* the symmetry-break.
+- **Mass-before-commit** for the flank; remove the last gladiatorial nudge.

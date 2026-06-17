@@ -498,13 +498,22 @@ stepUnit cfg ety = do
             Just (e, _, _) -> Just <$> get e
             Nothing -> pure Nothing
           else pure Nothing
+      myRole <- get ety
+      -- The movement target: close on the nearest enemy soldier, or the base
+      -- once their soldiers clear.
       let target = case mUnit of
             Just u -> Just u
             Nothing -> mBase
-      -- Attack a visible target that is in reach.
-      let struck = case target of
-            Just (tEnt, tPos, d2) | d2 <= range2 -> Just (tEnt, tPos)
-            _ -> Nothing
+          -- What to actually hit: whatever is in reach. A Flank unit is the
+          -- base-breaker -- it razes the base ahead of chasing soldiers; everyone
+          -- else hits the nearest soldier but falls back to a base in reach (so a
+          -- unit standing on the enemy base never sits there doing nothing).
+          attackables = case myRole of
+            Flank -> [mBase, mUnit]
+            _ -> [mUnit, mBase]
+          struck = case [(tEnt, tPos) | Just (tEnt, tPos, d2) <- attackables, d2 <= range2] of
+            (s : _) -> Just s
+            [] -> Nothing
       case struck of
         Just (tEnt, _) -> attack cfg myTeam myType tEnt
         Nothing -> pure ()
@@ -521,7 +530,6 @@ stepUnit cfg ety = do
       -- itself piecemeal into the enemy blob. With no enemy in sight, it marches
       -- to the muster waypoint.
       plan <- teamPlan myTeam <$> get global
-      myRole <- get ety
       let wp = planWaypoint plan
           gap = planGap plan
           supported = not (cMuster cfg) || allyNear + 1 >= musterMin
@@ -547,12 +555,16 @@ stepUnit cfg ety = do
             let V2 ebx _ = enemyBase
                 V2 px _ = p
              in if abs (px - ebx) > flankTurnIn then V2 ebx (gap * flankY) else enemyBase
-          -- Recon scouts the enemy half spread out (a different lane per unit, so
-          -- they saturate rather than clump) and never closes onto the base.
+          -- Recon saturates the enemy half: each scout takes a low-discrepancy
+          -- (golden-ratio) point spread over both depth and height, so they fan
+          -- out evenly instead of forming a rigid line, and never close the base.
           reconScout =
             let V2 ebx _ = enemyBase
                 Entity eid = ety
-             in V2 (ebx * 0.45) (fromIntegral ((eid `mod` 7) - 3) * 90)
+                frac z = z - fromIntegral (floor z :: Int)
+                sx = 0.15 + 0.55 * frac (fromIntegral eid * 0.6180339887)
+                sy = frac (fromIntegral eid * 0.3819660113) * 2 - 1
+             in V2 (ebx * sx) (sy * 250)
           -- Self-preservation: a scout backs straight off a nearby threat unless
           -- it can simply kite it. Information rarely outvalues the scout itself.
           dangerR2 = sq (typeVision myType * 0.45)
@@ -740,6 +752,19 @@ teamFront team = do
       )
       (0, 0, 0)
   pure (if n == 0 then 0 else sx / fromIntegral n, maxY)
+
+-- | Telemetry: how many of a team's soldiers are sitting on the /enemy/ base
+-- (within a few base-radii). Cross-read with the enemy base HP: bodies on the
+-- base while its HP holds flat is the signature of units squatting an objective
+-- instead of reducing it -- invisible to any aggregate count.
+siegeCount :: Team -> SystemSTM Int
+siegeCount team =
+  cfold
+    (\n (t :: Team, k :: Kind, Position q) -> if t == team && k == Soldier && quadrance (q - eb) <= r2 then n + 1 else n)
+    (0 :: Int)
+  where
+    eb = basePos (enemyOf team)
+    r2 = sq (baseRadius * 4)
 
 -- | Telemetry (over-eager assaults). Two measurable faces of "too eager to
 -- advance into certain death", per team:
@@ -951,18 +976,21 @@ coordinator cfg = loop (1 :: Int)
         rf <- teamFront Red
         bf <- teamFront Blue
         (rbad, bbad, rout, bout) <- engageRates
-        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf, (rbad, rout), (bbad, bout))
+        rsg <- siegeCount Red
+        bsg <- siegeCount Blue
+        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf, (rbad, rout, rsg), (bbad, bout, bsg))
       let teamDmg t = round (sum [v | ((t', _, _), v) <- DM.toList dm, t' == t]) :: Int
       traceM $
         "[hb] R " ++ showCensus rc ++ " base=" ++ show (round rHp :: Int) ++ " next=" ++ show (planNext rp) ++ " dmg=" ++ show (teamDmg Red) ++ " " ++ showTel rCov rFront rBad
           ++ " | B " ++ showCensus bc ++ " base=" ++ show (round bHp :: Int) ++ " next=" ++ show (planNext bp) ++ " dmg=" ++ show (teamDmg Blue) ++ " " ++ showTel bCov bFront bBad
       when (isPlaying ph) (threadDelay 500000 >> heartbeat)
 
-    -- Coverage seen/total enemies, front mean-x, combat y-spread, and the
-    -- over-eager pair (bad = nearest foe counters me, out = locally outnumbered).
-    showTel (seen, tot) (cx, maxY) (bad, out) =
+    -- Coverage seen/total, front mean-x, combat y-spread, the over-eager pair
+    -- (bad = nearest foe counters me, out = locally outnumbered), and siege =
+    -- own bodies on the enemy base (read against that base's HP above).
+    showTel (seen, tot) (cx, maxY) (bad, out, sg) =
       "cov=" ++ show seen ++ "/" ++ show tot ++ " frontx=" ++ show (round cx :: Int) ++ " ymax=" ++ show (round maxY :: Int)
-        ++ " bad=" ++ show (round (bad * 100) :: Int) ++ "% out=" ++ show (round (out * 100) :: Int) ++ "%"
+        ++ " bad=" ++ show (round (bad * 100) :: Int) ++ "% out=" ++ show (round (out * 100) :: Int) ++ "% siege=" ++ show sg
 
     baseHpOf team =
       cfold (\acc (t :: Team, k :: Kind, Health h) -> if t == team && k == Base then h else acc) baseHp
