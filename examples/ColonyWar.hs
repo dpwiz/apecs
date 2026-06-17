@@ -65,7 +65,7 @@ module Main (main) where
 import Control.Monad (foldM, forM_, void, when)
 import Data.Bits (shiftR, xor)
 import Data.Char (toLower)
-import Data.List (foldl', intercalate, isPrefixOf, partition)
+import Data.List (intercalate, isPrefixOf, partition)
 import Data.Maybe (isJust)
 import qualified Data.Map.Strict as DM
 import Debug.Trace (traceM)
@@ -73,7 +73,7 @@ import System.Environment (getArgs)
 
 import Apecs.Gloss
 import Apecs.STM.Prelude
-import Linear (V2 (..), normalize, quadrance, (^*), (^/))
+import Linear (V2 (..), dot, normalize, quadrance, (^*), (^/))
 import System.Exit (exitSuccess)
 import System.IO (BufferMode (LineBuffering), hSetBuffering, stderr, stdout)
 import System.Random (randomRIO)
@@ -289,6 +289,14 @@ instance Semigroup Grid where _ <> b = b
 instance Monoid Grid where mempty = Grid DM.empty
 instance Component Grid where type Storage Grid = Global Grid
 
+-- | The two spawners' positions for the current round (Red, Blue). A 'Global' set
+-- once at round start and read wherever code needs to know where a base is -- so
+-- nothing depends on a fixed coordinate baked in as a constant.
+data BasePos = BasePos !(V2 Float) !(V2 Float)
+instance Semigroup BasePos where _ <> b = b
+instance Monoid BasePos where mempty = BasePos (V2 0 0) (V2 0 0)
+instance Component BasePos where type Storage BasePos = Global BasePos
+
 -- | Every component an entity owns, so we can delete it in one go (the extra
 -- deletes are harmless no-ops for entities that lack a component).
 type All = (Position, Health, Team, Kind, UnitType, Attacking, Role)
@@ -314,6 +322,7 @@ makeWorld
   , ''ShowAttacks
   , ''Viewpoint
   , ''Grid
+  , ''BasePos
   , ''Camera
   ]
 
@@ -512,12 +521,13 @@ advantage atk def
   | beats def atk = 0.5
   | otherwise = 1.0
 
--- | Spawn anchor for a team, at the left/right edge of the battlefield. Set wide
--- (the field is ~2x the old one) so there is room to manoeuvre and so a base's
--- own sight no longer spans midfield -- recon has to earn the picture.
-basePos :: Team -> V2 Float
-basePos Red = V2 (-480) 0
-basePos Blue = V2 480 0
+-- | A team's spawner position, read from the round's 'BasePos' state (set at
+-- round start). Deliberately NOT a published constant -- the rest of the code
+-- reads where the spawners ACTUALLY are, so their placement can change without
+-- anything assuming the old fixed coordinates.
+homePos :: Team -> BasePos -> V2 Float
+homePos Red (BasePos r _) = r
+homePos Blue (BasePos _ b) = b
 
 enemyOf :: Team -> Team
 enemyOf Red = Blue
@@ -534,8 +544,8 @@ mix64 x0 =
       x2 = (x1 `xor` (x1 `shiftR` 29)) * 1442695040888963407
    in x2 `xor` (x2 `shiftR` 32)
 
-teamSeed :: Team -> Int
-teamSeed team = let V2 x y = basePos team in round (x * 73856093 + y * 19349663)
+teamSeed :: V2 Float -> Int
+teamSeed (V2 x y) = round (x * 73856093 + y * 19349663)
 
 -- | A +/-1 coin from a seed.
 coinSign :: Int -> Float
@@ -580,8 +590,8 @@ setTeamPlan Blue p (Plans r _) = Plans r p
 
 -- | At round start a colony is blind: it musters at home and knows neither where
 -- the enemy is nor which way it lies. Recon must find out.
-initialPlan :: Team -> TeamPlan
-initialPlan team = TeamPlan Hunter (basePos team) 1 Nothing Nothing
+initialPlan :: Team -> V2 Float -> TeamPlan
+initialPlan _team home = TeamPlan Hunter home 1 Nothing Nothing
 
 -- Spatial index --------------------------------------------------------------
 
@@ -721,6 +731,7 @@ stepUnit cfg ety = do
       -- itself piecemeal into the enemy blob. With no enemy in sight, it marches
       -- to the muster waypoint.
       plan <- teamPlan myTeam <$> get global
+      homeBase <- homePos myTeam <$> (get global :: SystemSTM BasePos)
       let wp = planWaypoint plan
           gap = planGap plan
           supported = not (cMuster cfg) || allyNear + 1 >= musterMin
@@ -744,7 +755,6 @@ stepUnit cfg ety = do
           -- ('planContact'). Both are earned, never handed out.
           mEnemyBase = planEnemyBase plan
           mContact = planContact plan
-          homeBase = basePos myTeam
           Entity eid = ety
           frac z = z - fromIntegral (floor z :: Int)
           -- A distinct bearing + depth per unit (R2/Roberts: two INDEPENDENT
@@ -757,12 +767,15 @@ stepUnit cfg ety = do
           -- and so no direction to commit to -- fanned by bearing to watch every
           -- approach, not bunched on the spawner.
           stagePoint = homeBase + udir ^* rallyDist
-          -- The maneuver path, once the base is known: sweep wide along the open
-          -- flank (clear of the y≈0 grind) then turn in and crash it.
+          -- The maneuver path, once the base is known, in the APPROACH frame (so it
+          -- works for any spawner placement, not just a horizontal one): sweep wide
+          -- to a staging point offset perpendicular to the home->base axis on the
+          -- open flank ('gap' picks the side), then turn in and crash the base.
           flankDest eb =
-            let V2 ebx _ = eb
-                V2 px _ = p
-             in if abs (px - ebx) > flankTurnIn then V2 ebx (gap * flankY) else eb
+            let axis = let v = eb - homeBase in if quadrance v > 1 then normalize v else V2 1 0
+                perp = let V2 ax ay = axis in V2 (negate ay) ax
+                stage = eb + perp ^* (gap * flankY)
+             in if quadrance (p - stage) > sq flankTurnIn then stage else eb
           -- Recon explores to FIND the enemy, then keeps eyes on him. Blind, it
           -- fans out in every bearing from home, ranging deep (the enemy could be
           -- any direction). In contact, it closes on the contact area to map the
@@ -1034,7 +1047,8 @@ enemyCoverage team = do
     cfold
       (\acc (t :: Team, ut :: UnitType, Position q) -> if t == team then (q, typeVision ut) : acc else acc)
       []
-  let sources = (basePos team, baseVision) : unitSrcs
+  home <- homePos team <$> (get global :: SystemSTM BasePos)
+  let sources = (home, baseVision) : unitSrcs
   enemies <-
     cfold
       (\acc (t :: Team, k :: Kind, Position q) -> if t /= team && k == Soldier then q : acc else acc)
@@ -1065,28 +1079,27 @@ reconOverlap team = do
 -- | Telemetry: a team's soldier front as (mean x, max |y|), so a pinned-at-centre
 -- front (no travel) and the y-spread vs vision radius (how 2D the fight really
 -- is) are both legible.
-teamFront :: Team -> SystemSTM (Float, Float)
+teamFront :: Team -> SystemSTM (V2 Float, Float)
 teamFront team = do
-  (sx, n, maxY) <-
+  (sx, sy, n, maxY) <-
     cfold
-      ( \(sx, n, my) (t :: Team, k :: Kind, Position (V2 x y)) ->
-          if t == team && k == Soldier then (sx + x, n + 1 :: Int, max my (abs y)) else (sx, n, my)
+      ( \(sx, sy, n, my) (t :: Team, k :: Kind, Position (V2 x y)) ->
+          if t == team && k == Soldier then (sx + x, sy + y, n + 1 :: Int, max my (abs y)) else (sx, sy, n, my)
       )
-      (0, 0, 0)
-  pure (if n == 0 then 0 else sx / fromIntegral n, maxY)
+      (0, 0, 0, 0)
+  pure (if n == 0 then V2 0 0 else V2 (sx / fromIntegral n) (sy / fromIntegral n), maxY)
 
 -- | Telemetry: how many of a team's soldiers are sitting on the /enemy/ base
 -- (within a few base-radii). Cross-read with the enemy base HP: bodies on the
 -- base while its HP holds flat is the signature of units squatting an objective
 -- instead of reducing it -- invisible to any aggregate count.
 siegeCount :: Team -> SystemSTM Int
-siegeCount team =
+siegeCount team = do
+  eb <- homePos (enemyOf team) <$> (get global :: SystemSTM BasePos)
+  let r2 = sq (baseRadius * 4)
   cfold
     (\n (t :: Team, k :: Kind, Position q) -> if t == team && k == Soldier && quadrance (q - eb) <= r2 then n + 1 else n)
     (0 :: Int)
-  where
-    eb = basePos (enemyOf team)
-    r2 = sq (baseRadius * 4)
 
 -- | Warfighting scorecard (exp 008) helpers.
 --
@@ -1126,12 +1139,13 @@ armsEntropy (h, g, l) =
    in if tot == 0 then 0 else negate (sum [p * logBase 3 p | p <- ps])
 
 -- Initiative: how far into enemy territory a team's front sits (0 = own base,
--- 1 = enemy base), from its mean soldier x.
-initiative :: Team -> Float -> Float
-initiative team mx =
-  let V2 ox _ = basePos team
-      V2 ex _ = basePos (enemyOf team)
-   in max 0 (min 1 ((mx - ox) / (ex - ox)))
+-- 1 = enemy base), as the front centroid PROJECTED onto the home->enemy axis --
+-- so it reads correctly whatever the spawner placement, not just a horizontal one.
+initiative :: V2 Float -> V2 Float -> V2 Float -> Float
+initiative home enemy mean =
+  let axis = enemy - home
+      d2 = quadrance axis
+   in if d2 < 1 then 0 else max 0 (min 1 (dot (mean - home) axis / d2))
 
 -- | Telemetry (over-eager assaults). Two measurable faces of "too eager to
 -- advance into certain death", per team:
@@ -1173,10 +1187,17 @@ planFor team = do
     cfold
       (\acc (t :: Team, ut :: UnitType, Position q) -> if t == team then (q, typeVision ut) : acc else acc)
       []
-  let sources = (basePos team, baseVision) : unitSrcs
+  home <- homePos team <$> (get global :: SystemSTM BasePos)
+  let sources = (home, baseVision) : unitSrcs
   enemies <-
     cfold
       (\acc (t :: Team, ut :: UnitType, Position q) -> if t /= team then (q, ut) : acc else acc)
+      []
+  -- The enemy spawner ENTITIES (their actual positions), so discovery is detection
+  -- by sight, not a lookup of a coordinate the colony was never told.
+  enemyBases <-
+    cfold
+      (\acc (t :: Team, k :: Kind, Position q) -> if t /= team && k == Base then q : acc else acc)
       []
   own <-
     cfold
@@ -1187,13 +1208,15 @@ planFor team = do
   let prevBase = planEnemyBase prevPlan
       prevContact = planContact prevPlan
       visible = [(q, ut) | (q, ut) <- enemies, seenBy sources q]
-      -- Discover the enemy spawner: once any friendly source covers its position
-      -- it is known and remembered for the round; until then the strike force is
-      -- aiming at a rumour and must not commit. Sticky so it survives the fog.
-      ebPos = basePos (enemyOf team)
+      -- Discover the enemy spawner: once a friendly source covers an enemy base
+      -- entity, ITS sighted position is known and remembered for the round; until
+      -- then the strike force is aiming at a rumour and must not commit. Sticky so
+      -- it survives the fog.
       enemyBaseSeen = case prevBase of
         Just b -> Just b
-        Nothing -> if seenBy sources ebPos then Just ebPos else Nothing
+        Nothing -> case filter (seenBy sources) enemyBases of
+          (q : _) -> Just q
+          [] -> Nothing
       -- Contact: the earned centroid of where the enemy actually is. Updated from
       -- this pass's sightings, sticky through the fog. Nothing == still blind, so
       -- recon explores and the force holds. This is what makes the force orient on
@@ -1202,14 +1225,24 @@ planFor team = do
         [] -> prevContact
         ps -> Just (foldr (+) (V2 0 0) ps ^/ fromIntegral (length ps))
       census = foldr (bumpType . snd) (0, 0, 0) visible
-      waypoint = chooseWaypoint team (map fst visible)
+      waypoint = chooseWaypoint home (map fst visible)
       -- Fold this pass's sightings into the decaying flank memory, then commit
       -- the maneuver to the flank the colony /remembers/ as emptier (with
       -- hysteresis). Memory, not a live read, so the choice persists after the
       -- enemy slips into the fog -- and the two colonies, seeing different
       -- things, diverge instead of both lunging at the same flank.
-      upSeen = fromIntegral (length [() | (V2 _ y, _) <- visible, y > 0])
-      downSeen = fromIntegral (length [() | (V2 _ y, _) <- visible, y <= 0])
+      -- 'Flank' is defined in the APPROACH frame: which side of the home->target
+      -- axis a sighting lies on (perp projection), not world up/down -- so it means
+      -- the same thing whatever the spawner placement. The target is the discovered
+      -- base if known, else the contact; blind, the axis is arbitrary but there are
+      -- no sightings to classify anyway. flankDest uses the same axis + perp.
+      flankAxis = case (case enemyBaseSeen of Just b -> Just b; Nothing -> contact') of
+        Just t -> let v = t - home in if quadrance v > 1 then normalize v else V2 1 0
+        Nothing -> V2 1 0
+      flankPerp = let V2 ax ay = flankAxis in V2 (negate ay) ax
+      sideOf q = dot (q - home) flankPerp
+      upSeen = fromIntegral (length [() | (q, _) <- visible, sideOf q > 0])
+      downSeen = fromIntegral (length [() | (q, _) <- visible, sideOf q <= 0])
       up' = up0 * threatDecay + upSeen
       down' = down0 * threatDecay + downSeen
       gap = chooseGap g0 up' down'
@@ -1270,8 +1303,8 @@ chooseGap g0 up down
 -- | Muster on the enemy the colony can see; with the field dark, muster at HOME
 -- -- the colony has no idea which way the enemy lies, so it does not stream off
 -- on a bearing it was never given. The force holds while recon finds the enemy.
-chooseWaypoint :: Team -> [V2 Float] -> V2 Float
-chooseWaypoint team [] = basePos team
+chooseWaypoint :: V2 Float -> [V2 Float] -> V2 Float
+chooseWaypoint home [] = home
 chooseWaypoint _ ps = foldr (+) (V2 0 0) ps ^/ fromIntegral (length ps)
 
 -- | A colony's strategist thread: re-plan from the fog until the round ends.
@@ -1310,14 +1343,13 @@ rollRole _ r
 -- the direction of the muster waypoint, nudged sideways by the given tangential
 -- offset so a salvo of spawns fans into a facing line instead of stacking on a
 -- single pixel.
-edgeSpawn :: Team -> V2 Float -> Float -> V2 Float
-edgeSpawn team wp tang = b + dir ^* spawnRadius + perp ^* tang
+edgeSpawn :: V2 Float -> V2 Float -> Float -> V2 Float
+edgeSpawn home wp tang = home + dir ^* spawnRadius + perp ^* tang
   where
-    b = basePos team
-    toWp = wp - b
+    toWp = wp - home
     dir
       | quadrance toWp > 1e-3 = normalize toWp
-      | otherwise = normalize (basePos (enemyOf team) - b)
+      | otherwise = V2 0 1 -- blind muster (waypoint == home): no preferred facing
     perp = let V2 dx dy = dir in V2 (-dy) dx
 
 {- | A base's reinforcement thread. Each iteration enlists one soldier of
@@ -1344,8 +1376,9 @@ spawnerThread cfg base team = loop
             n <- teamUnitCount team
             check (n < capPerTeam) -- block here until a slot frees
             plan <- teamPlan team <$> get global
+            Position homePosn <- get base
             let ut = planNext plan
-                pos = edgeSpawn team (planWaypoint plan) tang
+                pos = edgeSpawn homePosn (planWaypoint plan) tang
                 role = rollRole ut roleRoll
             Just <$> newEntity (team, Soldier, ut, Position pos, Health (typeHp ut), role)
       case mE of
@@ -1363,23 +1396,29 @@ spawnerThread cfg base team = loop
 -- recon-and-build contest. Returns the base ids so the coordinator can watch them.
 startRound :: Config -> Int -> SystemIO (Entity, Entity)
 startRound cfg n = do
+  -- The ONE place the spawner coordinates are initialised. Static for now (wide
+  -- left/right edges), but published only as round STATE ('BasePos'), never as a
+  -- constant the rest of the code reads -- so placement can change here alone.
+  let redHome = V2 (-480) 0
+      blueHome = V2 480 0
   -- The two colonies commit to OPPOSITE opening flanks (so the maneuvers don't
-  -- mirror and collide), but which colony takes top vs bottom flips
-  -- unpredictably each round -- a cheap coin seeded from the round and both
-  -- spawner positions, so neither the enemy nor the AI itself can bank on it.
-  let pick = coinSign (mix64 n + teamSeed Red + teamSeed Blue)
+  -- mirror and collide), but which colony takes which flank flips unpredictably
+  -- each round -- a cheap coin seeded from the round and both spawner positions,
+  -- so neither the enemy nor the AI itself can bank on it.
+  let pick = coinSign (mix64 n + teamSeed redHome + teamSeed blueHome)
   atomically $ do
     cmapM_ $ \(_ :: Team, e :: Entity) -> destroy e (Proxy @All)
     set global (mempty :: KillScore)
     set global (mempty :: DamageLog)
     set global (mempty :: BaseDamage)
-    set global (Plans (initialPlan Red) (initialPlan Blue))
+    set global (BasePos redHome blueHome)
+    set global (Plans (initialPlan Red redHome) (initialPlan Blue blueHome))
     set global (ThreatMem (Threat 0 0 pick 0 0) (Threat 0 0 (negate pick) 0 0))
     set global Playing
   -- Bases carry a (behaviourally inert) Role only so the role-aware gather fold
   -- still sees them as targets; Defend reads sensibly for the thing defended.
-  redBase <- atomically $ newEntity (Red, Base, Position (basePos Red), Health baseHp, Defend)
-  blueBase <- atomically $ newEntity (Blue, Base, Position (basePos Blue), Health baseHp, Defend)
+  redBase <- atomically $ newEntity (Red, Base, Position redHome, Health baseHp, Defend)
+  blueBase <- atomically $ newEntity (Blue, Base, Position blueHome, Health baseHp, Defend)
   void $ forkSys (spawnerThread cfg redBase Red)
   void $ forkSys (spawnerThread cfg blueBase Blue)
   void $ forkSys (strategist cfg Red redBase)
@@ -1408,7 +1447,7 @@ coordinator cfg = loop (1 :: Int)
     -- A gated 2 Hz pulse of each colony's live composition and current plan,
     -- so you can watch the counter-play shift through the fog.
     heartbeat = do
-      (ph, rc, bc, Plans rp bp, DamageLog dm, rHp, bHp, rCov, bCov, rFront, bFront, rBad, bBad, rConc, bConc, BaseDamage bdR bdB) <- atomically $ do
+      (ph, rc, bc, Plans rp bp, DamageLog dm, rHp, bHp, rCov, bCov, rFront, bFront, rBad, bBad, rConc, bConc, BaseDamage bdR bdB, (rInit, bInit)) <- atomically $ do
         ph <- get global
         rc <- teamCensus Red
         bc <- teamCensus Blue
@@ -1431,7 +1470,10 @@ coordinator cfg = loop (1 :: Int)
         bovl <- reconOverlap Blue
         tm <- get global
         bd <- get global
-        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf, (rbad, rout, rsg), (bbad, bout, bsg), (rconc, rgrp, rovl, teamThreat Red tm), (bconc, bgrp, bovl, teamThreat Blue tm), bd)
+        bpos <- get global :: SystemSTM BasePos
+        let rInit = initiative (homePos Red bpos) (homePos Blue bpos) (fst rf)
+            bInit = initiative (homePos Blue bpos) (homePos Red bpos) (fst bf)
+        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf, (rbad, rout, rsg), (bbad, bout, bsg), (rconc, rgrp, rovl, teamThreat Red tm), (bconc, bgrp, bovl, teamThreat Blue tm), bd, (rInit, bInit))
       let teamDmgF t = sum [v | ((t', _, _), v) <- DM.toList dm, t' == t]
           teamDmg t = round (teamDmgF t) :: Int
       let foundFlag p = (if isJust (planContact p) then "c" else "-") ++ (if isJust (planEnemyBase p) then "B" else "-")
@@ -1440,8 +1482,8 @@ coordinator cfg = loop (1 :: Int)
           ++ " | B " ++ showCensus bc ++ " base=" ++ show (round bHp :: Int) ++ " next=" ++ show (planNext bp) ++ " find=" ++ foundFlag bp ++ " dmg=" ++ show (teamDmg Blue) ++ " " ++ showTel bCov bFront bBad
       -- Warfighting adherence scorecard (exp 008), per side.
       traceM $
-        "[score] R " ++ scoreLine Red rCov bCov rc rFront rConc (teamDmgF Red) bdR
-          ++ " | B " ++ scoreLine Blue bCov rCov bc bFront bConc (teamDmgF Blue) bdB
+        "[score] R " ++ scoreLine rCov bCov rc rInit rConc (teamDmgF Red) bdR
+          ++ " | B " ++ scoreLine bCov rCov bc bInit bConc (teamDmgF Blue) bdB
       when (isPlaying ph) (threadDelay 500000 >> heartbeat)
 
     -- recon = my coverage of the enemy; sec = my hidden-force count / secRef (NOT
@@ -1454,7 +1496,7 @@ coordinator cfg = loop (1 :: Int)
     -- unc/surp/kl = the in-the-
     -- moment information dynamics of my belief over the enemy flank (bits):
     -- uncertainty (entropy), surprisal (prediction error), Bayesian surprise.
-    scoreLine team myCov foeCov census (mx, _) (conc, grp, ovl, thr) soldierDmg baseDmg =
+    scoreLine myCov foeCov census initVal (conc, grp, ovl, thr) soldierDmg baseDmg =
       let frac (s, t) = if t == 0 then 0 :: Float else fromIntegral s / fromIntegral t
           pct x = show (round (x * 100) :: Int)
           bits x = show (fromIntegral (round (x * 100) :: Int) / 100 :: Float)
@@ -1474,7 +1516,7 @@ coordinator cfg = loop (1 :: Int)
           cogScore = cogShare * min 1 (baseDmg / baseHp)
        in "recon=" ++ pct (frac myCov) ++ " sec=" ++ pct secScore
             ++ " ovl=" ++ bits ovl
-            ++ " arms=" ++ pct (armsEntropy census) ++ " init=" ++ pct (initiative team mx)
+            ++ " arms=" ++ pct (armsEntropy census) ++ " init=" ++ pct initVal
             ++ " focus=" ++ pct conc ++ " grp=" ++ show grp
             ++ " cog=" ++ pct cogScore
             ++ " unc=" ++ bits (beliefEntropy (thUp thr) (thDown thr))
@@ -1483,7 +1525,7 @@ coordinator cfg = loop (1 :: Int)
     -- Coverage seen/total, front mean-x, combat y-spread, the over-eager pair
     -- (bad = nearest foe counters me, out = locally outnumbered), and siege =
     -- own bodies on the enemy base (read against that base's HP above).
-    showTel (seen, tot) (cx, maxY) (bad, out, sg) =
+    showTel (seen, tot) (V2 cx _, maxY) (bad, out, sg) =
       "cov=" ++ show seen ++ "/" ++ show tot ++ " frontx=" ++ show (round cx :: Int) ++ " ymax=" ++ show (round maxY :: Int)
         ++ " bad=" ++ show (round (bad * 100) :: Int) ++ "% out=" ++ show (round (out * 100) :: Int) ++ "% siege=" ++ show sg
 
@@ -1609,7 +1651,8 @@ draw = do
             cfold
               (\acc (t :: Team, ut :: UnitType, Position q) -> if t == s then (q, typeVision ut) : acc else acc)
               []
-          pure ((basePos s, baseVision) : us)
+          home <- homePos s <$> (get global :: SystemSTM BasePos)
+          pure ((home, baseVision) : us)
       let vis t q = case viewer of
             Nothing -> True
             Just s -> t == s || any (\(c, r) -> quadrance (q - c) <= r * r) sources
@@ -1719,9 +1762,10 @@ visionOverlay = do
           pure $ acc <> translate x y (color (withAlpha 0.04 (teamColor t)) (circleSolid (typeVision ut)))
       )
       mempty
+  bp <- get global :: SystemSTM BasePos
   let baseDiscs =
         mconcat
-          [ let V2 bx by = basePos t
+          [ let V2 bx by = homePos t bp
              in translate bx by (color (withAlpha 0.07 (teamColor t)) (circleSolid baseVision))
           | t <- [Red, Blue]
           ]
