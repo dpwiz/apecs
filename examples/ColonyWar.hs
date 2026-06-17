@@ -1575,6 +1575,20 @@ baseGlyph t hp =
   color white (circle baseRadius)
     <> color (teamColor t) (circleSolid (baseRadius * max 0.05 (hp / baseHp)))
 
+-- | A spawner the viewer has DISCOVERED but is not currently looking at: drawn
+-- from memory, so its /location/ is known (a dim ring + a crosshair mark) but its
+-- current HP is NOT -- the side only remembers where it is, not its live state.
+rememberedBaseGlyph :: Team -> Picture
+rememberedBaseGlyph t =
+  color (withAlpha 0.5 (teamColor t)) (circle baseRadius)
+    <> color (withAlpha 0.5 (teamColor t)) (line [(-baseRadius, 0), (baseRadius, 0)])
+    <> color (withAlpha 0.5 (teamColor t)) (line [(0, -baseRadius), (0, baseRadius)])
+
+-- | The viewer's belief about where the enemy mass is (its remembered contact
+-- centroid): a faint enemy-coloured ring -- aggregate memory, not a live sighting.
+contactMarker :: Team -> Picture
+contactMarker enemy = color (withAlpha 0.28 (teamColor enemy)) (thickCircle 26 2)
+
 draw :: SystemIO Picture
 draw = do
   -- Fold the whole frame in a single STM transaction: a consistent snapshot,
@@ -1599,14 +1613,28 @@ draw = do
       let vis t q = case viewer of
             Nothing -> True
             Just s -> t == s || any (\(c, r) -> quadrance (q - c) <= r * r) sources
+      -- The viewer's working MEMORY (what it actually plans on), so the view shows
+      -- its knowledge, not just its current line of sight: the discovered enemy
+      -- spawner persists once found, and its belief about the enemy mass shows.
+      plansNow <- get global :: SystemSTM Plans
+      let memBase = viewer >>= \s -> planEnemyBase (teamPlan s plansNow)
+          memContact = viewer >>= \s -> planContact (teamPlan s plansNow)
+          atRemembered (V2 x y) = maybe False (\m -> quadrance (m - V2 x y) < 1) memBase
       basePic <-
         cfoldM
           ( \acc (t :: Team, k :: Kind, Position (V2 x y), Health hp) ->
               pure $ case k of
-                Base | vis t (V2 x y) -> acc <> translate x y (baseGlyph t hp)
+                Base
+                  | vis t (V2 x y) -> acc <> translate x y (baseGlyph t hp)
+                  -- Discovered earlier, now out of sight: drawn FROM MEMORY (a
+                  -- known location, unknown live HP) instead of vanishing.
+                  | atRemembered (V2 x y) -> acc <> translate x y (rememberedBaseGlyph t)
                 _ -> acc
           )
           mempty
+      let memPic = case (viewer, memContact) of
+            (Just s, Just (V2 cx cy)) -> translate cx cy (contactMarker (enemyOf s))
+            _ -> mempty
       -- Pop counts are the true totals (HUD meta), but only visible glyphs draw.
       (soldierPic, rp, bp) <-
         cfoldM
@@ -1634,14 +1662,13 @@ draw = do
       ks <- get global :: SystemSTM KillScore
       wns <- get global :: SystemSTM Wins
       ph <- get global :: SystemSTM Phase
-      pl <- get global :: SystemSTM Plans
       dmg <- get global :: SystemSTM DamageLog
-      pure (visionPic, attackPic, basePic, soldierPic, fogPic, vp, rp, bp, ks, wns, ph, pl, dmg)
+      pure (visionPic, attackPic, basePic, soldierPic, fogPic <> memPic, vp, rp, bp, ks, wns, ph, plansNow, dmg)
   -- Two left-aligned rows in the top-left of the (1600x900) window.
   let viewLabel = case vp of
         ViewAll -> "viewpoint: ALL (omniscient)"
-        ViewSide Red -> "viewpoint: RED  (fog -- only what Red sees)"
-        ViewSide Blue -> "viewpoint: BLUE (fog -- only what Blue sees)"
+        ViewSide Red -> "viewpoint: RED  (fog -- what Red knows: sight + memory)"
+        ViewSide Blue -> "viewpoint: BLUE (fog -- what Blue knows: sight + memory)"
       viewCol = case vp of ViewAll -> greyN 0.5; ViewSide t -> teamColor t
       hud =
         label (teamColor Red) (-780) 420 ("RED   pop " ++ show redPop ++ "   next " ++ show (planNext rPlan) ++ "   kills " ++ show kr ++ "   wins " ++ show wr)
