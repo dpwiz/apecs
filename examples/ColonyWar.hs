@@ -62,7 +62,7 @@ Build with @-threaded -N@ so the threads actually run in parallel.
 -}
 module Main (main) where
 
-import Control.Monad (foldM, forM, forM_, void, when)
+import Control.Monad (foldM, forM_, void, when)
 import Data.Char (toLower)
 import Data.List (intercalate, isPrefixOf)
 import qualified Data.Map.Strict as DM
@@ -305,9 +305,8 @@ dbg cfg msg = when (cDebug cfg) (traceM msg)
 
 -- Tunables ------------------------------------------------------------------
 
-capPerTeam, initialPlatoon :: Int
+capPerTeam :: Int
 capPerTeam = 34
-initialPlatoon = 12
 
 baseHp :: Float
 baseHp = 380
@@ -347,14 +346,12 @@ rallyPoint team = b + normalize (basePos (enemyOf team) - b) ^* rallyDist
 -- packing is deliberately tight: concentration is what lets a winning army
 -- overwhelm a thinner one locally and break through, which is how a round
 -- actually ends. (Roomy spacing was tried and turned every round into an
--- endless even-trade grind.) 'lineSpacing' only sets the cosmetic width of the
--- opening muster lines.
-baseRadius, collideDist, sepStrength, spawnRadius, lineSpacing :: Float
+-- endless even-trade grind.)
+baseRadius, collideDist, sepStrength, spawnRadius :: Float
 baseRadius = 22
 collideDist = 11
 sepStrength = 0.6
 spawnRadius = 40
-lineSpacing = 16
 
 collideDist2, waypointReach2 :: Float
 collideDist2 = collideDist * collideDist
@@ -912,9 +909,10 @@ spawnerThread cfg base team = loop
 
 -- Round lifecycle -----------------------------------------------------------
 
--- | Wipe the battlefield and stand up a fresh round: two bases, a starting
--- Guard platoon each, and a spawner + strategist thread per colony. Returns
--- the base ids so the coordinator can watch them.
+-- | Wipe the battlefield and stand up a fresh round: just two bases, each with a
+-- spawner + strategist thread. Both colonies grow their armies from scratch out
+-- of an empty field -- no starting platoon -- so the opening is itself a
+-- recon-and-build contest. Returns the base ids so the coordinator can watch them.
 startRound :: Config -> SystemIO (Entity, Entity)
 startRound cfg = do
   atomically $ do
@@ -925,21 +923,11 @@ startRound cfg = do
     set global Playing
   redBase <- atomically $ newEntity (Red, Base, Position (basePos Red), Health baseHp)
   blueBase <- atomically $ newEntity (Blue, Base, Position (basePos Blue), Health baseHp)
-  -- Stand both platoons up as facing battle lines. Create every soldier first
-  -- and only then fork their AI, so neither colony gets a head-start of live
-  -- ticks while the other is still being spawned (that asymmetry quietly biased
-  -- the whole match toward Red, who used to spawn entirely first).
-  units <- forM [0 .. initialPlatoon - 1] $ \i ->
-    forM [Red, Blue] $ \team -> do
-      let wp = planWaypoint (initialPlan team)
-          off = (fromIntegral i - fromIntegral (initialPlatoon - 1) / 2) * lineSpacing
-      atomically $ newEntity (team, Soldier, Guard, Position (edgeSpawn team wp off), Health (typeHp Guard), MainBody)
-  forM_ (concat units) (void . forkSys . unitAI cfg)
   void $ forkSys (spawnerThread cfg redBase Red)
   void $ forkSys (spawnerThread cfg blueBase Blue)
   void $ forkSys (strategist cfg Red redBase)
   void $ forkSys (strategist cfg Blue blueBase)
-  dbg cfg "[round] started: 2 bases, 2 platoons, 2 spawners, 2 strategists"
+  dbg cfg "[round] started: 2 bases, 2 spawners, 2 strategists (no starting platoon)"
   pure (redBase, blueBase)
 
 {- | The single round coordinator: start a round, run until a base falls (which
