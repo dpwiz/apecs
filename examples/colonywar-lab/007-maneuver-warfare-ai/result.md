@@ -25,10 +25,34 @@ Harness cycle unaffected (its units are MainBody): edges still 150/0, mirrors ~0
 - **bad-fight rate rose to 30–56%**: flankers/recon meet their counters
   mid-maneuver (no mass-before-commit discipline yet).
 
+## Increment 2: hedge under uncertainty + recon that saturates & survives
+
+From a playtest (6e6ab18): recon clumped idle/suicidal on the enemy base; forces
+had no memory/anticipation; and both sides built **mono** while blind — "the enemy
+is the lack of information, and the counter to that is a balanced force."
+
+- **`planNextFor`**: never mono. A **diversity floor** (`minDiversity`=0.2) keeps
+  ≥20% of every type (guaranteeing scouting Hunters); only a **confident** sighting
+  (`confidentSightings`=10 enemies seen) sharpens the surplus to a hard counter;
+  blind, it just balances the mix.
+- **Recon behaviour**: scouts disperse across the enemy half (a different lane per
+  unit id — saturate, don't clump), kite what they can, **flee** what they can't
+  (self-preservation), and never close onto the base.
+
+### Effect (telemetry)
+- Composition is now genuinely **mixed** (e.g. H15/G11/L8 vs H12/G15/L7), no mono.
+- Recon **saturates**: `ymax=270` (full height) and **coverage 22–30/34** (up from
+  ~10) — the fog is being actively beaten by recon now.
+
+### Still open
+- **Rounds still don't end** — the **mirror-flank** persists: both symmetric
+  strategists pick the same gap deterministically, so flanks collide.
+- **No memory** (point 2): forces don't anticipate a threat from a direction
+  enemies were massing.
+
 ### Next
-- **Increment 2 (recon-pull + security):** choose the gap from where the *enemy*
-  is actually weak/absent (not just where its units are), and screen own flanks;
-  break the mirror so a flank hits a genuinely undefended base.
-- **Increment 3 (mass before commit):** the flank stages until strong, then
-  strikes together — a coherent force can overpower the light base defense, and
-  it removes the gladiatorial trickle. Likely the key to clean endings.
+- **Increment 3 — threat memory (point 2):** remember last-seen enemy clusters
+  (decaying) to anticipate/defend a direction *and* drive the gap choice from each
+  side's own (different) recon picture → this should also **break the mirror**
+  (asymmetric memory → divergent flanks → a flank finds an undefended base).
+- **Mass-before-commit** for the flank, and remove the gladiatorial nudge.

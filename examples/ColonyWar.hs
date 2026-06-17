@@ -547,11 +547,27 @@ stepUnit cfg ety = do
             let V2 ebx _ = enemyBase
                 V2 px _ = p
              in if abs (px - ebx) > flankTurnIn then V2 ebx (gap * flankY) else enemyBase
+          -- Recon scouts the enemy half spread out (a different lane per unit, so
+          -- they saturate rather than clump) and never closes onto the base.
+          reconScout =
+            let V2 ebx _ = enemyBase
+                Entity eid = ety
+             in V2 (ebx * 0.45) (fromIntegral ((eid `mod` 7) - 3) * 90)
+          -- Self-preservation: a scout backs straight off a nearby threat unless
+          -- it can simply kite it. Information rarely outvalues the scout itself.
+          dangerR2 = sq (typeVision myType * 0.45)
+          fleePoint = case mUnit of
+            Just (_, tPos, _) -> p + (let v = p - tPos in if quadrance v > 1e-6 then normalize v else V2 0 1) ^* 90
+            Nothing -> p
+          reconDanger = case mUnit of Just (_, _, d2) -> d2 < dangerR2; Nothing -> False
           dest = case myRole of
             -- Maneuver force: ignore the frontal fight, head for the base.
             Flank -> Just flankDest
-            -- Recon: scout the open flank toward the enemy; kite/harass if met.
-            Recon -> case kiteDest of Just kd -> Just kd; Nothing -> Just flankDest
+            -- Recon: kite what it can, flee what it can't, otherwise spread and scout.
+            Recon
+              | Just kd <- kiteDest -> Just kd
+              | reconDanger -> Just fleePoint
+              | otherwise -> Just reconScout
             -- Main body: fix the enemy front (press into melee when supported,
             -- else fall back and mass at the rally point).
             MainBody
@@ -639,19 +655,42 @@ bumpType Hunter (h, g, l) = (h + 1, g, l)
 bumpType Guard (h, g, l) = (h, g + 1, l)
 bumpType Lance (h, g, l) = (h, g, l + 1)
 
--- | What to enlist next given the visible enemy census: the type that best
--- answers their /whole/ composition, or -- seeing nothing through the fog --
--- the far-seeing Hunter to go look.
+-- | What to enlist next. The enemy here is often the /fog/: a colony that has
+-- not actually seen the enemy composition must not gamble its whole build on a
+-- hard counter to a read it doesn't have. The known answer to uncertainty is a
+-- balanced, combined-arms force -- robust to anything, hard-countered by nothing
+-- -- so:
 --
--- "Best answer" is the type maximising summed cycle advantage over every enemy
--- unit, not merely the counter to their most numerous type. That distinction is
--- the whole game: a Lance ball with a few Guards mixed in should /not/ be met
--- with Hunters (the Guards out-brawl them) -- weighing the Guards in drags
--- Hunter's score down, so the colony answers with Lance instead of trickling
--- fragile Hunters to their death.
-chooseNext :: Census -> UnitType
-chooseNext (0, 0, 0) = Hunter
-chooseNext census = bestResponse census
+--   * a __diversity floor__ keeps a minimum of every type in the field (never a
+--     brittle mono build, and it guarantees the Hunters that do the scouting);
+--   * only a __confident__ sighting (enough enemies actually seen) sharpens the
+--     surplus toward a hard counter to their /whole/ composition;
+--   * blind, the surplus just balances the mix and sends Hunters to look.
+planNextFor :: Census -> Int -> Census -> UnitType
+planNextFor own@(h, g, l) seenN enemyCensus
+  | Just t <- belowFloor = t
+  | seenN >= confidentSightings = bestResponse enemyCensus
+  | otherwise = leastOf own
+  where
+    total = h + g + l
+    floorEach = fromIntegral total * minDiversity :: Double
+    belowFloor = case [t | (t, c) <- [(Hunter, h), (Guard, g), (Lance, l)], fromIntegral c < floorEach] of
+      (t : _) -> Just t
+      [] -> Nothing
+
+-- | Fraction of every type a colony keeps in the field no matter what, so it is
+-- never a brittle mono build; and how many enemies it must actually see before
+-- it trusts a hard counter over a balanced hedge.
+minDiversity :: Double
+minDiversity = 0.2
+
+confidentSightings :: Int
+confidentSightings = 10
+
+-- | The type a team has fewest of (ties to the lighter type by 'Ord') -- used to
+-- even out a force when there is nothing reliable to counter.
+leastOf :: Census -> UnitType
+leastOf (h, g, l) = snd (minimum [(h, Hunter), (g, Guard), (l, Lance)])
 
 -- | The single type with the greatest summed cycle advantage against a census.
 -- Ties fall to the sturdier type (Lance > Guard > Hunter by 'Ord').
@@ -747,6 +786,10 @@ planFor team = do
     cfold
       (\acc (t :: Team, ut :: UnitType, Position q) -> if t /= team then (q, ut) : acc else acc)
       []
+  own <-
+    cfold
+      (\acc (t :: Team, ut :: UnitType) -> if t == team then bumpType ut acc else acc)
+      (0, 0, 0)
   let visible = [(q, ut) | (q, ut) <- enemies, seenBy sources q]
       census = foldr (bumpType . snd) (0, 0, 0) visible
       waypoint = chooseWaypoint team (map fst visible)
@@ -757,7 +800,7 @@ planFor team = do
       up = length [() | (V2 _ y, _) <- visible, y > 0]
       down = length [() | (V2 _ y, _) <- visible, y <= 0]
       gap = if down < up then -1 else 1
-  modify global (setTeamPlan team (TeamPlan (chooseNext census) waypoint gap))
+  modify global (setTeamPlan team (TeamPlan (planNextFor own (length visible) census) waypoint gap))
   where
     seenBy srcs q = any (\(s, r) -> quadrance (q - s) <= r * r) srcs
 
