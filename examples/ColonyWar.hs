@@ -166,8 +166,10 @@ instance Monoid Wins where
   mempty = Wins 0 0
 instance Component Wins where type Storage Wins = Global Wins
 
--- | The shared round state. A 'Global'; last write wins.
-data Phase = Playing | RoundOver Team deriving (Eq, Show)
+-- | The shared round state. A 'Global'; last write wins. 'RoundDraw' is a
+-- legitimate mutual loss: both spawners fell within the grace countdown, so both
+-- colonies committed equally suicidally.
+data Phase = Playing | RoundOver Team | RoundDraw deriving (Eq, Show)
 instance Semigroup Phase where _ <> b = b
 instance Monoid Phase where mempty = Playing
 instance Component Phase where type Storage Phase = Global Phase
@@ -299,6 +301,10 @@ data Config = Config
   -- ^ How often the round coordinator checks for a winner, microseconds.
   , cOver :: Int
   -- ^ How long the score table lingers between rounds, microseconds.
+  , cGrace :: Int
+  -- ^ After the first base falls, how long (microseconds) to wait before scoring.
+  -- If the other base also falls within this window the round is a draw -- a
+  -- mutual strike that traded both spawners is not a win for whoever landed first.
   , cMaxSeconds :: Int
   -- ^ Headless wall-clock budget before the process exits (0 == unbounded).
   , cDebug :: Bool
@@ -327,6 +333,7 @@ displayCfg =
     , cStrategy = 250000
     , cPoll = 100000
     , cOver = 4000000
+    , cGrace = 2500000
     , cMaxSeconds = 0
     , cDebug = False
     , cMuster = True
@@ -344,6 +351,7 @@ headlessCfg =
     , cStrategy = 30000
     , cPoll = 5000
     , cOver = 300000
+    , cGrace = 2500000
     , cMaxSeconds = 180
     , cDebug = True
     , cMuster = True
@@ -657,11 +665,15 @@ stepUnit cfg ety = do
             Nothing -> p
           reconDanger = case mUnit of Just (_, _, d2) -> d2 < dangerR2; Nothing -> False
           -- Home garrison: ring the base (a golden-angle slot per unit, so they
-          -- cover every approach) and intercept anything that reaches it.
+          -- cover every approach) and intercept anything that reaches it. The
+          -- ring sits INSIDE the garrison's own sight radius, so an attacker that
+          -- closes onto the base stays visible and gets answered -- rather than
+          -- slipping under a too-distant ring while the defenders hold position,
+          -- blind, as the base is razed behind them.
           ringPoint =
             let Entity eid = ety
                 ang = fromIntegral eid * 2.39996323
-             in homeBase + V2 (cos ang) (sin ang) ^* (baseRadius * 5)
+             in homeBase + V2 (cos ang) (sin ang) ^* (baseRadius * 2.5)
           homeThreatR2 = sq 240
           dest = case myRole of
             -- Maneuver force: ignore the frontal fight, head for the base.
@@ -691,11 +703,14 @@ stepUnit cfg ety = do
           approach = case dest of
             Just d -> normalize (d - p) ^* (speed * dt)
             Nothing -> V2 0 0
-          -- The maneuver and fighting elements cohere into local groups; recon
-          -- and the home garrison deliberately spread, so they don't.
-          cohesion
-            | myRole == MainBody || myRole == Flank, quadrance coh > 1e-6 = normalize coh ^* cohesionPull
-            | otherwise = V2 0 0
+          -- Only the main body coheres, into the fixing front -- and even then
+          -- not once it is in reach of a target (else two cohered blobs bounce
+          -- off each other and the front freezes). The flank must stay free to
+          -- peel off to the base; cohering it just sucks it back into the front
+          -- blob. Recon and the garrison never cohere.
+          cohesion = case (myRole, struck) of
+            (MainBody, Nothing) | quadrance coh > 1e-6 -> normalize coh ^* cohesionPull
+            _ -> V2 0 0
       set ety (Position (p + approach + sep + cohesion))
       pure True
   where
@@ -1065,7 +1080,7 @@ strategist cfg team base = loop
 -- a flanking force, a home garrison, and the main body (the remainder).
 flankShare, defendShare :: Double
 flankShare = 0.45
-defendShare = 0.2
+defendShare = 0.1
 
 -- | Task-force role for a fresh soldier (exp 007): Hunters scout + screen
 -- (Recon); the rest split into the Flank (strike the base), a Defend garrison
@@ -1167,11 +1182,11 @@ coordinator cfg = loop (1 :: Int)
     loop n = do
       (redBase, blueBase) <- startRound cfg n
       when (cDebug cfg) (void $ forkSys heartbeat)
-      winner <- waitWinner redBase blueBase
-      atomically $ do
-        modify global (addWin winner)
-        set global (RoundOver winner)
-      report n winner
+      outcome <- waitWinner redBase blueBase
+      atomically $ case outcome of
+        Just winner -> modify global (addWin winner) >> set global (RoundOver winner)
+        Nothing -> set global RoundDraw
+      report n outcome
       threadDelay (cOver cfg)
       loop (n + 1)
 
@@ -1243,26 +1258,37 @@ coordinator cfg = loop (1 :: Int)
 
     showCensus (h, g, l) = "H" ++ show h ++ "/G" ++ show g ++ "/L" ++ show l
 
-    waitWinner redBase blueBase = do
-      m <- atomically $ do
-        redAlive <- exists redBase (Proxy @Health)
-        blueAlive <- exists blueBase (Proxy @Health)
-        pure $
-          if not blueAlive then Just Red else if not redAlive then Just Blue else Nothing
-      case m of
-        Just w -> pure w
-        Nothing -> threadDelay (cPoll cfg) >> waitWinner redBase blueBase
+    bothAlive redBase blueBase =
+      atomically ((,) <$> exists redBase (Proxy @Health) <*> exists blueBase (Proxy @Health))
 
-    report n winner = do
+    -- Wait until a base falls, then hold a grace countdown: if the other base
+    -- falls within it too, the round is a draw (a mutual strike traded both
+    -- spawners); otherwise the surviving side wins. Returns Nothing for a draw.
+    waitWinner redBase blueBase = do
+      (ra, ba) <- bothAlive redBase blueBase
+      if ra && ba
+        then threadDelay (cPoll cfg) >> waitWinner redBase blueBase
+        else do
+          threadDelay (cGrace cfg)
+          (ra', ba') <- bothAlive redBase blueBase
+          pure $ case (ra', ba') of
+            (False, False) -> Nothing
+            (True, _) -> Just Red
+            (_, True) -> Just Blue
+
+    report n outcome = do
       (KillScore kr kb, Wins wr wb, dl) <-
         atomically ((,,) <$> get global <*> get global <*> get global)
+      let result = case outcome of
+            Just w -> show w ++ " wins"
+            Nothing -> "Draw (both spawners fell)"
       liftIO . putStrLn $
         concat
           [ "Round "
           , show n
           , ": "
-          , show winner
-          , " wins  | kills R/B "
+          , result
+          , "  | kills R/B "
           , show kr
           , "/"
           , show kb
@@ -1372,15 +1398,18 @@ draw = do
           <> label (teamColor Blue) (-780) 396 ("BLUE  pop " ++ show bluePop ++ "   next " ++ show (planNext bPlan) ++ "   kills " ++ show kb ++ "   wins " ++ show wb)
           <> label viewCol (-780) 372 viewLabel
           <> label (greyN 0.5) (-780) (-430) "v: vision   r: range   a: attacks   [ ]: viewpoint   esc: quit"
+      scoreCard banner =
+        color (withAlpha 0.74 black) (rectangleSolid 1600 900)
+          <> banner
+          <> label white (-150) 158 ("kills R " ++ show kr ++ " / B " ++ show kb ++ "     match R " ++ show wr ++ " / B " ++ show wb)
+          <> damageBlock (teamColor Red) (-312) 116 "RED damage  (attacker vs defender)" (teamMatrix Red dl)
+          <> damageBlock (teamColor Blue) (-312) (-24) "BLUE damage  (attacker vs defender)" (teamMatrix Blue dl)
       overlay = case phase of
         Playing -> mempty
         RoundOver w ->
-          color (withAlpha 0.74 black) (rectangleSolid 1600 900)
-            <> label white (-58) 215 "ROUND OVER"
-            <> label (teamColor w) (-85) 185 (show w ++ " TEAM WINS")
-            <> label white (-150) 158 ("kills R " ++ show kr ++ " / B " ++ show kb ++ "     match R " ++ show wr ++ " / B " ++ show wb)
-            <> damageBlock (teamColor Red) (-312) 116 "RED damage  (attacker vs defender)" (teamMatrix Red dl)
-            <> damageBlock (teamColor Blue) (-312) (-24) "BLUE damage  (attacker vs defender)" (teamMatrix Blue dl)
+          scoreCard (label white (-58) 215 "ROUND OVER" <> label (teamColor w) (-85) 185 (show w ++ " TEAM WINS"))
+        RoundDraw ->
+          scoreCard (label white (-32) 215 "DRAW" <> label (greyN 0.7) (-200) 185 "BOTH SPAWNERS FELL")
   -- Fog wash sits under the glyphs; tracers go on /top/ (a hit fires within attack
   -- range, so the line is short and would otherwise hide under the units).
   pure (fogPic <> visionPic <> basePic <> soldierPic <> attackPic <> hud <> overlay)
