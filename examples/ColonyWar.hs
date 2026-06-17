@@ -216,6 +216,12 @@ data Config = Config
   , cMuster :: Bool
   -- ^ Whether soldiers rally-and-wave (mass up before committing). Off in the
   -- matchup harness to measure raw stat combat with this behaviour ablated.
+  , cKite :: Bool
+  -- ^ Whether a soldier that out-ranges /and/ out-runs its target kites it
+  -- (fires while backing off to hold the range gap). Ablation flag for exp 003.
+  , cArena :: Float
+  -- ^ Matchup harness only: if > 0, clamp positions to a +/- this square so
+  -- kiters can be cornered (0 = unbounded). The full game uses its own field.
   }
 
 displayCfg :: Config
@@ -230,6 +236,8 @@ displayCfg =
     , cMaxSeconds = 0
     , cDebug = False
     , cMuster = True
+    , cKite = False
+    , cArena = 0
     }
 
 headlessCfg :: Config
@@ -244,6 +252,8 @@ headlessCfg =
     , cMaxSeconds = 180
     , cDebug = True
     , cMuster = True
+    , cKite = False
+    , cArena = 0
     }
 
 dbg :: Config -> String -> SystemIO ()
@@ -417,6 +427,15 @@ stepUnit cfg ety = do
           speed = typeSpeed myType
       (mUnit, mBase, sep, allyNear) <-
         cfoldM (gather p myTeam vis2) (Nothing, Nothing, V2 0 0, 0 :: Int)
+      -- The nearest enemy /soldier/'s type, for the kiting decision (one read,
+      -- same transaction/snapshot as the gather, so it is consistent). Only
+      -- needed when kiting is enabled, so the normal game pays nothing.
+      mUnitType <-
+        if cKite cfg
+          then case mUnit of
+            Just (e, _, _) -> Just <$> get e
+            Nothing -> pure Nothing
+          else pure Nothing
       let target = case mUnit of
             Just u -> Just u
             Nothing -> mBase
@@ -441,7 +460,22 @@ stepUnit cfg ety = do
       wp <- planWaypoint . teamPlan myTeam <$> get global
       let supported = not (cMuster cfg) || allyNear + 1 >= musterMin
           rally = rallyPoint myTeam
+          -- Kiting: if I out-range and out-run my target, hold it at the edge of
+          -- my reach -- close in if it slips out, back straight off if it gets
+          -- too near -- so I keep firing while it never lands a blow.
+          kiteOK = cKite cfg && case mUnitType of
+            Just tt -> typeRange myType > typeRange tt && typeSpeed myType > typeSpeed tt
+            Nothing -> False
+          kiteDest = case (kiteOK, mUnit) of
+            (True, Just (_, tPos, d2))
+              | d2 > range2 -> Just tPos -- out of reach: close the distance
+              | sqrt d2 < typeRange myType * 0.92 ->
+                  let away = let v = p - tPos in if quadrance v > 1e-6 then normalize v else V2 1 0
+                   in Just (p + away ^* 60) -- too close: back off, still firing
+              | otherwise -> Nothing -- in the sweet spot: hold and fire
+            _ -> Nothing
           dest
+            | Just kd <- kiteDest = Just kd
             | fighting = Nothing
             | supported = case target of
                 Just (_, tPos, d2) | d2 > range2 -> Just tPos
@@ -922,9 +956,9 @@ sweep the type x type grid at equal numbers and read off who actually wins.
 
   > stm-colony-war --matchup warrior:10 scout:10 [reps] [--muster]
 -}
-matchupCfg :: Bool -> Config
-matchupCfg muster =
-  headlessCfg {cTick = 16000, cDebug = False, cMuster = muster}
+matchupCfg :: Bool -> Bool -> Float -> Config
+matchupCfg muster kite arena =
+  headlessCfg {cTick = 16000, cDebug = False, cMuster = muster, cKite = kite, cArena = arena}
 
 -- | Parse @"warrior:10,siege:5"@ into a unit roster.
 parseComp :: String -> [(UnitType, Int)]
@@ -986,6 +1020,12 @@ runBattle cfg = loop (0 :: Int)
               cfold (\acc (k :: Kind, e :: Entity) -> if k == Soldier then e : acc else acc) []
           order <- liftIO (shuffleIO ents)
           mapM_ (\e -> atomically (void (stepUnit cfg e))) order
+          when (cArena cfg > 0) $
+            atomically $
+              cmap $ \(Position (V2 x y)) ->
+                let a = cArena cfg
+                    cl v = max (-a) (min a v)
+                 in Position (V2 (cl x) (cl y))
           (r, b) <- atomically teamCounts
           if
             | r == 0 && b == 0 -> pure Nothing
@@ -1001,11 +1041,13 @@ runBattle cfg = loop (0 :: Int)
 runMatchups :: [String] -> IO ()
 runMatchups args = do
   let muster = "--muster" `elem` args
+      kite = "--kite" `elem` args
+      arena = if "--arena" `elem` args then 160 else 0
       positional = filter (not . isPrefixOf "--") args
   case positional of
     (redS : blueS : rest) -> do
       let reps = case rest of (r : _) -> read r; _ -> 200 :: Int
-          cfg = matchupCfg muster
+          cfg = matchupCfg muster kite arena
           redC = parseComp redS
           blueC = parseComp blueS
       w <- initWorld
@@ -1028,6 +1070,7 @@ runMatchups args = do
           , "blue=" ++ blueS
           , "reps=" ++ show reps
           , "muster=" ++ show muster
+          , "kite=" ++ show kite
           , "red_wins=" ++ show rw
           , "blue_wins=" ++ show bw
           , "draws=" ++ show dr

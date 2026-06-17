@@ -1,0 +1,10 @@
+# Hunter(Scout slot) vs Lance(Siege slot, range 13), 12v12, 400 reps; only cKite toggled
+# Hunter range sweep, kite standoff 0.92
+r14 OFF: red 0 / blue 400      r14 ON: red 3 / blue 397   (standoff inside Lance reach -> fails)
+r15 OFF: red 0 / blue 400      r15 ON: red 400 / blue 0   (clean flip: behaviour makes the counter)
+r16 OFF: red 0 / blue 400      r16 ON: red 400 / blue 0
+
+# gradient probes (Hunter r16, kite ON)
+12v12 unbounded: red 400 / blue 0
+12v12 arena160 : red 400 / blue 0
+arena160 numbers Hunter:k vs Lance:12 (300 reps): k=8,10,12,14,16,18 all -> red 300 / blue 0
