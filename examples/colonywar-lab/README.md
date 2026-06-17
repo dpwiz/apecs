@@ -30,6 +30,7 @@ A>B by ≥k; the data says Z."*
 | # | Question | Verdict |
 |---|---|---|
 | [001](001-current-triad/) | Is the current Warrior/Scout/Siege triad a real cost-parity counter cycle? | ❌ No — **Siege strictly dominant** (a fixpoint); Scout combat-dead; S>C reversed. |
+| [002](002-cycle-feasibility/) | Can a real cycle come from stat retune, or are new behaviours needed? | 🔬 Stats can't — combat is **winner-take-all** (1.00/0.00, no gradient). Drama needs behaviours (kite/screen) + fog. |
 
 ## Baseline scorecard (committed `0a8b067`, 104 full-game rounds)
 
