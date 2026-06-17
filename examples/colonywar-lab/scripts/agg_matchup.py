@@ -72,7 +72,12 @@ for a, b in [('warrior', 'scout'), ('scout', 'siege'), ('siege', 'warrior')]:
     for (k1, w1), (k2, w2) in zip(pts, pts[1:]):
         if (w1 - 0.5) * (w2 - 0.5) <= 0 and w2 != w1:
             be = k1 + (0.5 - w1) * (k2 - k1) / (w2 - w1); break
-    bestr = f"{be/12:.2f}x" if be else "off-scale"
     print(f"{AB[a]}>{AB[b]}: {series}")
-    print(f"   break-even ~{be:.1f} vs 12  ({bestr} numbers)  "
-          + ("GOOD (<=1.0x)" if be and be <= 12 else "WEAK (needs more numbers)"))
+    if be is None:
+        wins_low = pts and pts[0][1] > 0.5
+        note = "wins even when outnumbered (<=0.5x, dominant)" if wins_low \
+            else "loses across the whole sweep (counter is broken)"
+        print(f"   break-even off-scale: {note}")
+    else:
+        print(f"   break-even ~{be:.1f} vs 12  ({be/12:.2f}x numbers)  "
+              + ("GOOD (<=1.0x)" if be <= 12 else "WEAK (needs more numbers)"))

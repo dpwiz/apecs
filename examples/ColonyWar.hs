@@ -947,19 +947,33 @@ splitOn c s = case break (== c) s of
   (a, []) -> [a]
   (a, _ : rest) -> a : splitOn c rest
 
--- | Spawn a roster around an anchor on a small deterministic grid (separation
--- then spreads them); no base, no spawner, no strategist.
+-- | Spawn a roster on a small grid whose columns recede /away/ from the centre,
+-- so the two armies are mirror-symmetric about x=0 (separation then spreads
+-- them); no base, no spawner, no strategist.
 spawnArmy :: Team -> [(UnitType, Int)] -> V2 Float -> SystemIO ()
 spawnArmy team comp (V2 ax ay) =
   forM_ (zip [0 :: Int ..] roster) $ \(i, ut) -> do
-    let gx = fromIntegral (i `mod` 5) * 9 - 18
-        gy = fromIntegral (i `div` 5) * 9
+    let face = signum ax -- columns recede outward, front rank faces the centre
+        gx = face * fromIntegral (i `mod` 5) * 9
+        gy = fromIntegral (i `div` 5) * 9 - 16
     void . atomically $
       newEntity (team, Soldier, ut, Position (V2 (ax + gx) (ay + gy)), Health (typeHp ut))
   where
     roster = concat [replicate n ut | (ut, n) <- comp]
 
+-- | Fisher-Yates shuffle (list-based; the rosters are tiny).
+shuffleIO :: [a] -> IO [a]
+shuffleIO [] = pure []
+shuffleIO xs = do
+  i <- randomRIO (0, length xs - 1)
+  case splitAt i xs of
+    (a, x : b) -> (x :) <$> shuffleIO (a ++ b)
+    (a, []) -> shuffleIO a -- unreachable: i < length xs
+
+
 -- | Step every soldier once per tick until one side is gone or the clock caps.
+-- The step order is reshuffled each tick so neither side gets a systematic
+-- first-strike advantage (a fixed order makes mirror matchups 100/0).
 runBattle :: Config -> SystemIO (Maybe Team)
 runBattle cfg = loop (0 :: Int)
   where
@@ -970,7 +984,8 @@ runBattle cfg = loop (0 :: Int)
           ents <-
             atomically $
               cfold (\acc (k :: Kind, e :: Entity) -> if k == Soldier then e : acc else acc) []
-          mapM_ (\e -> atomically (void (stepUnit cfg e))) ents
+          order <- liftIO (shuffleIO ents)
+          mapM_ (\e -> atomically (void (stepUnit cfg e))) order
           (r, b) <- atomically teamCounts
           if
             | r == 0 && b == 0 -> pure Nothing
