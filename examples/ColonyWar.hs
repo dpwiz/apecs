@@ -621,6 +621,37 @@ teamUnitCount team =
     (\n (t :: Team, k :: Kind) -> if t == team && k == Soldier then n + 1 else n)
     (0 :: Int)
 
+-- | Telemetry (exp 006): how much of the enemy a team actually sees through its
+-- fog -- its base sight plus every friendly soldier's recon -- as (seen, total)
+-- enemy soldiers. Coverage seen/total ~ 1 means the fog is collapsed (vision
+-- spans the whole field, recon is worthless, the counter-game goes deterministic).
+enemyCoverage :: Team -> SystemSTM (Int, Int)
+enemyCoverage team = do
+  unitSrcs <-
+    cfold
+      (\acc (t :: Team, ut :: UnitType, Position q) -> if t == team then (q, typeVision ut) : acc else acc)
+      []
+  let sources = (basePos team, baseVision) : unitSrcs
+  enemies <-
+    cfold
+      (\acc (t :: Team, k :: Kind, Position q) -> if t /= team && k == Soldier then q : acc else acc)
+      []
+  let seen = length [() | q <- enemies, any (\(s, r) -> quadrance (q - s) <= r * r) sources]
+  pure (seen, length enemies)
+
+-- | Telemetry: a team's soldier front as (mean x, max |y|), so a pinned-at-centre
+-- front (no travel) and the y-spread vs vision radius (how 2D the fight really
+-- is) are both legible.
+teamFront :: Team -> SystemSTM (Float, Float)
+teamFront team = do
+  (sx, n, maxY) <-
+    cfold
+      ( \(sx, n, my) (t :: Team, k :: Kind, Position (V2 x y)) ->
+          if t == team && k == Soldier then (sx + x, n + 1 :: Int, max my (abs y)) else (sx, n, my)
+      )
+      (0, 0, 0)
+  pure (if n == 0 then 0 else sx / fromIntegral n, maxY)
+
 {- | One planning pass for a colony, run as a transaction. It looks through the
 fog -- the union of its base's sight and every friendly soldier's recon -- to
 census the enemies it can see, then writes the counter-type and a muster
@@ -768,7 +799,7 @@ coordinator cfg = loop (1 :: Int)
     -- A gated 2 Hz pulse of each colony's live composition and current plan,
     -- so you can watch the triad counter-play shift through the fog.
     heartbeat = do
-      (ph, rc, bc, Plans rp bp, DamageLog dm, rHp, bHp) <- atomically $ do
+      (ph, rc, bc, Plans rp bp, DamageLog dm, rHp, bHp, rCov, bCov, rFront, bFront) <- atomically $ do
         ph <- get global
         rc <- teamCensus Red
         bc <- teamCensus Blue
@@ -776,12 +807,20 @@ coordinator cfg = loop (1 :: Int)
         dl <- get global
         rh <- baseHpOf Red
         bh <- baseHpOf Blue
-        pure (ph, rc, bc, pl, dl, rh, bh)
+        rcov <- enemyCoverage Red
+        bcov <- enemyCoverage Blue
+        rf <- teamFront Red
+        bf <- teamFront Blue
+        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf)
       let teamDmg t = round (sum [v | ((t', _, _), v) <- DM.toList dm, t' == t]) :: Int
       traceM $
-        "[hb] R " ++ showCensus rc ++ " base=" ++ show (round rHp :: Int) ++ " next=" ++ show (planNext rp) ++ " dmg=" ++ show (teamDmg Red)
-          ++ " | B " ++ showCensus bc ++ " base=" ++ show (round bHp :: Int) ++ " next=" ++ show (planNext bp) ++ " dmg=" ++ show (teamDmg Blue)
+        "[hb] R " ++ showCensus rc ++ " base=" ++ show (round rHp :: Int) ++ " next=" ++ show (planNext rp) ++ " dmg=" ++ show (teamDmg Red) ++ " " ++ showTel rCov rFront
+          ++ " | B " ++ showCensus bc ++ " base=" ++ show (round bHp :: Int) ++ " next=" ++ show (planNext bp) ++ " dmg=" ++ show (teamDmg Blue) ++ " " ++ showTel bCov bFront
       when (isPlaying ph) (threadDelay 500000 >> heartbeat)
+
+    -- Coverage seen/total enemies, front mean-x, and combat y-spread.
+    showTel (seen, tot) (cx, maxY) =
+      "cov=" ++ show seen ++ "/" ++ show tot ++ " frontx=" ++ show (round cx :: Int) ++ " ymax=" ++ show (round maxY :: Int)
 
     baseHpOf team =
       cfold (\acc (t :: Team, k :: Kind, Health h) -> if t == team && k == Base then h else acc) baseHp
