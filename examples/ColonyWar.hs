@@ -146,6 +146,18 @@ instance Monoid DamageLog where
   mempty = DamageLog DM.empty
 instance Component DamageLog where type Storage DamageLog = Global DamageLog
 
+-- | Per-round damage each team has put on the /enemy base/, by (Red, Blue) --
+-- the center-of-gravity ledger for the Warfighting scorecard (exp 008): how much
+-- of a side's effort lands on the heart vs on bodies.
+data BaseDamage = BaseDamage !Float !Float deriving (Show)
+instance Semigroup BaseDamage where BaseDamage a b <> BaseDamage c d = BaseDamage (a + c) (b + d)
+instance Monoid BaseDamage where mempty = BaseDamage 0 0
+instance Component BaseDamage where type Storage BaseDamage = Global BaseDamage
+
+addBaseDmg :: Team -> Float -> BaseDamage -> BaseDamage
+addBaseDmg Red d (BaseDamage r b) = BaseDamage (r + d) b
+addBaseDmg Blue d (BaseDamage r b) = BaseDamage r (b + d)
+
 -- | Rounds won across the whole match, by (Red, Blue). A 'Global'.
 data Wins = Wins !Int !Int deriving (Show)
 instance Semigroup Wins where
@@ -250,6 +262,7 @@ makeWorld
   , ''Role
   , ''KillScore
   , ''DamageLog
+  , ''BaseDamage
   , ''Wins
   , ''Phase
   , ''Plans
@@ -706,9 +719,11 @@ attack cfg killer atkType victim = do
         defType <- get victim
         let mult = if cTriad cfg then advantage atkType defType else 1.0
         pure (typeDamage atkType * mult, Just defType)
-    -- Ledger soldier-vs-soldier damage (the part actually applied).
-    forM_ mDef $ \defType ->
-      modify global (logDamage killer atkType defType (min dmg h))
+    -- Ledger the applied damage: soldier-vs-soldier into the type matrix, base
+    -- damage into the center-of-gravity ledger.
+    case mDef of
+      Just defType -> modify global (logDamage killer atkType defType (min dmg h))
+      Nothing -> modify global (addBaseDmg killer (min dmg h))
     if h - dmg <= 0
       then do
         destroy victim (Proxy @All)
@@ -832,6 +847,35 @@ siegeCount team =
     eb = basePos (enemyOf team)
     r2 = sq (baseRadius * 4)
 
+-- | Warfighting scorecard (exp 008) helpers.
+--
+-- Focus / Schwerpunkt: the largest local cluster of a team's force over its
+-- total -- ~1 when concentrated at a point, small when smeared across the field.
+concentration :: Team -> SystemSTM Float
+concentration team = do
+  pts <- cfold (\acc (t :: Team, k :: Kind, Position q) -> if t == team && k == Soldier then q : acc else acc) []
+  let n = length pts
+      r2 = sq 130
+      dens c = length [() | q <- pts, quadrance (q - c) <= r2]
+      best = if null pts then 0 else maximum (map dens pts)
+  pure (if n == 0 then 0 else fromIntegral best / fromIntegral n)
+
+-- Combined arms: Shannon entropy of the (H,G,L) mix, normalised to 0..1 (1 = an
+-- even three-way split, 0 = mono).
+armsEntropy :: Census -> Float
+armsEntropy (h, g, l) =
+  let tot = h + g + l
+      ps = [fromIntegral x / fromIntegral tot | x <- [h, g, l], x > 0]
+   in if tot == 0 then 0 else negate (sum [p * logBase 3 p | p <- ps])
+
+-- Initiative: how far into enemy territory a team's front sits (0 = own base,
+-- 1 = enemy base), from its mean soldier x.
+initiative :: Team -> Float -> Float
+initiative team mx =
+  let V2 ox _ = basePos team
+      V2 ex _ = basePos (enemyOf team)
+   in max 0 (min 1 ((mx - ox) / (ex - ox)))
+
 -- | Telemetry (over-eager assaults). Two measurable faces of "too eager to
 -- advance into certain death", per team:
 --   * bad  = fraction of soldiers whose /nearest/ enemy hard-counters them (a
@@ -938,7 +982,7 @@ strategist cfg team base = loop
 -- | How the non-Hunter reinforcements divide between the three ground roles:
 -- a flanking force, a home garrison, and the main body (the remainder).
 flankShare, defendShare :: Double
-flankShare = 0.3
+flankShare = 0.45
 defendShare = 0.2
 
 -- | Task-force role for a fresh soldier (exp 007): Hunters scout + screen
@@ -1018,6 +1062,7 @@ startRound cfg n = do
     cmapM_ $ \(_ :: Team, e :: Entity) -> destroy e (Proxy @All)
     set global (mempty :: KillScore)
     set global (mempty :: DamageLog)
+    set global (mempty :: BaseDamage)
     set global (Plans (initialPlan Red) (initialPlan Blue))
     set global (ThreatMem (Threat 0 0 pick) (Threat 0 0 (negate pick)))
     set global Playing
@@ -1051,7 +1096,7 @@ coordinator cfg = loop (1 :: Int)
     -- A gated 2 Hz pulse of each colony's live composition and current plan,
     -- so you can watch the triad counter-play shift through the fog.
     heartbeat = do
-      (ph, rc, bc, Plans rp bp, DamageLog dm, rHp, bHp, rCov, bCov, rFront, bFront, rBad, bBad) <- atomically $ do
+      (ph, rc, bc, Plans rp bp, DamageLog dm, rHp, bHp, rCov, bCov, rFront, bFront, rBad, bBad, rConc, bConc, BaseDamage bdR bdB) <- atomically $ do
         ph <- get global
         rc <- teamCensus Red
         bc <- teamCensus Blue
@@ -1066,12 +1111,30 @@ coordinator cfg = loop (1 :: Int)
         (rbad, bbad, rout, bout) <- engageRates
         rsg <- siegeCount Red
         bsg <- siegeCount Blue
-        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf, (rbad, rout, rsg), (bbad, bout, bsg))
-      let teamDmg t = round (sum [v | ((t', _, _), v) <- DM.toList dm, t' == t]) :: Int
+        rconc <- concentration Red
+        bconc <- concentration Blue
+        bd <- get global
+        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf, (rbad, rout, rsg), (bbad, bout, bsg), rconc, bconc, bd)
+      let teamDmgF t = sum [v | ((t', _, _), v) <- DM.toList dm, t' == t]
+          teamDmg t = round (teamDmgF t) :: Int
       traceM $
         "[hb] R " ++ showCensus rc ++ " base=" ++ show (round rHp :: Int) ++ " next=" ++ show (planNext rp) ++ " dmg=" ++ show (teamDmg Red) ++ " " ++ showTel rCov rFront rBad
           ++ " | B " ++ showCensus bc ++ " base=" ++ show (round bHp :: Int) ++ " next=" ++ show (planNext bp) ++ " dmg=" ++ show (teamDmg Blue) ++ " " ++ showTel bCov bFront bBad
+      -- Warfighting adherence scorecard (exp 008), per side.
+      traceM $
+        "[score] R " ++ scoreLine Red rCov bCov rc rFront rConc (teamDmgF Red) bdR
+          ++ " | B " ++ scoreLine Blue bCov rCov bc bFront bConc (teamDmgF Blue) bdB
       when (isPlaying ph) (threadDelay 500000 >> heartbeat)
+
+    -- recon  = my coverage of the enemy; sec = 1 - the enemy's coverage of me;
+    -- arms   = combined-arms mix entropy; init = how deep my front is in his
+    -- half; focus = my force concentration; cog = share of my damage on his base.
+    scoreLine team myCov foeCov census (mx, _) conc soldierDmg baseDmg =
+      let frac (s, t) = if t == 0 then 0 :: Float else fromIntegral s / fromIntegral t
+          pct x = show (round (x * 100) :: Int)
+       in "recon=" ++ pct (frac myCov) ++ " sec=" ++ pct (1 - frac foeCov)
+            ++ " arms=" ++ pct (armsEntropy census) ++ " init=" ++ pct (initiative team mx)
+            ++ " focus=" ++ pct conc ++ " cog=" ++ pct (if soldierDmg + baseDmg <= 0 then 0 else baseDmg / (soldierDmg + baseDmg))
 
     -- Coverage seen/total, front mean-x, combat y-spread, the over-eager pair
     -- (bad = nearest foe counters me, out = locally outnumbered), and siege =
