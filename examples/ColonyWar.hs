@@ -4,6 +4,7 @@
 {-# LANGUAGE FlexibleInstances #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE MultiWayIf #-}
 {-# LANGUAGE ScopedTypeVariables #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
@@ -58,8 +59,9 @@ Build with @-threaded -N@ so the threads actually run in parallel.
 -}
 module Main (main) where
 
-import Control.Monad (forM, forM_, void, when)
-import Data.List (intercalate)
+import Control.Monad (foldM, forM, forM_, void, when)
+import Data.Char (toLower)
+import Data.List (intercalate, isPrefixOf)
 import qualified Data.Map.Strict as DM
 import Debug.Trace (traceM)
 import System.Environment (getArgs)
@@ -211,6 +213,9 @@ data Config = Config
   -- ^ Headless wall-clock budget before the process exits (0 == unbounded).
   , cDebug :: Bool
   -- ^ Emit 'traceM' diagnostics.
+  , cMuster :: Bool
+  -- ^ Whether soldiers rally-and-wave (mass up before committing). Off in the
+  -- matchup harness to measure raw stat combat with this behaviour ablated.
   }
 
 displayCfg :: Config
@@ -224,6 +229,7 @@ displayCfg =
     , cOver = 4000000
     , cMaxSeconds = 0
     , cDebug = False
+    , cMuster = True
     }
 
 headlessCfg :: Config
@@ -237,6 +243,7 @@ headlessCfg =
     , cOver = 300000
     , cMaxSeconds = 180
     , cDebug = True
+    , cMuster = True
     }
 
 dbg :: Config -> String -> SystemIO ()
@@ -432,7 +439,7 @@ stepUnit cfg ety = do
       -- is under-supported falls back to the rally point to mass up first,
       -- rather than feed itself piecemeal into the enemy blob.
       wp <- planWaypoint . teamPlan myTeam <$> get global
-      let supported = allyNear + 1 >= musterMin
+      let supported = not (cMuster cfg) || allyNear + 1 >= musterMin
           rally = rallyPoint myTeam
           dest
             | fighting = Nothing
@@ -904,6 +911,114 @@ handleEvent _ = pure ()
 step :: Float -> SystemIO ()
 step _ = pure ()
 
+-- Matchup harness -----------------------------------------------------------
+
+{- | A controlled, scriptable combat test that isolates unit balance from the
+strategist. Two fixed armies are spawned facing each other and stepped
+/synchronously/ (no threads, no sleeps, full information) until one side is
+eliminated, so thousands of battles run in seconds and a result is decisive.
+This is the instrument behind the "real counters" / "no fixpoint" hypotheses:
+sweep the type x type grid at equal numbers and read off who actually wins.
+
+  > stm-colony-war --matchup warrior:10 scout:10 [reps] [--muster]
+-}
+matchupCfg :: Bool -> Config
+matchupCfg muster =
+  headlessCfg {cTick = 16000, cDebug = False, cMuster = muster}
+
+-- | Parse @"warrior:10,siege:5"@ into a unit roster.
+parseComp :: String -> [(UnitType, Int)]
+parseComp s = [parse1 part | part <- splitOn ',' s]
+  where
+    parse1 p = case splitOn ':' p of
+      [t, n] -> (parseType t, read n)
+      _ -> error ("matchup: bad component " ++ show p)
+    parseType t = case map toLower t of
+      "warrior" -> Warrior
+      "w" -> Warrior
+      "scout" -> Scout
+      "s" -> Scout
+      "siege" -> Siege
+      "c" -> Siege
+      other -> error ("matchup: bad unit type " ++ show other)
+
+splitOn :: Char -> String -> [String]
+splitOn c s = case break (== c) s of
+  (a, []) -> [a]
+  (a, _ : rest) -> a : splitOn c rest
+
+-- | Spawn a roster around an anchor on a small deterministic grid (separation
+-- then spreads them); no base, no spawner, no strategist.
+spawnArmy :: Team -> [(UnitType, Int)] -> V2 Float -> SystemIO ()
+spawnArmy team comp (V2 ax ay) =
+  forM_ (zip [0 :: Int ..] roster) $ \(i, ut) -> do
+    let gx = fromIntegral (i `mod` 5) * 9 - 18
+        gy = fromIntegral (i `div` 5) * 9
+    void . atomically $
+      newEntity (team, Soldier, ut, Position (V2 (ax + gx) (ay + gy)), Health (typeHp ut))
+  where
+    roster = concat [replicate n ut | (ut, n) <- comp]
+
+-- | Step every soldier once per tick until one side is gone or the clock caps.
+runBattle :: Config -> SystemIO (Maybe Team)
+runBattle cfg = loop (0 :: Int)
+  where
+    maxTicks = 6000
+    loop t
+      | t >= maxTicks = pure Nothing -- unresolved: a draw/stalemate
+      | otherwise = do
+          ents <-
+            atomically $
+              cfold (\acc (k :: Kind, e :: Entity) -> if k == Soldier then e : acc else acc) []
+          mapM_ (\e -> atomically (void (stepUnit cfg e))) ents
+          (r, b) <- atomically teamCounts
+          if
+            | r == 0 && b == 0 -> pure Nothing
+            | b == 0 -> pure (Just Red)
+            | r == 0 -> pure (Just Blue)
+            | otherwise -> loop (t + 1)
+    teamCounts =
+      cfold
+        (\(r, b) (tm :: Team, k :: Kind) -> if k == Soldier then (if tm == Red then (r + 1, b) else (r, b + 1)) else (r, b))
+        (0 :: Int, 0 :: Int)
+
+-- | Run @reps@ battles of one matchup and print a single structured RESULT line.
+runMatchups :: [String] -> IO ()
+runMatchups args = do
+  let muster = "--muster" `elem` args
+      positional = filter (not . isPrefixOf "--") args
+  case positional of
+    (redS : blueS : rest) -> do
+      let reps = case rest of (r : _) -> read r; _ -> 200 :: Int
+          cfg = matchupCfg muster
+          redC = parseComp redS
+          blueC = parseComp blueS
+      w <- initWorld
+      (rw, bw, dr) <- runWith w $ do
+        set global (Camera 0 1)
+        let one (r, b, d) _ = do
+              atomically $ cmapM_ (\(_ :: Team, e :: Entity) -> destroy e (Proxy @All))
+              spawnArmy Red redC (V2 (-70) 0)
+              spawnArmy Blue blueC (V2 70 0)
+              o <- runBattle cfg
+              pure $ case o of
+                Just Red -> (r + 1, b, d)
+                Just Blue -> (r, b + 1, d)
+                Nothing -> (r, b, d + 1)
+        foldM one (0 :: Int, 0 :: Int, 0 :: Int) [1 .. reps]
+      putStrLn $
+        unwords
+          [ "RESULT"
+          , "red=" ++ redS
+          , "blue=" ++ blueS
+          , "reps=" ++ show reps
+          , "muster=" ++ show muster
+          , "red_wins=" ++ show rw
+          , "blue_wins=" ++ show bw
+          , "draws=" ++ show dr
+          ]
+    _ -> putStrLn "usage: --matchup <redComp> <blueComp> [reps] [--muster]"
+
 main :: IO ()
 main = do
   -- Line-buffer both streams so round reports and heartbeats appear promptly
@@ -911,6 +1026,12 @@ main = do
   hSetBuffering stdout LineBuffering
   hSetBuffering stderr LineBuffering
   args <- getArgs
+  if "--matchup" `elem` args
+    then runMatchups (filter (/= "--matchup") args)
+    else runGame args
+
+runGame :: [String] -> IO ()
+runGame args = do
   let cfg
         | any (`elem` ["--headless", "headless"]) args = headlessCfg
         | otherwise = displayCfg
