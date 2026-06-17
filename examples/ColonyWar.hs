@@ -65,7 +65,7 @@ module Main (main) where
 import Control.Monad (foldM, forM_, void, when)
 import Data.Bits (shiftR, xor)
 import Data.Char (toLower)
-import Data.List (intercalate, isPrefixOf)
+import Data.List (intercalate, isPrefixOf, partition)
 import qualified Data.Map.Strict as DM
 import Debug.Trace (traceM)
 import System.Environment (getArgs)
@@ -402,6 +402,17 @@ collideDist2, waypointReach2 :: Float
 collideDist2 = collideDist * collideDist
 waypointReach2 = waypointReach * waypointReach
 
+-- | Cohesion (exp 009): maneuver/fighting units pull toward friendly soldiers in
+-- the band just beyond shoving range out to 'cohesionRadius', forming local
+-- groups that move as one. 'cohesionPull' is the per-tick draw (kept below a
+-- unit's step so the objective still leads).
+cohesionRadius, cohesionPull :: Float
+cohesionRadius = 80
+cohesionPull = 0.5
+
+cohesionRadius2 :: Float
+cohesionRadius2 = cohesionRadius * cohesionRadius
+
 sq :: Float -> Float
 sq x = x * x
 
@@ -547,8 +558,8 @@ stepUnit cfg ety = do
       let vis2 = sq (typeVision myType)
           range2 = sq (typeRange myType)
           speed = typeSpeed myType
-      (mUnit, mBase, sep, allyNear) <-
-        cfoldM (gather p myTeam vis2) (Nothing, Nothing, V2 0 0, 0 :: Int)
+      (mUnit, mBase, sep, allyNear, coh) <-
+        cfoldM (gather p myTeam vis2) (Nothing, Nothing, V2 0 0, 0 :: Int, V2 0 0)
       -- The nearest enemy /soldier/'s type, for the kiting decision (one read,
       -- same transaction/snapshot as the gather, so it is consistent). Only
       -- needed when kiting is enabled, so the normal game pays nothing.
@@ -673,12 +684,17 @@ stepUnit cfg ety = do
           approach = case dest of
             Just d -> normalize (d - p) ^* (speed * dt)
             Nothing -> V2 0 0
-      set ety (Position (p + approach + sep))
+          -- The maneuver and fighting elements cohere into local groups; recon
+          -- and the home garrison deliberately spread, so they don't.
+          cohesion
+            | myRole == MainBody || myRole == Flank, quadrance coh > 1e-6 = normalize coh ^* cohesionPull
+            | otherwise = V2 0 0
+      set ety (Position (p + approach + sep + cohesion))
       pure True
   where
     dt = fromIntegral (cTick cfg) / 1e6
-    gather p myTeam vis2 (mUnit, mBase, sep, allies) (t :: Team, k :: Kind, Position q, e) =
-      pure (mUnit', mBase', sep', allies')
+    gather p myTeam vis2 (mUnit, mBase, sep, allies, coh) (t :: Team, k :: Kind, Position q, e) =
+      pure (mUnit', mBase', sep', allies', coh')
       where
         dv = q - p
         d2 = quadrance dv
@@ -692,6 +708,13 @@ stepUnit cfg ety = do
         allies'
           | t == myTeam && k == Soldier && e /= ety && d2 <= musterRadius2 = allies + 1
           | otherwise = allies
+        -- Cohesion: pull toward friendly soldiers in the band just beyond the
+        -- shoving range and within 'cohesionRadius', so the force draws together
+        -- into local groups that move and fight as one (no more trickle) instead
+        -- of smearing toward a central waypoint as isolated specks.
+        coh'
+          | t == myTeam && k == Soldier && e /= ety && d2 > collideDist2 && d2 < cohesionRadius2 = coh + dv
+          | otherwise = coh
         mUnit'
           | seen && k == Soldier = closer mUnit e q d2
           | otherwise = mUnit
@@ -859,6 +882,22 @@ concentration team = do
       dens c = length [() | q <- pts, quadrance (q - c) <= r2]
       best = if null pts then 0 else maximum (map dens pts)
   pure (if n == 0 then 0 else fromIntegral best / fromIntegral n)
+
+-- Local groups: the number of distinct clusters a team's force breaks into
+-- (single-linkage connected components within a squad radius). Centralized
+-- smearing → many isolated specks; cohesion → a few dense groups.
+groupCount :: Team -> SystemSTM Int
+groupCount team = do
+  pts <- cfold (\acc (t :: Team, k :: Kind, Position q) -> if t == team && k == Soldier then q : acc else acc) []
+  pure (length (components pts))
+  where
+    r2 = sq 95
+    components [] = []
+    components (q : qs) = let (cl, rest) = flood [q] qs in cl : components rest
+    flood cluster pool =
+      case partition (\x -> any (\c -> quadrance (x - c) <= r2) cluster) pool of
+        ([], _) -> (cluster, pool)
+        (near, far) -> flood (cluster ++ near) far
 
 -- Combined arms: Shannon entropy of the (H,G,L) mix, normalised to 0..1 (1 = an
 -- even three-way split, 0 = mono).
@@ -1113,8 +1152,10 @@ coordinator cfg = loop (1 :: Int)
         bsg <- siegeCount Blue
         rconc <- concentration Red
         bconc <- concentration Blue
+        rgrp <- groupCount Red
+        bgrp <- groupCount Blue
         bd <- get global
-        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf, (rbad, rout, rsg), (bbad, bout, bsg), rconc, bconc, bd)
+        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf, (rbad, rout, rsg), (bbad, bout, bsg), (rconc, rgrp), (bconc, bgrp), bd)
       let teamDmgF t = sum [v | ((t', _, _), v) <- DM.toList dm, t' == t]
           teamDmg t = round (teamDmgF t) :: Int
       traceM $
@@ -1126,15 +1167,17 @@ coordinator cfg = loop (1 :: Int)
           ++ " | B " ++ scoreLine Blue bCov rCov bc bFront bConc (teamDmgF Blue) bdB
       when (isPlaying ph) (threadDelay 500000 >> heartbeat)
 
-    -- recon  = my coverage of the enemy; sec = 1 - the enemy's coverage of me;
-    -- arms   = combined-arms mix entropy; init = how deep my front is in his
-    -- half; focus = my force concentration; cog = share of my damage on his base.
-    scoreLine team myCov foeCov census (mx, _) conc soldierDmg baseDmg =
+    -- recon = my coverage of the enemy; sec = 1 - the enemy's coverage of me;
+    -- arms = combined-arms mix entropy; init = how deep my front is in his half;
+    -- focus = force concentration; grp = number of distinct groups (smear vs
+    -- cohere); cog = share of my damage on his base.
+    scoreLine team myCov foeCov census (mx, _) (conc, grp) soldierDmg baseDmg =
       let frac (s, t) = if t == 0 then 0 :: Float else fromIntegral s / fromIntegral t
           pct x = show (round (x * 100) :: Int)
        in "recon=" ++ pct (frac myCov) ++ " sec=" ++ pct (1 - frac foeCov)
             ++ " arms=" ++ pct (armsEntropy census) ++ " init=" ++ pct (initiative team mx)
-            ++ " focus=" ++ pct conc ++ " cog=" ++ pct (if soldierDmg + baseDmg <= 0 then 0 else baseDmg / (soldierDmg + baseDmg))
+            ++ " focus=" ++ pct conc ++ " grp=" ++ show grp
+            ++ " cog=" ++ pct (if soldierDmg + baseDmg <= 0 then 0 else baseDmg / (soldierDmg + baseDmg))
 
     -- Coverage seen/total, front mean-x, combat y-spread, the over-eager pair
     -- (bad = nearest foe counters me, out = locally outnumbered), and siege =
