@@ -113,9 +113,11 @@ instance Component UnitType where type Storage UnitType = Map UnitType
 --   * 'MainBody' fixes the enemy front -- engages and holds, the base case.
 --   * 'Flank' is the main effort: it avoids the enemy line and sweeps wide
 --     through the open flank to strike the lightly-held enemy base.
---   * 'Recon' screens and scouts -- spreads out to light up the map and watch
---     the team's own flanks against a backstab.
-data Role = MainBody | Flank | Recon deriving (Eq, Show)
+--   * 'Defend' garrisons home -- rings the base and intercepts intruders so a
+--     flank can't waltz onto an undefended spawner.
+--   * 'Recon' screens and scouts -- spreads out to light up the whole map, deny
+--     the enemy's scouts, and watch the team's own flanks against a backstab.
+data Role = MainBody | Flank | Defend | Recon deriving (Eq, Show)
 instance Component Role where type Storage Role = Map Role
 
 -- | A transient marker on a soldier that struck this tick, carrying the point
@@ -357,7 +359,7 @@ rallyDist = 95
 musterRadius2 = musterRadius * musterRadius
 
 musterMin :: Int
-musterMin = 6
+musterMin = 3
 
 -- | Flanking maneuver (exp 007): the flanking force sweeps to this vertical
 -- offset (well clear of the y≈0 frontal grind) along the open flank, then turns
@@ -600,31 +602,50 @@ stepUnit cfg ety = do
             let V2 ebx _ = enemyBase
                 V2 px _ = p
              in if abs (px - ebx) > flankTurnIn then V2 ebx (gap * flankY) else enemyBase
-          -- Recon saturates the enemy half: each scout takes a low-discrepancy
-          -- (golden-ratio) point spread over both depth and height, so they fan
-          -- out evenly instead of forming a rigid line, and never close the base.
+          -- Recon saturates the WHOLE field -- own half (security / early warning
+          -- of a backstab) through the enemy half -- via a low-discrepancy
+          -- (golden-ratio) scatter over depth and height, so it covers ground
+          -- instead of forming a rigid line.
+          homeBase = basePos myTeam
           reconScout =
             let V2 ebx _ = enemyBase
+                V2 obx _ = homeBase
                 Entity eid = ety
                 frac z = z - fromIntegral (floor z :: Int)
-                sx = 0.15 + 0.55 * frac (fromIntegral eid * 0.6180339887)
+                sx = frac (fromIntegral eid * 0.6180339887)
                 sy = frac (fromIntegral eid * 0.3819660113) * 2 - 1
-             in V2 (ebx * sx) (sy * 250)
-          -- Self-preservation: a scout backs straight off a nearby threat unless
-          -- it can simply kite it. Information rarely outvalues the scout itself.
+             in V2 (obx + (ebx - obx) * sx) (sy * 280)
+          -- Counter-recon: an enemy /scout/ nearby gets hunted (deny their eyes);
+          -- a real threat it can't kite gets fled (a scout rarely outvalues itself).
+          enemyScoutNear = mUnitType == Just Hunter && case mUnit of
+            Just (_, _, d2) -> d2 < sq (typeVision myType * 0.6)
+            Nothing -> False
           dangerR2 = sq (typeVision myType * 0.45)
           fleePoint = case mUnit of
             Just (_, tPos, _) -> p + (let v = p - tPos in if quadrance v > 1e-6 then normalize v else V2 0 1) ^* 90
             Nothing -> p
           reconDanger = case mUnit of Just (_, _, d2) -> d2 < dangerR2; Nothing -> False
+          -- Home garrison: ring the base (a golden-angle slot per unit, so they
+          -- cover every approach) and intercept anything that reaches it.
+          ringPoint =
+            let Entity eid = ety
+                ang = fromIntegral eid * 2.39996323
+             in homeBase + V2 (cos ang) (sin ang) ^* (baseRadius * 5)
+          homeThreatR2 = sq 240
           dest = case myRole of
             -- Maneuver force: ignore the frontal fight, head for the base.
             Flank -> Just flankDest
-            -- Recon: kite what it can, flee what it can't, otherwise spread and scout.
+            -- Recon: kite what it can, hunt enemy scouts, flee what would kill it,
+            -- otherwise spread and scout the whole field.
             Recon
               | Just kd <- kiteDest -> Just kd
+              | enemyScoutNear -> case mUnit of Just (_, tPos, _) -> Just tPos; Nothing -> Just reconScout
               | reconDanger -> Just fleePoint
               | otherwise -> Just reconScout
+            -- Garrison: intercept an enemy that has reached home, else hold a ring.
+            Defend -> case mUnit of
+              Just (_, tPos, _) | quadrance (tPos - homeBase) <= homeThreatR2 -> Just tPos
+              _ -> Just ringPoint
             -- Main body: fix the enemy front (press into melee when supported,
             -- else fall back and mass at the rally point).
             MainBody
@@ -914,15 +935,22 @@ strategist cfg team base = loop
 
 -- Spawning ------------------------------------------------------------------
 
--- | The share of (non-Hunter) reinforcements peeled off as the flanking force.
-flankShare :: Double
-flankShare = 0.35
+-- | How the non-Hunter reinforcements divide between the three ground roles:
+-- a flanking force, a home garrison, and the main body (the remainder).
+flankShare, defendShare :: Double
+flankShare = 0.3
+defendShare = 0.2
 
--- | Task-force role for a fresh soldier (exp 007): Hunters scout (Recon); the
--- rest mostly hold the line, with 'flankShare' peeling off to strike the base.
+-- | Task-force role for a fresh soldier (exp 007): Hunters scout + screen
+-- (Recon); the rest split into the Flank (strike the base), a Defend garrison
+-- (hold home so the enemy flank can't waltz onto an empty spawner), and the
+-- MainBody that fixes the front.
 rollRole :: UnitType -> Double -> Role
 rollRole Hunter _ = Recon
-rollRole _ r = if r < flankShare then Flank else MainBody
+rollRole _ r
+  | r < flankShare = Flank
+  | r < flankShare + defendShare = Defend
+  | otherwise = MainBody
 
 -- | Where a fresh soldier appears: on the base perimeter at 'spawnRadius', in
 -- the direction of the muster waypoint, nudged sideways by the given tangential

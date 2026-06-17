@@ -105,10 +105,31 @@ distinct). Each round the two colonies still take **opposite** flanks (divergenc
 a coin seeded from the round + both positions — neither the enemy nor the AI can
 bank on a pattern. Rounds still resolve (3 in 180s, both winning).
 
+### Increment 4: garrison defense, whole-field recon, counter-recon
+Playtest of 3df1794: recon formed one line (only covered the enemy half), didn't
+deny enemy vision, and rounds ended in an **instakill on an undefended spawner**.
+
+- **Defend role** (`defendShare`=0.2 of non-Hunters): a garrison rings the home
+  base (a golden-angle slot each) and intercepts intruders → the flank must
+  *earn* the base, no more instakill.
+- **Recon covers the whole field** (own half through enemy half, golden-ratio
+  scatter) — security/early-warning, not a forward line.
+- **Counter-recon**: recon hunts nearby enemy scouts (denies vision), kites
+  Lances, flees what would kill it.
+- **`musterMin` 6→3**: the 4-role dispersion thinned local density, so the
+  MainBody never met the old muster threshold and froze at its rally point.
+  Lowering it lets the dispersed fixing force actually commit.
+
+### Pacing note (user)
+"1 round in 180s is actually good" — the war is *meant* to be a long ebb-and-flow,
+not fast rounds. With the above, Round 1 ran a **113/118-kill** attrition-and-
+maneuver battle in ~240s (vs the earlier 20–50), no instakill, no freeze.
+
+**Reverted:** mass-before-commit (flank staging). It was my rebalance for the
+garrison stalemate, but it *froze* a good state (flankers staged forever; the
+dispersed front under-mustered). Pacing was already good without it. Kept simple.
+
 ### Next
-- **Defensive anticipation (point 2, the other half):** the same memory should
-  make a colony *screen its own threatened flank* — right now nobody defends, so
-  the flank razes a free base (rounds may end too cheaply). Defense makes the
-  flank *earn* it → counterplay and drama.
-- **Mass-before-commit** for the flank; remove the last gladiatorial nudge.
-- A ~100-round batch to certify fairness (Wilson CI), once it feels right.
+- **Memory-driven defense** (point 2 proper): bias the garrison to the
+  remembered-threatened flank, not just an even ring.
+- A ~100-round fairness batch (Wilson CI), once it feels right in playtest.
