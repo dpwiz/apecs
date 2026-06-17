@@ -58,7 +58,7 @@ Build with @-threaded -N@ so the threads actually run in parallel.
 -}
 module Main (main) where
 
-import Control.Monad (forM_, void, when)
+import Control.Monad (forM, forM_, void, when)
 import Data.List (intercalate)
 import qualified Data.Map.Strict as DM
 import Debug.Trace (traceM)
@@ -68,6 +68,7 @@ import Apecs.Gloss
 import Apecs.STM.Prelude
 import Linear (V2 (..), normalize, quadrance, (^*), (^/))
 import System.Exit (exitSuccess)
+import System.IO (BufferMode (LineBuffering), hSetBuffering, stderr, stdout)
 import System.Random (randomRIO)
 
 -- Components ----------------------------------------------------------------
@@ -89,6 +90,12 @@ instance Component Kind where type Storage Kind = Map Kind
 -- | The rock-paper-scissors triad. Only soldiers carry one.
 data UnitType = Warrior | Scout | Siege deriving (Eq, Ord, Show, Enum, Bounded)
 instance Component UnitType where type Storage UnitType = Map UnitType
+
+-- | A transient marker on a soldier that struck this tick, carrying the point
+-- it struck at. Set/cleared each turn by 'stepUnit', read only by the renderer
+-- to draw a tracer line from attacker to victim. Carries no game meaning.
+newtype Attacking = Attacking (V2 Float) deriving (Show)
+instance Component Attacking where type Storage Attacking = Map Attacking
 
 -- | Kills scored this round, by (Red, Blue). A 'Global'.
 data KillScore = KillScore !Int !Int deriving (Show)
@@ -152,9 +159,16 @@ instance Semigroup ShowRange where _ <> b = b
 instance Monoid ShowRange where mempty = ShowRange False
 instance Component ShowRange where type Storage ShowRange = Global ShowRange
 
+-- | Whether to draw attacker->victim tracer lines. On by default; toggled from
+-- input.
+newtype ShowAttacks = ShowAttacks Bool
+instance Semigroup ShowAttacks where _ <> b = b
+instance Monoid ShowAttacks where mempty = ShowAttacks True
+instance Component ShowAttacks where type Storage ShowAttacks = Global ShowAttacks
+
 -- | Every component an entity owns, so we can delete it in one go (the extra
 -- deletes are harmless no-ops for entities that lack a component).
-type All = (Position, Health, Team, Kind, UnitType)
+type All = (Position, Health, Team, Kind, UnitType, Attacking)
 
 makeWorld
   "World"
@@ -163,6 +177,7 @@ makeWorld
   , ''Team
   , ''Kind
   , ''UnitType
+  , ''Attacking
   , ''KillScore
   , ''DamageLog
   , ''Wins
@@ -170,6 +185,7 @@ makeWorld
   , ''Plans
   , ''ShowVision
   , ''ShowRange
+  , ''ShowAttacks
   , ''Camera
   ]
 
@@ -215,11 +231,11 @@ headlessCfg =
   Config
     { cHeadless = True
     , cTick = 1500 -- the whole battle plays out fast
-    , cSpawn = 8000
+    , cSpawn = 14000
     , cStrategy = 30000
     , cPoll = 5000
     , cOver = 300000
-    , cMaxSeconds = 35
+    , cMaxSeconds = 180
     , cDebug = True
     }
 
@@ -229,23 +245,48 @@ dbg cfg msg = when (cDebug cfg) (traceM msg)
 -- Tunables ------------------------------------------------------------------
 
 capPerTeam, initialPlatoon :: Int
-capPerTeam = 60
-initialPlatoon = 14
+capPerTeam = 34
+initialPlatoon = 12
 
 baseHp :: Float
-baseHp = 600
+baseHp = 380
 
 -- | A base sees roughly a quarter of the (640-wide) field around itself.
 baseVision, waypointReach :: Float
 baseVision = 160
 waypointReach = 28
 
--- | Soldiers shove each other apart so they don't stack into one pixel.
-baseRadius, collideDist, sepStrength, spawnRadius :: Float
+-- | Reinforcements rally and attack in waves instead of feeding in one at a
+-- time. A soldier with fewer than 'musterMin' friendly soldiers within
+-- 'musterRadius' is "under-supported": rather than charge a blob that would melt
+-- it, it falls back to a staging point 'rallyDist' in front of its base and
+-- waits for the clump to build, committing only once it is strong enough.
+musterRadius, rallyDist, musterRadius2 :: Float
+musterRadius = 58
+rallyDist = 95
+musterRadius2 = musterRadius * musterRadius
+
+musterMin :: Int
+musterMin = 6
+
+-- | A team's staging point: in front of its base, on the line to the enemy.
+rallyPoint :: Team -> V2 Float
+rallyPoint team = b + normalize (basePos (enemyOf team) - b) ^* rallyDist
+  where
+    b = basePos team
+
+-- | Soldiers shove each other apart so they don't stack into one pixel. This
+-- packing is deliberately tight: concentration is what lets a winning army
+-- overwhelm a thinner one locally and break through, which is how a round
+-- actually ends. (Roomy spacing was tried and turned every round into an
+-- endless even-trade grind.) 'lineSpacing' only sets the cosmetic width of the
+-- opening muster lines.
+baseRadius, collideDist, sepStrength, spawnRadius, lineSpacing :: Float
 baseRadius = 22
 collideDist = 11
 sepStrength = 0.6
 spawnRadius = 40
+lineSpacing = 16
 
 collideDist2, waypointReach2 :: Float
 collideDist2 = collideDist * collideDist
@@ -279,12 +320,6 @@ beats Warrior Scout = True
 beats Scout Siege = True
 beats Siege Warrior = True
 beats _ _ = False
-
--- | The type to enlist in order to beat the given enemy type.
-counter :: UnitType -> UnitType
-counter Scout = Warrior
-counter Siege = Scout
-counter Warrior = Siege
 
 -- | Damage multiplier from the triad: double if you counter, half if countered.
 advantage :: UnitType -> UnitType -> Float
@@ -373,23 +408,42 @@ stepUnit cfg ety = do
       let vis2 = sq (typeVision myType)
           range2 = sq (typeRange myType)
           speed = typeSpeed myType
-      (mUnit, mBase, sep) <-
-        cfoldM (gather p myTeam vis2) (Nothing, Nothing, V2 0 0)
+      (mUnit, mBase, sep, allyNear) <-
+        cfoldM (gather p myTeam vis2) (Nothing, Nothing, V2 0 0, 0 :: Int)
       let target = case mUnit of
             Just u -> Just u
             Nothing -> mBase
       -- Attack a visible target that is in reach.
-      case target of
-        Just (tEnt, _, d2) | d2 <= range2 -> attack myTeam myType tEnt
-        _ -> pure ()
-      -- Move: close on the target, else muster at the colony's waypoint.
+      let struck = case target of
+            Just (tEnt, tPos, d2) | d2 <= range2 -> Just (tEnt, tPos)
+            _ -> Nothing
+          fighting = case struck of
+            Just _ -> True
+            Nothing -> False
+      case struck of
+        Just (tEnt, _) -> attack myTeam myType tEnt
+        Nothing -> pure ()
+      -- Record (display only) a tracer to whatever we hit, or clear last tick's.
+      when (not (cHeadless cfg)) $ case struck of
+        Just (_, tPos) -> set ety (Attacking tPos)
+        Nothing -> destroy ety (Proxy @Attacking)
+      -- Move. A soldier already trading blows holds and fights. One with enough
+      -- friends nearby presses the target (or marches to the muster). One that
+      -- is under-supported falls back to the rally point to mass up first,
+      -- rather than feed itself piecemeal into the enemy blob.
       wp <- planWaypoint . teamPlan myTeam <$> get global
-      let dest = case target of
-            Just (_, tPos, d2) | d2 > range2 -> Just tPos
-            Just _ -> Nothing -- in range: hold and fight
-            Nothing
-              | quadrance (wp - p) > waypointReach2 -> Just wp
-              | otherwise -> Nothing
+      let supported = allyNear + 1 >= musterMin
+          rally = rallyPoint myTeam
+          dest
+            | fighting = Nothing
+            | supported = case target of
+                Just (_, tPos, d2) | d2 > range2 -> Just tPos
+                Just _ -> Nothing
+                Nothing
+                  | quadrance (wp - p) > waypointReach2 -> Just wp
+                  | otherwise -> Nothing
+            | quadrance (rally - p) > waypointReach2 = Just rally
+            | otherwise = Nothing
           approach = case dest of
             Just d -> normalize (d - p) ^* (speed * dt)
             Nothing -> V2 0 0
@@ -397,8 +451,8 @@ stepUnit cfg ety = do
       pure True
   where
     dt = fromIntegral (cTick cfg) / 1e6
-    gather p myTeam vis2 (mUnit, mBase, sep) (t :: Team, k :: Kind, Position q, e) =
-      pure (mUnit', mBase', sep')
+    gather p myTeam vis2 (mUnit, mBase, sep, allies) (t :: Team, k :: Kind, Position q, e) =
+      pure (mUnit', mBase', sep', allies')
       where
         dv = q - p
         d2 = quadrance dv
@@ -408,6 +462,10 @@ stepUnit cfg ety = do
               let d = sqrt d2
                in sep + (p - q) ^* ((collideDist - d) / d * sepStrength)
           | otherwise = sep
+        -- Friendly soldiers close enough to count as local support.
+        allies'
+          | t == myTeam && k == Soldier && e /= ety && d2 <= musterRadius2 = allies + 1
+          | otherwise = allies
         mUnit'
           | seen && k == Soldier = closer mUnit e q d2
           | otherwise = mUnit
@@ -460,18 +518,30 @@ bumpType Warrior (w, s, c) = (w + 1, s, c)
 bumpType Scout (w, s, c) = (w, s + 1, c)
 bumpType Siege (w, s, c) = (w, s, c + 1)
 
--- | The most numerous type in a census (ties favour Warrior, then Scout).
-majorityType :: Census -> UnitType
-majorityType (w, s, c)
-  | w >= s && w >= c = Warrior
-  | s >= c = Scout
-  | otherwise = Siege
-
--- | What to enlist next given the visible enemy census: counter their main
--- force, or -- seeing nothing through the fog -- send Scouts to look.
+-- | What to enlist next given the visible enemy census: the type that best
+-- answers their /whole/ composition, or -- seeing nothing through the fog --
+-- the far-seeing Scout to go look.
+--
+-- "Best answer" is the type maximising summed triad advantage over every enemy
+-- unit, not merely the counter to their most numerous type. That distinction is
+-- the whole game: a Siege ball screened by a few Warriors should /not/ be met
+-- with Scouts (the Warriors gut them) -- weighing the Warriors in drags Scout's
+-- score below Siege's, so the colony answers with Siege instead of trickling
+-- fragile Scouts to their death.
 chooseNext :: Census -> UnitType
 chooseNext (0, 0, 0) = Scout
-chooseNext census = counter (majorityType census)
+chooseNext census = bestResponse census
+
+-- | The single type with the greatest summed triad advantage against a census.
+-- Ties fall to the sturdier type (Siege > Scout > Warrior by 'Ord').
+bestResponse :: Census -> UnitType
+bestResponse (w, s, c) =
+  snd (maximum [(score t, t) | t <- [Warrior, Scout, Siege]])
+  where
+    fw = fromIntegral w
+    fs = fromIntegral s
+    fc = fromIntegral c
+    score t = fw * advantage t Warrior + fs * advantage t Scout + fc * advantage t Siege
 
 -- | Living soldiers a team currently fields.
 teamUnitCount :: Team -> SystemSTM Int
@@ -505,12 +575,11 @@ planFor team = do
   where
     seenBy srcs q = any (\(s, r) -> quadrance (q - s) <= r * r) srcs
 
--- | Muster where the enemy was last seen; with the field dark, press forward.
+-- | Muster on the enemy the colony can see; with the field dark, press forward
+-- and march on the enemy base so a won fight turns into a breakthrough instead
+-- of milling at the centre line.
 chooseWaypoint :: Team -> [V2 Float] -> V2 Float
-chooseWaypoint team [] = b + (e - b) ^* 0.4
-  where
-    b = basePos team
-    e = basePos (enemyOf team)
+chooseWaypoint team [] = basePos (enemyOf team)
 chooseWaypoint _ ps = foldr (+) (V2 0 0) ps ^/ fromIntegral (length ps)
 
 -- | A colony's strategist thread: re-plan from the fog until the round ends.
@@ -528,12 +597,19 @@ strategist cfg team base = loop
 
 -- Spawning ------------------------------------------------------------------
 
--- | A point uniformly inside a disk of the given radius.
-randomDisk :: Float -> SystemIO (V2 Float)
-randomDisk r = liftIO $ do
-  a <- randomRIO (0, 2 * pi)
-  rr <- randomRIO (0, r)
-  pure (V2 (rr * cos a) (rr * sin a))
+-- | Where a fresh soldier appears: on the base perimeter at 'spawnRadius', in
+-- the direction of the muster waypoint, nudged sideways by the given tangential
+-- offset so a salvo of spawns fans into a facing line instead of stacking on a
+-- single pixel.
+edgeSpawn :: Team -> V2 Float -> Float -> V2 Float
+edgeSpawn team wp tang = b + dir ^* spawnRadius + perp ^* tang
+  where
+    b = basePos team
+    toWp = wp - b
+    dir
+      | quadrance toWp > 1e-3 = normalize toWp
+      | otherwise = normalize (basePos (enemyOf team) - b)
+    perp = let V2 dx dy = dir in V2 (-dy) dx
 
 {- | A base's reinforcement thread. Each iteration enlists one soldier of
 whatever type its strategist currently wants, blocking on STM 'check'/'retry'
@@ -548,7 +624,7 @@ spawnerThread :: Config -> Entity -> Team -> SystemIO ()
 spawnerThread cfg base team = loop
   where
     loop = do
-      off <- randomDisk spawnRadius
+      tang <- liftIO (randomRIO (-spawnRadius, spawnRadius))
       mE <- atomically $ do
         baseAlive <- exists base (Proxy @Health)
         ph <- get global
@@ -557,8 +633,10 @@ spawnerThread cfg base team = loop
           else do
             n <- teamUnitCount team
             check (n < capPerTeam) -- block here until a slot frees
-            ut <- planNext . teamPlan team <$> get global
-            Just <$> newEntity (team, Soldier, ut, Position (basePos team + off), Health (typeHp ut))
+            plan <- teamPlan team <$> get global
+            let ut = planNext plan
+                pos = edgeSpawn team (planWaypoint plan) tang
+            Just <$> newEntity (team, Soldier, ut, Position pos, Health (typeHp ut))
       case mE of
         Nothing -> pure () -- base dead or round over: retire
         Just e -> do
@@ -581,11 +659,16 @@ startRound cfg = do
     set global Playing
   redBase <- atomically $ newEntity (Red, Base, Position (basePos Red), Health baseHp)
   blueBase <- atomically $ newEntity (Blue, Base, Position (basePos Blue), Health baseHp)
-  forM_ [Red, Blue] $ \team ->
-    forM_ [1 .. initialPlatoon] $ \(_ :: Int) -> do
-      off <- randomDisk spawnRadius
-      e <- atomically $ newEntity (team, Soldier, Warrior, Position (basePos team + off), Health (typeHp Warrior))
-      void $ forkSys (unitAI cfg e)
+  -- Stand both platoons up as facing battle lines. Create every soldier first
+  -- and only then fork their AI, so neither colony gets a head-start of live
+  -- ticks while the other is still being spawned (that asymmetry quietly biased
+  -- the whole match toward Red, who used to spawn entirely first).
+  units <- forM [0 .. initialPlatoon - 1] $ \i ->
+    forM [Red, Blue] $ \team -> do
+      let wp = planWaypoint (initialPlan team)
+          off = (fromIntegral i - fromIntegral (initialPlatoon - 1) / 2) * lineSpacing
+      atomically $ newEntity (team, Soldier, Warrior, Position (edgeSpawn team wp off), Health (typeHp Warrior))
+  forM_ (concat units) (void . forkSys . unitAI cfg)
   void $ forkSys (spawnerThread cfg redBase Red)
   void $ forkSys (spawnerThread cfg blueBase Blue)
   void $ forkSys (strategist cfg Red redBase)
@@ -614,18 +697,23 @@ coordinator cfg = loop (1 :: Int)
     -- A gated 2 Hz pulse of each colony's live composition and current plan,
     -- so you can watch the triad counter-play shift through the fog.
     heartbeat = do
-      (ph, rc, bc, Plans rp bp, DamageLog dm) <- atomically $ do
+      (ph, rc, bc, Plans rp bp, DamageLog dm, rHp, bHp) <- atomically $ do
         ph <- get global
         rc <- teamCensus Red
         bc <- teamCensus Blue
         pl <- get global
         dl <- get global
-        pure (ph, rc, bc, pl, dl)
+        rh <- baseHpOf Red
+        bh <- baseHpOf Blue
+        pure (ph, rc, bc, pl, dl, rh, bh)
       let teamDmg t = round (sum [v | ((t', _, _), v) <- DM.toList dm, t' == t]) :: Int
       traceM $
-        "[hb] R " ++ showCensus rc ++ " next=" ++ show (planNext rp) ++ " dmg=" ++ show (teamDmg Red)
-          ++ " | B " ++ showCensus bc ++ " next=" ++ show (planNext bp) ++ " dmg=" ++ show (teamDmg Blue)
+        "[hb] R " ++ showCensus rc ++ " base=" ++ show (round rHp :: Int) ++ " next=" ++ show (planNext rp) ++ " dmg=" ++ show (teamDmg Red)
+          ++ " | B " ++ showCensus bc ++ " base=" ++ show (round bHp :: Int) ++ " next=" ++ show (planNext bp) ++ " dmg=" ++ show (teamDmg Blue)
       when (isPlaying ph) (threadDelay 500000 >> heartbeat)
+
+    baseHpOf team =
+      cfold (\acc (t :: Team, k :: Kind, Health h) -> if t == team && k == Base then h else acc) baseHp
 
     teamCensus team =
       cfold (\acc (t :: Team, ut :: UnitType) -> if t == team then bumpType ut acc else acc) (0, 0, 0)
@@ -673,12 +761,14 @@ coordinator cfg = loop (1 :: Int)
 label :: Color -> Float -> Float -> String -> Picture
 label col x y = color col . translate x y . scale 0.12 0.12 . Text
 
--- | A soldier glyph, distinct per type: small Scout dot, Warrior disc, blocky
--- Siege square.
+-- | A soldier glyph, distinct per type: small Scout dot, Warrior disc, and a
+-- bigger ringed disc for the heavy Siege (a filled circle with a darker rim).
 unitGlyph :: Team -> UnitType -> Picture
 unitGlyph t Warrior = color (teamColor t) (circleSolid 5)
 unitGlyph t Scout = color (teamColor t) (circleSolid 3)
-unitGlyph t Siege = color (teamColor t) (rectangleSolid 11 11)
+unitGlyph t Siege =
+  color (teamColor t) (circleSolid 7)
+    <> color (dark (dark (teamColor t))) (thickCircle 7 2)
 
 -- | A base: white ring with an inner disc that shrinks as its health drops.
 baseGlyph :: Team -> Float -> Picture
@@ -692,7 +782,7 @@ draw = do
   -- never a half-destroyed unit, even with hundreds of threads mutating the
   -- stores. Bases, soldiers, populations and the optional vision overlay all
   -- come from this one snapshot.
-  (visionPic, basePic, soldierPic, redPop, bluePop, KillScore kr kb, Wins wr wb, phase, Plans rPlan bPlan, dl) <-
+  (visionPic, attackPic, basePic, soldierPic, redPop, bluePop, KillScore kr kb, Wins wr wb, phase, Plans rPlan bPlan, dl) <-
     atomically $ do
       basePic <-
         cfoldM
@@ -714,21 +804,23 @@ draw = do
           (mempty, 0 :: Int, 0 :: Int)
       ShowVision showV <- get global
       ShowRange showR <- get global
+      ShowAttacks showA <- get global
       visionPic <-
         mappend
           <$> (if showV then visionOverlay else pure mempty)
           <*> (if showR then rangeOverlay else pure mempty)
+      attackPic <- if showA then attackLines else pure mempty
       ks <- get global :: SystemSTM KillScore
       wns <- get global :: SystemSTM Wins
       ph <- get global :: SystemSTM Phase
       pl <- get global :: SystemSTM Plans
       dmg <- get global :: SystemSTM DamageLog
-      pure (visionPic, basePic, soldierPic, rp, bp, ks, wns, ph, pl, dmg)
+      pure (visionPic, attackPic, basePic, soldierPic, rp, bp, ks, wns, ph, pl, dmg)
   -- Two left-aligned rows: a single long row clips off the right window edge.
   let hud =
         label (teamColor Red) (-310) 210 ("RED   pop " ++ show redPop ++ "   next " ++ show (planNext rPlan) ++ "   kills " ++ show kr ++ "   wins " ++ show wr)
           <> label (teamColor Blue) (-310) 190 ("BLUE  pop " ++ show bluePop ++ "   next " ++ show (planNext bPlan) ++ "   kills " ++ show kb ++ "   wins " ++ show wb)
-          <> label (greyN 0.5) (-310) (-230) "v: vision   r: attack range   esc: quit"
+          <> label (greyN 0.5) (-310) (-230) "v: vision   r: range   a: attacks   esc: quit"
       overlay = case phase of
         Playing -> mempty
         RoundOver w ->
@@ -738,7 +830,9 @@ draw = do
             <> label white (-150) 158 ("kills R " ++ show kr ++ " / B " ++ show kb ++ "     match R " ++ show wr ++ " / B " ++ show wb)
             <> damageBlock (teamColor Red) (-312) 116 "RED damage  (attacker vs defender)" (teamMatrix Red dl)
             <> damageBlock (teamColor Blue) (-312) (-24) "BLUE damage  (attacker vs defender)" (teamMatrix Blue dl)
-  pure (visionPic <> basePic <> soldierPic <> hud <> overlay)
+  -- Tracers go on /top/ of the glyphs: a hit only fires within attack range, so
+  -- the line is short and would otherwise hide under the units it connects.
+  pure (visionPic <> basePic <> soldierPic <> attackPic <> hud <> overlay)
 
 -- | A round-end ledger block: a title and one line per attacker type listing
 -- the damage it dealt to (vs Warrior / vs Scout / vs Siege).
@@ -786,10 +880,24 @@ rangeOverlay =
     )
     mempty
 
+-- | A faint team-coloured tracer from every soldier that struck this tick to
+-- the point it struck, so the who-fights-whom of the melee is legible at a
+-- glance. Each line lasts exactly one tick: 'stepUnit' clears it next turn.
+attackLines :: SystemSTM Picture
+attackLines =
+  cfoldM
+    ( \acc (t :: Team, Position (V2 x y), Attacking (V2 tx ty)) ->
+        let col = withAlpha 0.85 (light (light (teamColor t)))
+            -- A dot at the struck point makes a sub-20px tracer legible.
+         in pure $ acc <> color col (line [(x, y), (tx, ty)] <> translate tx ty (circleSolid 1.5))
+    )
+    mempty
+
 handleEvent :: Event -> SystemIO ()
 handleEvent (EventKey (SpecialKey KeyEsc) Down _ _) = liftIO exitSuccess
 handleEvent (EventKey (Char 'v') Down _ _) = modify global (\(ShowVision b) -> ShowVision (not b))
 handleEvent (EventKey (Char 'r') Down _ _) = modify global (\(ShowRange b) -> ShowRange (not b))
+handleEvent (EventKey (Char 'a') Down _ _) = modify global (\(ShowAttacks b) -> ShowAttacks (not b))
 handleEvent _ = pure ()
 
 -- | Deliberately empty: all game logic runs on the forked threads.
@@ -798,6 +906,10 @@ step _ = pure ()
 
 main :: IO ()
 main = do
+  -- Line-buffer both streams so round reports and heartbeats appear promptly
+  -- even when redirected to a file (block buffering would hide them until exit).
+  hSetBuffering stdout LineBuffering
+  hSetBuffering stderr LineBuffering
   args <- getArgs
   let cfg
         | any (`elem` ["--headless", "headless"]) args = headlessCfg
@@ -807,6 +919,7 @@ main = do
     set global (Camera 0 1)
     set global (ShowVision False)
     set global (ShowRange False)
+    set global (ShowAttacks True)
     void $ forkSys (coordinator cfg)
     if cHeadless cfg
       then do
