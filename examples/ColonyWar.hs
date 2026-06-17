@@ -36,12 +36,15 @@ This is exactly the workload that breaks a non-STM ECS:
 
 Gameplay:
 
-  * Three unit types form a rock-paper-scissors triad -- Warrior > Scout,
-    Scout > Siege, Siege > Warrior (countering type deals double, countered
-    deals half; Siege also wrecks bases).
+  * Three unit types form an /emergent/ rock-paper-scissors -- Hunter > Lance,
+    Lance > Guard, Guard > Hunter -- with no damage lookup table. The cycle
+    falls out of range, speed, and a single kiting behaviour: the fast long-
+    ranged Hunter kites the slow short-ranged Lance; the Guard range-matches the
+    Hunter (so kiting buys nothing) and out-brawls it; the tanky Lance out-brawls
+    the Guard (which is too slow to kite it) and wrecks bases.
 
   * Fog of war: a base sees ~a quarter of the field around itself; units (the
-    far-sighted Scouts especially) extend that with recon. Each colony's
+    far-sighted Hunters especially) extend that with recon. Each colony's
     strategist only counts the enemies it can actually see, and queues the type
     that counters whatever it spots.
 
@@ -68,7 +71,7 @@ import System.Environment (getArgs)
 
 import Apecs.Gloss
 import Apecs.STM.Prelude
-import Linear (V2 (..), dot, normalize, quadrance, (^*), (^/))
+import Linear (V2 (..), normalize, quadrance, (^*), (^/))
 import System.Exit (exitSuccess)
 import System.IO (BufferMode (LineBuffering), hSetBuffering, stderr, stdout)
 import System.Random (randomRIO)
@@ -89,8 +92,19 @@ instance Component Team where type Storage Team = Map Team
 data Kind = Soldier | Base deriving (Eq, Show)
 instance Component Kind where type Storage Kind = Map Kind
 
--- | The rock-paper-scissors triad. Only soldiers carry one.
-data UnitType = Warrior | Scout | Siege deriving (Eq, Ord, Show, Enum, Bounded)
+-- | The three archetypes. Their rock-paper-scissors is /emergent/: it falls out
+-- of range, speed, and the one kiting behaviour, not a damage lookup table.
+--
+--   * 'Hunter' — fast, long-ranged, fragile recon. Kites the slow short-ranged
+--     Lance to death (and can't be caught), but loses a stand-up brawl.
+--   * 'Guard'  — long-ranged (matches the Hunter, so kiting buys nothing) but
+--     slow; out-brawls the Hunter, yet too slow to kite the Lance.
+--   * 'Lance'  — short-ranged, tanky, hard-hitting base-breaker. Out-brawls the
+--     Guard; helpless against a Hunter that simply backs away and fires.
+--
+-- So Hunter > Lance > Guard > Hunter, with no dominant type (proven in the lab,
+-- exp 004). Only soldiers carry one.
+data UnitType = Hunter | Guard | Lance deriving (Eq, Ord, Show, Enum, Bounded)
 instance Component UnitType where type Storage UnitType = Map UnitType
 
 -- | A transient marker on a soldier that struck this tick, carrying the point
@@ -146,7 +160,7 @@ data TeamPlan = TeamPlan
 data Plans = Plans TeamPlan TeamPlan deriving (Show)
 instance Semigroup Plans where _ <> b = b
 instance Monoid Plans where
-  mempty = Plans (TeamPlan Scout (V2 0 0)) (TeamPlan Scout (V2 0 0))
+  mempty = Plans (TeamPlan Hunter (V2 0 0)) (TeamPlan Hunter (V2 0 0))
 instance Component Plans where type Storage Plans = Global Plans
 
 -- | Whether to draw the vision overlay. A 'Global' toggled from input.
@@ -219,13 +233,10 @@ data Config = Config
   , cKite :: Bool
   -- ^ Whether a soldier that out-ranges /and/ out-runs its target kites it
   -- (fires while backing off to hold the range gap). Ablation flag for exp 003.
-  , cScreen :: Bool
-  -- ^ Whether a screening unit (the Guard archetype) fans laterally into a wall
-  -- that spans the field, denying a kiter the room to orbit. Flag for exp 004.
   , cTriad :: Bool
-  -- ^ Whether the rock-paper-scissors damage multiplier applies. On in the live
-  -- game; off in behaviour experiments to isolate a *geometric* counter (exp 004)
-  -- from the stat-table counter, so combat is symmetric and only behaviour wins.
+  -- ^ Legacy: whether the old rock-paper-scissors /damage multiplier/ applies.
+  -- Off in the live game (the cycle is emergent now); kept so the harness can
+  -- still reproduce the pre-redesign stat-triad experiments with @--triad@.
   , cArena :: Float
   -- ^ Matchup harness only: if > 0, clamp positions to a +/- this square so
   -- kiters can be cornered (0 = unbounded). The full game uses its own field.
@@ -243,9 +254,8 @@ displayCfg =
     , cMaxSeconds = 0
     , cDebug = False
     , cMuster = True
-    , cKite = False
-    , cScreen = False
-    , cTriad = True
+    , cKite = True
+    , cTriad = False
     , cArena = 0
     }
 
@@ -261,9 +271,8 @@ headlessCfg =
     , cMaxSeconds = 180
     , cDebug = True
     , cMuster = True
-    , cKite = False
-    , cScreen = False
-    , cTriad = True
+    , cKite = True
+    , cTriad = False
     , cArena = 0
     }
 
@@ -320,55 +329,45 @@ collideDist2, waypointReach2 :: Float
 collideDist2 = collideDist * collideDist
 waypointReach2 = waypointReach * waypointReach
 
--- | Screening (exp 004): a Guard repels nearby allied Guards along the axis
--- /perpendicular/ to its line to the enemy, fanning a clump into a tall wall
--- that spans the field so a kiter can't slide along the boundary to escape.
--- Wider radius and stronger push than the cosmetic 'collideDist' separation,
--- and lateral-only, so the front spreads instead of balling up.
-screenRadius, screenStrength :: Float
-screenRadius = 46
-screenStrength = 1.1
-
-screenRadius2 :: Float
-screenRadius2 = screenRadius * screenRadius
-
--- | The archetype that screens. Warrior stands in for the Guard while the
--- behaviour cycle is being proven in the harness; gating on type means a mixed
--- army screens only with its Guards.
-isScreener :: UnitType -> Bool
-isScreener Warrior = True
-isScreener _ = False
-
 sq :: Float -> Float
 sq x = x * x
 
--- Per-type stats. The triad: fragile far-seeing Scouts, balanced Warriors,
--- slow hard-hitting short-sighted Siege.
+-- Per-type stats. The cycle is emergent (exp 004): a Hunter out-ranges AND
+-- out-runs a Lance, so it kites; a Guard range-matches the Hunter (kiting buys
+-- nothing) but is too slow to kite a Lance; a Lance out-brawls the Guard.
+--   Hunter: long range, fast, fragile, far-seeing recon.
+--   Guard:  long range (= Hunter), slow, mid HP/dmg, the anchor.
+--   Lance:  short range, tanky, hard-hitting; razes bases (double vs a base).
 typeHp, typeSpeed, typeDamage, typeVision, typeRange :: UnitType -> Float
-typeHp Warrior = 100
-typeHp Scout = 55
-typeHp Siege = 170
-typeSpeed Warrior = 70
-typeSpeed Scout = 120
-typeSpeed Siege = 44
-typeDamage Warrior = 12
-typeDamage Scout = 7
-typeDamage Siege = 24
-typeVision Warrior = 95
-typeVision Scout = 170
-typeVision Siege = 75
-typeRange Warrior = 14
-typeRange Scout = 12
-typeRange Siege = 20
+typeHp Hunter = 55
+typeHp Guard = 110
+typeHp Lance = 170
+typeSpeed Hunter = 130
+typeSpeed Guard = 50
+typeSpeed Lance = 70
+typeDamage Hunter = 8
+typeDamage Guard = 9
+typeDamage Lance = 22
+typeVision Hunter = 170
+typeVision Guard = 95
+typeVision Lance = 75
+typeRange Hunter = 18
+typeRange Guard = 18
+typeRange Lance = 12
 
--- | Does an attacker of the first type hard-counter a defender of the second?
+-- | Does the first type beat the second in the emergent cycle? This is /not/ a
+-- damage multiplier (combat applies none) -- it is the empirical outcome of the
+-- range/speed/kiting interplay (exp 004), used by each colony's strategist to
+-- pick a counter. Hunter > Lance > Guard > Hunter.
 beats :: UnitType -> UnitType -> Bool
-beats Warrior Scout = True
-beats Scout Siege = True
-beats Siege Warrior = True
+beats Guard Hunter = True
+beats Hunter Lance = True
+beats Lance Guard = True
 beats _ _ = False
 
--- | Damage multiplier from the triad: double if you counter, half if countered.
+-- | A strategy-only score for fielding @atk@ against a @def@ the colony can see:
+-- favourable if @atk@ beats it, unfavourable if it is beaten. Drives the
+-- counter-picker; it no longer scales any damage.
 advantage :: UnitType -> UnitType -> Float
 advantage atk def
   | beats atk def = 2.0
@@ -405,10 +404,10 @@ logDamage :: Team -> UnitType -> UnitType -> Float -> DamageLog -> DamageLog
 logDamage team atk def d (DamageLog m) = DamageLog (DM.insertWith (+) (team, atk, def) d m)
 
 -- | A team's ledger as one row per attacker type, each carrying the damage it
--- dealt to (Warrior, Scout, Siege) defenders.
+-- dealt to (Hunter, Guard, Lance) defenders.
 teamMatrix :: Team -> DamageLog -> [(UnitType, (Int, Int, Int))]
 teamMatrix team (DamageLog m) =
-  [ (atk, (val atk Warrior, val atk Scout, val atk Siege)) | atk <- [Warrior, Scout, Siege]
+  [ (atk, (val atk Hunter, val atk Guard, val atk Lance)) | atk <- [Hunter, Guard, Lance]
   ]
   where
     val atk def = round (DM.findWithDefault 0 (team, atk, def) m)
@@ -423,7 +422,7 @@ setTeamPlan Blue p (Plans r _) = Plans r p
 
 -- | A forward muster point at round start: a third of the way to the foe.
 initialPlan :: Team -> TeamPlan
-initialPlan team = TeamPlan Scout (b + (e - b) ^* 0.35)
+initialPlan team = TeamPlan Hunter (b + (e - b) ^* 0.35)
   where
     b = basePos team
     e = basePos (enemyOf team)
@@ -518,16 +517,7 @@ stepUnit cfg ety = do
           approach = case dest of
             Just d -> normalize (d - p) ^* (speed * dt)
             Nothing -> V2 0 0
-      -- Screening: fan laterally into a spanning wall (only the Guard archetype,
-      -- only with an enemy in sight to orient the perpendicular). Gated off in
-      -- the live game, so it pays nothing there.
-      screenForce <-
-        if cScreen cfg && isScreener myType
-          then case mUnit of
-            Just (_, tPos, _) -> screenSpread ety p myTeam (tPos - p)
-            Nothing -> pure (V2 0 0)
-          else pure (V2 0 0)
-      set ety (Position (p + approach + sep + screenForce))
+      set ety (Position (p + approach + sep))
       pure True
   where
     dt = fromIntegral (cTick cfg) / 1e6
@@ -556,34 +546,10 @@ stepUnit cfg ety = do
       Just (_, _, best) | best <= d2 -> acc
       _ -> Just (e, q, d2)
 
-{- | The lateral spread that makes a screen. Repel every nearby allied screener
-along the axis perpendicular to my line to the enemy, scaled by how close it is,
-so a clustered column fans out into a tall wall facing the foe (front-to-back
-crowding is left to the normal 'sep'). A kiter sliding along the arena boundary
-then meets a Guard at every height and is forced to brawl instead of orbiting.
--}
-screenSpread :: Entity -> V2 Float -> Team -> V2 Float -> SystemSTM (V2 Float)
-screenSpread ety p myTeam enemyDir = cfoldM accum (V2 0 0)
-  where
-    perp =
-      let len = sqrt (quadrance enemyDir)
-          V2 ex ey = enemyDir
-       in if len > 1e-6 then V2 (-ey / len) (ex / len) else V2 0 1
-    accum !acc (t :: Team, k :: Kind, ut :: UnitType, Position q, e :: Entity) =
-      pure $
-        let off = p - q
-            d2 = quadrance off
-         in if t == myTeam && k == Soldier && isScreener ut && e /= ety && d2 > 1e-6 && d2 < screenRadius2
-              then
-                let lat = off `dot` perp -- signed lateral gap to this neighbour
-                    d = sqrt d2
-                    mag = (screenRadius - d) / screenRadius * screenStrength
-                 in acc + perp ^* (signum lat * mag)
-              else acc
-
-{- | Deal damage to a victim within the caller's transaction. Triad advantage
-scales soldier-vs-soldier damage; Siege does double against a base. Soldier
-kills score; razing a base does not (the coordinator notices that separately).
+{- | Deal damage to a victim within the caller's transaction. Soldier-vs-soldier
+damage is flat (the counter cycle is emergent, not a multiplier) unless 'cTriad'
+is on for a legacy experiment; a Lance does double against a base. Soldier kills
+score; razing a base does not (the coordinator notices that separately).
 -}
 attack :: Config -> Team -> UnitType -> Entity -> SystemSTM ()
 attack cfg killer atkType victim = do
@@ -592,7 +558,7 @@ attack cfg killer atkType victim = do
     Health h <- get victim
     k <- get victim
     (dmg, mDef) <- case k of
-      Base -> pure (typeDamage atkType * (if atkType == Siege then 2 else 1), Nothing)
+      Base -> pure (typeDamage atkType * (if atkType == Lance then 2 else 1), Nothing)
       Soldier -> do
         defType <- get victim
         let mult = if cTriad cfg then advantage atkType defType else 1.0
@@ -616,38 +582,38 @@ unitAI cfg ety = do
 
 -- Recon & strategy ----------------------------------------------------------
 
--- | Live soldiers of a team, tallied by type as (Warrior, Scout, Siege).
+-- | Live soldiers of a team, tallied by type as (Hunter, Guard, Lance).
 type Census = (Int, Int, Int)
 
 bumpType :: UnitType -> Census -> Census
-bumpType Warrior (w, s, c) = (w + 1, s, c)
-bumpType Scout (w, s, c) = (w, s + 1, c)
-bumpType Siege (w, s, c) = (w, s, c + 1)
+bumpType Hunter (h, g, l) = (h + 1, g, l)
+bumpType Guard (h, g, l) = (h, g + 1, l)
+bumpType Lance (h, g, l) = (h, g, l + 1)
 
 -- | What to enlist next given the visible enemy census: the type that best
 -- answers their /whole/ composition, or -- seeing nothing through the fog --
--- the far-seeing Scout to go look.
+-- the far-seeing Hunter to go look.
 --
--- "Best answer" is the type maximising summed triad advantage over every enemy
+-- "Best answer" is the type maximising summed cycle advantage over every enemy
 -- unit, not merely the counter to their most numerous type. That distinction is
--- the whole game: a Siege ball screened by a few Warriors should /not/ be met
--- with Scouts (the Warriors gut them) -- weighing the Warriors in drags Scout's
--- score below Siege's, so the colony answers with Siege instead of trickling
--- fragile Scouts to their death.
+-- the whole game: a Lance ball with a few Guards mixed in should /not/ be met
+-- with Hunters (the Guards out-brawl them) -- weighing the Guards in drags
+-- Hunter's score down, so the colony answers with Lance instead of trickling
+-- fragile Hunters to their death.
 chooseNext :: Census -> UnitType
-chooseNext (0, 0, 0) = Scout
+chooseNext (0, 0, 0) = Hunter
 chooseNext census = bestResponse census
 
--- | The single type with the greatest summed triad advantage against a census.
--- Ties fall to the sturdier type (Siege > Scout > Warrior by 'Ord').
+-- | The single type with the greatest summed cycle advantage against a census.
+-- Ties fall to the sturdier type (Lance > Guard > Hunter by 'Ord').
 bestResponse :: Census -> UnitType
-bestResponse (w, s, c) =
-  snd (maximum [(score t, t) | t <- [Warrior, Scout, Siege]])
+bestResponse (h, g, l) =
+  snd (maximum [(score t, t) | t <- [Hunter, Guard, Lance]])
   where
-    fw = fromIntegral w
-    fs = fromIntegral s
-    fc = fromIntegral c
-    score t = fw * advantage t Warrior + fs * advantage t Scout + fc * advantage t Siege
+    fh = fromIntegral h
+    fg = fromIntegral g
+    fl = fromIntegral l
+    score t = fh * advantage t Hunter + fg * advantage t Guard + fl * advantage t Lance
 
 -- | Living soldiers a team currently fields.
 teamUnitCount :: Team -> SystemSTM Int
@@ -753,7 +719,7 @@ spawnerThread cfg base team = loop
 -- Round lifecycle -----------------------------------------------------------
 
 -- | Wipe the battlefield and stand up a fresh round: two bases, a starting
--- Warrior platoon each, and a spawner + strategist thread per colony. Returns
+-- Guard platoon each, and a spawner + strategist thread per colony. Returns
 -- the base ids so the coordinator can watch them.
 startRound :: Config -> SystemIO (Entity, Entity)
 startRound cfg = do
@@ -773,7 +739,7 @@ startRound cfg = do
     forM [Red, Blue] $ \team -> do
       let wp = planWaypoint (initialPlan team)
           off = (fromIntegral i - fromIntegral (initialPlatoon - 1) / 2) * lineSpacing
-      atomically $ newEntity (team, Soldier, Warrior, Position (edgeSpawn team wp off), Health (typeHp Warrior))
+      atomically $ newEntity (team, Soldier, Guard, Position (edgeSpawn team wp off), Health (typeHp Guard))
   forM_ (concat units) (void . forkSys . unitAI cfg)
   void $ forkSys (spawnerThread cfg redBase Red)
   void $ forkSys (spawnerThread cfg blueBase Blue)
@@ -824,7 +790,7 @@ coordinator cfg = loop (1 :: Int)
     teamCensus team =
       cfold (\acc (t :: Team, ut :: UnitType) -> if t == team then bumpType ut acc else acc) (0, 0, 0)
 
-    showCensus (w, s, c) = "W" ++ show w ++ "/S" ++ show s ++ "/C" ++ show c
+    showCensus (h, g, l) = "H" ++ show h ++ "/G" ++ show g ++ "/L" ++ show l
 
     waitWinner redBase blueBase = do
       m <- atomically $ do
@@ -858,21 +824,21 @@ coordinator cfg = loop (1 :: Int)
       liftIO $ putStrLn ("  BLUE " ++ matrixLine (teamMatrix Blue dl))
 
     -- One-line ledger: each attacker type with the damage it dealt to
-    -- (vs Warrior / vs Scout / vs Siege).
+    -- (vs Hunter / vs Guard / vs Lance).
     matrixLine rows =
-      "damage " ++ intercalate "  " [show atk ++ " " ++ show (w, s, c) | (atk, (w, s, c)) <- rows]
+      "damage " ++ intercalate "  " [show atk ++ " " ++ show (h, g, l) | (atk, (h, g, l)) <- rows]
 
 -- Rendering & input (main thread) -------------------------------------------
 
 label :: Color -> Float -> Float -> String -> Picture
 label col x y = color col . translate x y . scale 0.12 0.12 . Text
 
--- | A soldier glyph, distinct per type: small Scout dot, Warrior disc, and a
--- bigger ringed disc for the heavy Siege (a filled circle with a darker rim).
+-- | A soldier glyph, distinct per type: small Hunter dot, Guard disc, and a
+-- bigger ringed disc for the heavy Lance (a filled circle with a darker rim).
 unitGlyph :: Team -> UnitType -> Picture
-unitGlyph t Warrior = color (teamColor t) (circleSolid 5)
-unitGlyph t Scout = color (teamColor t) (circleSolid 3)
-unitGlyph t Siege =
+unitGlyph t Hunter = color (teamColor t) (circleSolid 3)
+unitGlyph t Guard = color (teamColor t) (circleSolid 5)
+unitGlyph t Lance =
   color (teamColor t) (circleSolid 7)
     <> color (dark (dark (teamColor t))) (thickCircle 7 2)
 
@@ -941,24 +907,24 @@ draw = do
   pure (visionPic <> basePic <> soldierPic <> attackPic <> hud <> overlay)
 
 -- | A round-end ledger block: a title and one line per attacker type listing
--- the damage it dealt to (vs Warrior / vs Scout / vs Siege).
+-- the damage it dealt to (vs Hunter / vs Guard / vs Lance).
 damageBlock :: Color -> Float -> Float -> String -> [(UnitType, (Int, Int, Int))] -> Picture
 damageBlock col x y title rows =
   smallLabel col x y title
     <> mconcat
-      [ smallLabel col x (y - 18 * fromIntegral (i + 1)) (rowText atk w s c)
-      | (i, (atk, (w, s, c))) <- zip [0 :: Int ..] rows
+      [ smallLabel col x (y - 18 * fromIntegral (i + 1)) (rowText atk h g l)
+      | (i, (atk, (h, g, l))) <- zip [0 :: Int ..] rows
       ]
   where
-    rowText atk w s c =
-      pad 9 (show atk) ++ "vsW " ++ pad 6 (show w) ++ "vsS " ++ pad 6 (show s) ++ "vsC " ++ show c
+    rowText atk h g l =
+      pad 9 (show atk) ++ "vsH " ++ pad 6 (show h) ++ "vsG " ++ pad 6 (show g) ++ "vsL " ++ show l
     pad n s = take n (s ++ repeat ' ')
 
 smallLabel :: Color -> Float -> Float -> String -> Picture
 smallLabel col x y = color col . translate x y . scale 0.1 0.1 . Text
 
 -- | Faint discs for every sight source: a big one per base, a small one per
--- soldier (Scouts reach furthest). Overlapping discs build up where a colony's
+-- soldier (Hunters reach furthest). Overlapping discs build up where a colony's
 -- recon is densest, sketching what it can actually see through the fog.
 visionOverlay :: SystemSTM Picture
 visionOverlay = do
@@ -976,8 +942,8 @@ visionOverlay = do
           ]
   pure (baseDiscs <> unitDiscs)
 
--- | An unfilled ring at each soldier's attack reach, so Siege's longer bite is
--- visible at a glance.
+-- | An unfilled ring at each soldier's attack reach, so the Hunter and Guard's
+-- longer reach (and the Lance's short bite) is visible at a glance.
 rangeOverlay :: SystemSTM Picture
 rangeOverlay =
   cfoldM
@@ -1019,13 +985,13 @@ eliminated, so thousands of battles run in seconds and a result is decisive.
 This is the instrument behind the "real counters" / "no fixpoint" hypotheses:
 sweep the type x type grid at equal numbers and read off who actually wins.
 
-  > stm-colony-war --matchup warrior:10 scout:10 [reps] [--muster]
+  > stm-colony-war --matchup hunter:10 guard:10 [reps] [--muster]
 -}
-matchupCfg :: Bool -> Bool -> Bool -> Bool -> Float -> Config
-matchupCfg muster kite screen triad arena =
-  headlessCfg {cTick = 16000, cDebug = False, cMuster = muster, cKite = kite, cScreen = screen, cTriad = triad, cArena = arena}
+matchupCfg :: Bool -> Bool -> Bool -> Float -> Config
+matchupCfg muster kite triad arena =
+  headlessCfg {cTick = 16000, cDebug = False, cMuster = muster, cKite = kite, cTriad = triad, cArena = arena}
 
--- | Parse @"warrior:10,siege:5"@ into a unit roster.
+-- | Parse @"hunter:10,lance:5"@ into a unit roster.
 parseComp :: String -> [(UnitType, Int)]
 parseComp s = [parse1 part | part <- splitOn ',' s]
   where
@@ -1033,12 +999,12 @@ parseComp s = [parse1 part | part <- splitOn ',' s]
       [t, n] -> (parseType t, read n)
       _ -> error ("matchup: bad component " ++ show p)
     parseType t = case map toLower t of
-      "warrior" -> Warrior
-      "w" -> Warrior
-      "scout" -> Scout
-      "s" -> Scout
-      "siege" -> Siege
-      "c" -> Siege
+      "hunter" -> Hunter
+      "h" -> Hunter
+      "guard" -> Guard
+      "g" -> Guard
+      "lance" -> Lance
+      "l" -> Lance
       other -> error ("matchup: bad unit type " ++ show other)
 
 splitOn :: Char -> String -> [String]
@@ -1105,16 +1071,17 @@ runBattle cfg = loop (0 :: Int)
 -- | Run @reps@ battles of one matchup and print a single structured RESULT line.
 runMatchups :: [String] -> IO ()
 runMatchups args = do
+  -- Defaults mirror the live combat model (kiting on, no triad multiplier);
+  -- ablate with --nokite / --triad. Muster stays off to isolate raw combat.
   let muster = "--muster" `elem` args
-      kite = "--kite" `elem` args
-      screen = "--screen" `elem` args
-      triad = not ("--notriad" `elem` args)
+      kite = not ("--nokite" `elem` args)
+      triad = "--triad" `elem` args
       arena = if "--arena" `elem` args then 160 else 0
       positional = filter (not . isPrefixOf "--") args
   case positional of
     (redS : blueS : rest) -> do
       let reps = case rest of (r : _) -> read r; _ -> 200 :: Int
-          cfg = matchupCfg muster kite screen triad arena
+          cfg = matchupCfg muster kite triad arena
           redC = parseComp redS
           blueC = parseComp blueS
       w <- initWorld
@@ -1138,7 +1105,6 @@ runMatchups args = do
           , "reps=" ++ show reps
           , "muster=" ++ show muster
           , "kite=" ++ show kite
-          , "screen=" ++ show screen
           , "triad=" ++ show triad
           , "red_wins=" ++ show rw
           , "blue_wins=" ++ show bw

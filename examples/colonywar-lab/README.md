@@ -33,6 +33,7 @@ A>B by ≥k; the data says Z."*
 | [002](002-cycle-feasibility/) | Can a real cycle come from stat retune, or are new behaviours needed? | 🔬 Stats can't — combat is **winner-take-all** (1.00/0.00, no gradient). Drama needs behaviours (kite/screen) + fog. |
 | [003](003-kiting-viability/) | Is kiting a viable way to create a counter? | ✅ Yes — flips a 0.00 stand-up loss to 1.00 from the flag alone. Duels stay winner-take-all (fine: decisive RPS; drama is fog+macro). |
 | [004](004-screening-viability/) | Can a screen behaviour close the cycle (Guard > Hunter)? | ❌ Screen does nothing (0/400). But the real kite-counter is **range-match** (a stat), and a true **3-cycle with no fixpoint** exists from kiting alone + range/speed/HP, **triad table OFF** (all edges 400/0, mirrors ~0.5). RPS emerges from physics. → redesign decision. |
+| [005](005-adopt-emergent-cycle/) | Adopt the emergent cycle in the live game. | ⚠️ Partial. Cycle adopted (Guard/Hunter/Lance, no triad table); no-fixpoint matrix holds under live settings. But the full base-razing game **stalemates** (static range-18 firing lines + composition counter-chase → no breakthrough). Needs a round-resolution design decision. |
 
 ## Baseline scorecard (committed `0a8b067`, 104 full-game rounds)
 
