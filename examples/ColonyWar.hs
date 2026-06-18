@@ -9,6 +9,7 @@
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeApplications #-}
 {-# LANGUAGE TypeFamilies #-}
+{-# OPTIONS_GHC -Wno-unused-top-binds #-}
 
 {- | STM Colony War: a massively-concurrent apecs-stm + gloss showcase.
 
@@ -71,8 +72,10 @@ import qualified Data.Map.Strict as DM
 import Debug.Trace (traceM)
 import System.Environment (getArgs)
 
+import Apecs
 import Apecs.Gloss
-import Apecs.STM.Prelude
+import Apecs.Stores.STM (STM, TMap, TGlobal)
+import qualified Apecs.Stores.STM as STM
 import Linear (V2 (..), dot, normalize, quadrance, (^*), (^/))
 import System.Exit (exitSuccess)
 import System.IO (BufferMode (LineBuffering), hSetBuffering, stderr, stdout)
@@ -81,18 +84,18 @@ import System.Random (randomRIO)
 -- Components ----------------------------------------------------------------
 
 newtype Position = Position (V2 Float) deriving (Show)
-instance Component Position where type Storage Position = Map Position
+instance Component Position where type Storage Position = TMap Position
 
 newtype Health = Health Float deriving (Show)
-instance Component Health where type Storage Health = Map Health
+instance Component Health where type Storage Health = TMap Health
 
 data Team = Red | Blue deriving (Eq, Ord, Show)
-instance Component Team where type Storage Team = Map Team
+instance Component Team where type Storage Team = TMap Team
 
 -- | What an entity /is/. Soldiers fight and move; a Base is the stationary
 -- spawn-heart a team must protect.
 data Kind = Soldier | Base deriving (Eq, Show)
-instance Component Kind where type Storage Kind = Map Kind
+instance Component Kind where type Storage Kind = TMap Kind
 
 -- | The three archetypes. Their rock-paper-scissors is /emergent/: it falls out
 -- of range, speed, and the one kiting behaviour, not a damage lookup table.
@@ -107,7 +110,7 @@ instance Component Kind where type Storage Kind = Map Kind
 -- So Hunter > Lance > Guard > Hunter, with no dominant type (proven in the lab,
 -- exp 004). Only soldiers carry one.
 data UnitType = Hunter | Guard | Lance deriving (Eq, Ord, Show, Enum, Bounded)
-instance Component UnitType where type Storage UnitType = Map UnitType
+instance Component UnitType where type Storage UnitType = TMap UnitType
 
 -- | A soldier's task-force role (maneuver warfare, exp 007), assigned at spawn.
 --
@@ -119,13 +122,13 @@ instance Component UnitType where type Storage UnitType = Map UnitType
 --   * 'Recon' screens and scouts -- spreads out to light up the whole map, deny
 --     the enemy's scouts, and watch the team's own flanks against a backstab.
 data Role = MainBody | Flank | Defend | Recon deriving (Eq, Show)
-instance Component Role where type Storage Role = Map Role
+instance Component Role where type Storage Role = TMap Role
 
 -- | A transient marker on a soldier that struck this tick, carrying the point
 -- it struck at. Set/cleared each turn by 'stepUnit', read only by the renderer
 -- to draw a tracer line from attacker to victim. Carries no game meaning.
 newtype Attacking = Attacking (V2 Float) deriving (Show)
-instance Component Attacking where type Storage Attacking = Map Attacking
+instance Component Attacking where type Storage Attacking = TMap Attacking
 
 -- | Kills scored this round, by (Red, Blue). A 'Global'.
 data KillScore = KillScore !Int !Int deriving (Show)
@@ -133,7 +136,7 @@ instance Semigroup KillScore where
   KillScore a b <> KillScore c d = KillScore (a + c) (b + d)
 instance Monoid KillScore where
   mempty = KillScore 0 0
-instance Component KillScore where type Storage KillScore = Global KillScore
+instance Component KillScore where type Storage KillScore = TGlobal KillScore
 
 -- | Per-round damage ledger: how much damage each team's attacker type dealt
 -- to each enemy defender type. Keyed by (attacker team, attacker type,
@@ -145,7 +148,7 @@ instance Semigroup DamageLog where
   DamageLog a <> DamageLog b = DamageLog (DM.unionWith (+) a b)
 instance Monoid DamageLog where
   mempty = DamageLog DM.empty
-instance Component DamageLog where type Storage DamageLog = Global DamageLog
+instance Component DamageLog where type Storage DamageLog = TGlobal DamageLog
 
 -- | Per-round damage each team has put on the /enemy base/, by (Red, Blue) --
 -- the center-of-gravity ledger for the Warfighting scorecard (exp 008): how much
@@ -153,7 +156,7 @@ instance Component DamageLog where type Storage DamageLog = Global DamageLog
 data BaseDamage = BaseDamage !Float !Float deriving (Show)
 instance Semigroup BaseDamage where BaseDamage a b <> BaseDamage c d = BaseDamage (a + c) (b + d)
 instance Monoid BaseDamage where mempty = BaseDamage 0 0
-instance Component BaseDamage where type Storage BaseDamage = Global BaseDamage
+instance Component BaseDamage where type Storage BaseDamage = TGlobal BaseDamage
 
 addBaseDmg :: Team -> Float -> BaseDamage -> BaseDamage
 addBaseDmg Red d (BaseDamage r b) = BaseDamage (r + d) b
@@ -165,7 +168,7 @@ instance Semigroup Wins where
   Wins a b <> Wins c d = Wins (a + c) (b + d)
 instance Monoid Wins where
   mempty = Wins 0 0
-instance Component Wins where type Storage Wins = Global Wins
+instance Component Wins where type Storage Wins = TGlobal Wins
 
 -- | Why a round drew. 'MutualFall' = both spawners fell within the grace
 -- countdown (both committed equally suicidally). 'Stalemate' = the round cap was
@@ -181,7 +184,7 @@ data Outcome = Win Team | Draw DrawReason deriving (Eq, Show)
 data Phase = Playing | RoundOver Team | RoundDraw DrawReason deriving (Eq, Show)
 instance Semigroup Phase where _ <> b = b
 instance Monoid Phase where mempty = Playing
-instance Component Phase where type Storage Phase = Global Phase
+instance Component Phase where type Storage Phase = TGlobal Phase
 
 -- | One colony's standing orders: which type to enlist next, where the main
 -- body musters, and which vertical flank (+1 top / -1 bottom) the strategist has
@@ -211,7 +214,7 @@ data Plans = Plans TeamPlan TeamPlan deriving (Show)
 instance Semigroup Plans where _ <> b = b
 instance Monoid Plans where
   mempty = Plans (TeamPlan Hunter (V2 0 0) 1 Nothing Nothing) (TeamPlan Hunter (V2 0 0) 1 Nothing Nothing)
-instance Component Plans where type Storage Plans = Global Plans
+instance Component Plans where type Storage Plans = TGlobal Plans
 
 -- | A colony's fading recollection of where it has /seen/ the enemy: decaying
 -- enemy weight on the top (+y) and bottom (-y) flank, plus the flank it has
@@ -238,7 +241,7 @@ data ThreatMem = ThreatMem Threat Threat deriving (Show)
 instance Semigroup ThreatMem where _ <> b = b
 instance Monoid ThreatMem where
   mempty = ThreatMem (Threat 0 0 1 0 0) (Threat 0 0 (-1) 0 0)
-instance Component ThreatMem where type Storage ThreatMem = Global ThreatMem
+instance Component ThreatMem where type Storage ThreatMem = TGlobal ThreatMem
 
 teamThreat :: Team -> ThreatMem -> Threat
 teamThreat Red (ThreatMem r _) = r
@@ -252,20 +255,20 @@ setTeamThreat Blue t (ThreatMem r _) = ThreatMem r t
 newtype ShowVision = ShowVision Bool
 instance Semigroup ShowVision where _ <> b = b
 instance Monoid ShowVision where mempty = ShowVision False
-instance Component ShowVision where type Storage ShowVision = Global ShowVision
+instance Component ShowVision where type Storage ShowVision = TGlobal ShowVision
 
 -- | Whether to draw the attack-range overlay. A 'Global' toggled from input.
 newtype ShowRange = ShowRange Bool
 instance Semigroup ShowRange where _ <> b = b
 instance Monoid ShowRange where mempty = ShowRange False
-instance Component ShowRange where type Storage ShowRange = Global ShowRange
+instance Component ShowRange where type Storage ShowRange = TGlobal ShowRange
 
 -- | Whether to draw attacker->victim tracer lines. On by default; toggled from
 -- input.
 newtype ShowAttacks = ShowAttacks Bool
 instance Semigroup ShowAttacks where _ <> b = b
 instance Monoid ShowAttacks where mempty = ShowAttacks True
-instance Component ShowAttacks where type Storage ShowAttacks = Global ShowAttacks
+instance Component ShowAttacks where type Storage ShowAttacks = TGlobal ShowAttacks
 
 -- | Whose fog to render through. 'ViewAll' draws everything (omniscient, the
 -- default); 'ViewSide' t draws only what team @t@ can actually see -- its own
@@ -274,7 +277,7 @@ instance Component ShowAttacks where type Storage ShowAttacks = Global ShowAttac
 data Viewpoint = ViewAll | ViewSide Team
 instance Semigroup Viewpoint where _ <> b = b
 instance Monoid Viewpoint where mempty = ViewAll
-instance Component Viewpoint where type Storage Viewpoint = Global Viewpoint
+instance Component Viewpoint where type Storage Viewpoint = TGlobal Viewpoint
 
 -- | A snapshot spatial index: occupied cells -> the units/bases in them. Rebuilt
 -- once per tick by a single refresher, read by every unit, so a unit's neighbour
@@ -287,7 +290,7 @@ type GridEntry = (Team, Kind, Role, Entity, V2 Float)
 newtype Grid = Grid (DM.Map (Int, Int) [GridEntry])
 instance Semigroup Grid where _ <> b = b
 instance Monoid Grid where mempty = Grid DM.empty
-instance Component Grid where type Storage Grid = Global Grid
+instance Component Grid where type Storage Grid = TGlobal Grid
 
 -- | The two spawners' positions for the current round (Red, Blue). A 'Global' set
 -- once at round start and read wherever code needs to know where a base is -- so
@@ -295,7 +298,7 @@ instance Component Grid where type Storage Grid = Global Grid
 data BasePos = BasePos !(V2 Float) !(V2 Float)
 instance Semigroup BasePos where _ <> b = b
 instance Monoid BasePos where mempty = BasePos (V2 0 0) (V2 0 0)
-instance Component BasePos where type Storage BasePos = Global BasePos
+instance Component BasePos where type Storage BasePos = TGlobal BasePos
 
 -- | Every component an entity owns, so we can delete it in one go (the extra
 -- deletes are harmless no-ops for entities that lack a component).
@@ -642,13 +645,13 @@ gridRefresher :: Config -> SystemIO ()
 gridRefresher _cfg = loop
   where
     loop = do
-      ents <- atomically $ cfold (\acc (t :: Team, k :: Kind, r :: Role, e :: Entity) -> (t, k, r, e) : acc) []
+      ents <- STM.atomically $ cfold (\acc (t :: Team, k :: Kind, r :: Role, e :: Entity) -> (t, k, r, e) : acc) []
       entries <- foldM addEntry [] ents
-      atomically $ set global (Grid (DM.fromListWith (++) entries))
-      threadDelay gridRefreshUs
+      STM.atomically $ set global (Grid (DM.fromListWith (++) entries))
+      STM.threadDelay gridRefreshUs
       loop
     addEntry acc (t, k, r, e) = do
-      mq <- atomically $ do
+      mq <- STM.atomically $ do
         ok <- exists e (Proxy @Position)
         if ok then (\(Position q) -> Just q) <$> get e else pure Nothing
       pure $ case mq of
@@ -959,9 +962,9 @@ attack killer atkType victim = do
 -- | The thread driving one soldier: tick, sleep, repeat, until it dies.
 unitAI :: Config -> Entity -> SystemIO ()
 unitAI cfg ety = do
-  living <- atomically (stepUnit cfg ety)
+  living <- STM.atomically (stepUnit cfg ety)
   when living $ do
-    threadDelay (cTick cfg)
+    STM.threadDelay (cTick cfg)
     unitAI cfg ety
 
 -- Recon & strategy ----------------------------------------------------------
@@ -1312,13 +1315,13 @@ strategist :: Config -> Team -> Entity -> SystemIO ()
 strategist cfg team base = loop
   where
     loop = do
-      continue <- atomically $ do
+      continue <- STM.atomically $ do
         baseAlive <- exists base (Proxy @Health)
         ph <- get global
         let ok = baseAlive && isPlaying ph
         when ok (planFor team)
         pure ok
-      when continue (threadDelay (cStrategy cfg) >> loop)
+      when continue (STM.threadDelay (cStrategy cfg) >> loop)
 
 -- Spawning ------------------------------------------------------------------
 
@@ -1367,25 +1370,25 @@ spawnerThread cfg base team = loop
     loop = do
       tang <- liftIO (randomRIO (-spawnRadius, spawnRadius))
       roleRoll <- liftIO (randomRIO (0, 1) :: IO Double)
-      mE <- atomically $ do
+      mE <- STM.atomically $ do
         baseAlive <- exists base (Proxy @Health)
         ph <- get global
         if not (baseAlive && isPlaying ph)
           then pure Nothing
           else do
             n <- teamUnitCount team
-            check (n < capPerTeam) -- block here until a slot frees
+            STM.check (n < capPerTeam) -- block here until a slot frees
             plan <- teamPlan team <$> get global
             Position homePosn <- get base
             let ut = planNext plan
                 pos = edgeSpawn homePosn (planWaypoint plan) tang
                 role = rollRole ut roleRoll
-            Just <$> newEntity (team, Soldier, ut, Position pos, Health (typeHp ut), role)
+            Just <$> STM.newEntity (team, Soldier, ut, Position pos, Health (typeHp ut), role)
       case mE of
         Nothing -> pure () -- base dead or round over: retire
         Just e -> do
-          void $ forkSys (unitAI cfg e)
-          threadDelay (cSpawn cfg)
+          void $ STM.forkSys (unitAI cfg e)
+          STM.threadDelay (cSpawn cfg)
           loop
 
 -- Round lifecycle -----------------------------------------------------------
@@ -1406,7 +1409,7 @@ startRound cfg n = do
   -- each round -- a cheap coin seeded from the round and both spawner positions,
   -- so neither the enemy nor the AI itself can bank on it.
   let pick = coinSign (mix64 n + teamSeed redHome + teamSeed blueHome)
-  atomically $ do
+  STM.atomically $ do
     cmapM_ $ \(_ :: Team, e :: Entity) -> destroy e (Proxy @All)
     set global (mempty :: KillScore)
     set global (mempty :: DamageLog)
@@ -1417,12 +1420,12 @@ startRound cfg n = do
     set global Playing
   -- Bases carry a (behaviourally inert) Role only so the role-aware gather fold
   -- still sees them as targets; Defend reads sensibly for the thing defended.
-  redBase <- atomically $ newEntity (Red, Base, Position redHome, Health baseHp, Defend)
-  blueBase <- atomically $ newEntity (Blue, Base, Position blueHome, Health baseHp, Defend)
-  void $ forkSys (spawnerThread cfg redBase Red)
-  void $ forkSys (spawnerThread cfg blueBase Blue)
-  void $ forkSys (strategist cfg Red redBase)
-  void $ forkSys (strategist cfg Blue blueBase)
+  redBase <- STM.atomically $ STM.newEntity (Red, Base, Position redHome, Health baseHp, Defend)
+  blueBase <- STM.atomically $ STM.newEntity (Blue, Base, Position blueHome, Health baseHp, Defend)
+  void $ STM.forkSys (spawnerThread cfg redBase Red)
+  void $ STM.forkSys (spawnerThread cfg blueBase Blue)
+  void $ STM.forkSys (strategist cfg Red redBase)
+  void $ STM.forkSys (strategist cfg Blue blueBase)
   dbg cfg "[round] started: 2 bases, 2 spawners, 2 strategists (no starting platoon)"
   pure (redBase, blueBase)
 
@@ -1435,19 +1438,19 @@ coordinator cfg = loop (1 :: Int)
   where
     loop n = do
       (redBase, blueBase) <- startRound cfg n
-      when (cDebug cfg) (void $ forkSys heartbeat)
+      when (cDebug cfg) (void $ STM.forkSys heartbeat)
       outcome <- waitWinner redBase blueBase
-      atomically $ case outcome of
+      STM.atomically $ case outcome of
         Win winner -> modify global (addWin winner) >> set global (RoundOver winner)
         Draw reason -> set global (RoundDraw reason)
       report n outcome
-      threadDelay (cOver cfg)
+      STM.threadDelay (cOver cfg)
       loop (n + 1)
 
     -- A gated 2 Hz pulse of each colony's live composition and current plan,
     -- so you can watch the counter-play shift through the fog.
     heartbeat = do
-      (ph, rc, bc, Plans rp bp, DamageLog dm, rHp, bHp, rCov, bCov, rFront, bFront, rBad, bBad, rConc, bConc, BaseDamage bdR bdB, (rInit, bInit)) <- atomically $ do
+      (ph, rc, bc, Plans rp bp, DamageLog dm, rHp, bHp, rCov, bCov, rFront, bFront, rBad, bBad, rConc, bConc, BaseDamage bdR bdB, (rInit, bInit)) <- STM.atomically $ do
         ph <- get global
         rc <- teamCensus Red
         bc <- teamCensus Blue
@@ -1484,7 +1487,7 @@ coordinator cfg = loop (1 :: Int)
       traceM $
         "[score] R " ++ scoreLine rCov bCov rc rInit rConc (teamDmgF Red) bdR
           ++ " | B " ++ scoreLine bCov rCov bc bInit bConc (teamDmgF Blue) bdB
-      when (isPlaying ph) (threadDelay 500000 >> heartbeat)
+      when (isPlaying ph) (STM.threadDelay 500000 >> heartbeat)
 
     -- recon = my coverage of the enemy; sec = my hidden-force count / secRef (NOT
     -- the unseen fraction -- annihilation must not read as perfect security);
@@ -1538,7 +1541,7 @@ coordinator cfg = loop (1 :: Int)
     showCensus (h, g, l) = "H" ++ show h ++ "/G" ++ show g ++ "/L" ++ show l
 
     bothAlive redBase blueBase =
-      atomically ((,) <$> exists redBase (Proxy @Health) <*> exists blueBase (Proxy @Health))
+      STM.atomically ((,) <$> exists redBase (Proxy @Health) <*> exists blueBase (Proxy @Health))
 
     -- Poll until a base falls (or the round cap is hit -- a stalemate draw, two
     -- competent defenses neither could crack), then hold a grace countdown: if
@@ -1553,9 +1556,9 @@ coordinator cfg = loop (1 :: Int)
             then
               if k <= (0 :: Int)
                 then pure (Draw Stalemate)
-                else threadDelay (cPoll cfg) >> poll (k - 1)
+                else STM.threadDelay (cPoll cfg) >> poll (k - 1)
             else do
-              threadDelay (cGrace cfg)
+              STM.threadDelay (cGrace cfg)
               (ra', ba') <- bothAlive redBase blueBase
               pure $ case (ra', ba') of
                 (False, False) -> Draw MutualFall
@@ -1564,7 +1567,7 @@ coordinator cfg = loop (1 :: Int)
 
     report n outcome = do
       (KillScore kr kb, Wins wr wb, dl) <-
-        atomically ((,,) <$> get global <*> get global <*> get global)
+        STM.atomically ((,,) <$> get global <*> get global <*> get global)
       let result = case outcome of
             Win w -> show w ++ " wins"
             Draw MutualFall -> "Draw (both spawners fell)"
@@ -1638,7 +1641,7 @@ draw = do
   -- stores. Bases, soldiers, populations and the optional vision overlay all
   -- come from this one snapshot.
   (visionPic, attackPic, basePic, soldierPic, fogPic, vp, redPop, bluePop, KillScore kr kb, Wins wr wb, phase, Plans rPlan bPlan, dl) <-
-    atomically $ do
+    STM.atomically $ do
       vp <- get global :: SystemSTM Viewpoint
       -- When viewing through one side's eyes, gather that side's sight sources
       -- (its base plus every friendly soldier's recon); enemies outside them are
@@ -1858,8 +1861,8 @@ spawnArmy team comp (V2 ax ay) =
     let face = signum ax -- columns recede outward, front rank faces the centre
         gx = face * fromIntegral (i `mod` 5) * 9
         gy = fromIntegral (i `div` 5) * 9 - 16
-    void . atomically $
-      newEntity (team, Soldier, ut, Position (V2 (ax + gx) (ay + gy)), Health (typeHp ut), MainBody)
+    void . STM.atomically $
+      STM.newEntity (team, Soldier, ut, Position (V2 (ax + gx) (ay + gy)), Health (typeHp ut), MainBody)
   where
     roster = concat [replicate n ut | (ut, n) <- comp]
 
@@ -1884,27 +1887,26 @@ runBattle cfg = loop (0 :: Int)
       | t >= maxTicks = pure Nothing -- unresolved: a draw/stalemate
       | otherwise = do
           ents <-
-            atomically $
+            STM.atomically $
               cfold (\acc (k :: Kind, e :: Entity) -> if k == Soldier then e : acc else acc) []
           order <- liftIO (shuffleIO ents)
-          atomically rebuildGrid
-          mapM_ (\e -> atomically (void (stepUnit cfg e))) order
+          STM.atomically rebuildGrid
+          mapM_ (\e -> STM.atomically (void (stepUnit cfg e))) order
           when (cArena cfg > 0) $
-            atomically $
+            STM.atomically $
               cmap $ \(Position (V2 x y)) ->
                 let a = cArena cfg
                     cl v = max (-a) (min a v)
                  in Position (V2 (cl x) (cl y))
-          (r, b) <- atomically teamCounts
+          (r, b) <- STM.atomically $ cfold teamCounts (0 :: Int, 0 :: Int)
           if
             | r == 0 && b == 0 -> pure Nothing
             | b == 0 -> pure (Just Red)
             | r == 0 -> pure (Just Blue)
             | otherwise -> loop (t + 1)
-    teamCounts =
-      cfold
-        (\(r, b) (tm :: Team, k :: Kind) -> if k == Soldier then (if tm == Red then (r + 1, b) else (r, b + 1)) else (r, b))
-        (0 :: Int, 0 :: Int)
+    teamCounts (r, b) (tm :: Team, k :: Kind) =
+      if k == Soldier then (if tm == Red then (r + 1, b) else (r, b + 1)) else (r, b)
+
 
 -- | Run @reps@ battles of one matchup and print a single structured RESULT line.
 runMatchups :: [String] -> IO ()
@@ -1925,7 +1927,7 @@ runMatchups args = do
       (rw, bw, dr) <- runWith w $ do
         set global (Camera 0 1)
         let one (r, b, d) _ = do
-              atomically $ cmapM_ (\(_ :: Team, e :: Entity) -> destroy e (Proxy @All))
+              STM.atomically $ cmapM_ (\(_ :: Team, e :: Entity) -> destroy e (Proxy @All))
               spawnArmy Red redC (V2 (-70) 0)
               spawnArmy Blue blueC (V2 70 0)
               -- There is no strategist in the harness, so hand each side a standing
@@ -1933,7 +1935,7 @@ runMatchups args = do
               -- main body closes and fights (without it, short-sighted units never
               -- make contact and every non-Hunter matchup draws). Raw combat, which
               -- is what the harness is meant to measure.
-              atomically $
+              STM.atomically $
                 set
                   global
                   ( Plans
@@ -1987,12 +1989,12 @@ runGame args = do
     set global (ShowRange False)
     set global (ShowAttacks True)
     set global (ViewAll :: Viewpoint)
-    void $ forkSys (gridRefresher cfg)
-    void $ forkSys (coordinator cfg)
+    void $ STM.forkSys (gridRefresher cfg)
+    void $ STM.forkSys (coordinator cfg)
     if cHeadless cfg
       then do
-        threadDelay (cMaxSeconds cfg * 1000000)
-        dl <- atomically (get global)
+        STM.threadDelay (cMaxSeconds cfg * 1000000)
+        dl <- STM.atomically (get global)
         liftIO $ do
           putStrLn "=== headless time limit reached ==="
           putStrLn ("  RED  " ++ matrixDump (teamMatrix Red dl))
