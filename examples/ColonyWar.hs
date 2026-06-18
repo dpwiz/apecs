@@ -251,24 +251,28 @@ setTeamThreat :: Team -> Threat -> ThreatMem -> ThreatMem
 setTeamThreat Red t (ThreatMem _ b) = ThreatMem t b
 setTeamThreat Blue t (ThreatMem r _) = ThreatMem r t
 
--- | Whether to draw the vision overlay. A 'Global' toggled from input.
+-- | Whether to draw the vision overlay. A pure UI toggle: one writer (the gloss
+-- event thread) and one reader (the renderer, once a frame), never read inside a
+-- battle transaction -- so it lives in a plain IO 'Global', not an STM cell. It
+-- has nothing to be atomic /with/; paying for STM here would be waste.
 newtype ShowVision = ShowVision Bool
 instance Semigroup ShowVision where _ <> b = b
 instance Monoid ShowVision where mempty = ShowVision False
-instance Component ShowVision where type Storage ShowVision = TGlobal ShowVision
+instance Component ShowVision where type Storage ShowVision = Global ShowVision
 
--- | Whether to draw the attack-range overlay. A 'Global' toggled from input.
+-- | Whether to draw the attack-range overlay. A pure UI toggle (see 'ShowVision')
+-- -- a plain IO 'Global', deliberately outside the STM world.
 newtype ShowRange = ShowRange Bool
 instance Semigroup ShowRange where _ <> b = b
 instance Monoid ShowRange where mempty = ShowRange False
-instance Component ShowRange where type Storage ShowRange = TGlobal ShowRange
+instance Component ShowRange where type Storage ShowRange = Global ShowRange
 
--- | Whether to draw attacker->victim tracer lines. On by default; toggled from
--- input.
+-- | Whether to draw attacker->victim tracer lines. On by default; a pure UI
+-- toggle (see 'ShowVision') in a plain IO 'Global'.
 newtype ShowAttacks = ShowAttacks Bool
 instance Semigroup ShowAttacks where _ <> b = b
 instance Monoid ShowAttacks where mempty = ShowAttacks True
-instance Component ShowAttacks where type Storage ShowAttacks = TGlobal ShowAttacks
+instance Component ShowAttacks where type Storage ShowAttacks = Global ShowAttacks
 
 -- | Whose fog to render through. 'ViewAll' draws everything (omniscient, the
 -- default); 'ViewSide' t draws only what team @t@ can actually see -- its own
@@ -277,20 +281,31 @@ instance Component ShowAttacks where type Storage ShowAttacks = TGlobal ShowAtta
 data Viewpoint = ViewAll | ViewSide Team
 instance Semigroup Viewpoint where _ <> b = b
 instance Monoid Viewpoint where mempty = ViewAll
-instance Component Viewpoint where type Storage Viewpoint = TGlobal Viewpoint
+-- A pure UI toggle (see 'ShowVision'): a plain IO 'Global', outside the STM world.
+instance Component Viewpoint where type Storage Viewpoint = Global Viewpoint
 
 -- | A snapshot spatial index: occupied cells -> the units/bases in them. Rebuilt
 -- once per tick by a single refresher, read by every unit, so a unit's neighbour
 -- query (separation, cohesion, target) scans only its 3x3 cell block instead of
 -- folding over ALL entities -- turning the per-tick cost from O(n) per unit
 -- (O(n^2) overall) into O(local density). The snapshot is at most one tick stale,
--- which is fine for forces that already act on independent clocks. A 'Global'.
+-- which is fine for forces that already act on independent clocks.
+--
+-- Deliberately a plain IO 'Global', NOT an STM cell. It is single-writer (the
+-- refresher), many-reader (every unit), and explicitly approximate -- exactly the
+-- shape that punishes STM: were it a 'TGlobal' read /inside/ each unit's
+-- transaction, every grid rewrite would invalidate every in-flight unit txn and
+-- cause a retry storm (which is why the old design was forced to refresh slowly).
+-- As an IORef-backed 'Global' it is read in IO /before/ a unit enters
+-- 'atomically' and threaded in, so the snapshot never joins the transaction's
+-- read-set. STM is kept for the state that must be exact (health, kills, plans);
+-- the approximate spatial index sits outside it on purpose.
 type GridEntry = (Team, Kind, Role, Entity, V2 Float)
 
 newtype Grid = Grid (DM.Map (Int, Int) [GridEntry])
 instance Semigroup Grid where _ <> b = b
 instance Monoid Grid where mempty = Grid DM.empty
-instance Component Grid where type Storage Grid = TGlobal Grid
+instance Component Grid where type Storage Grid = Global Grid
 
 -- | The two spawners' positions for the current round (Red, Blue). A 'Global' set
 -- once at round start and read wherever code needs to know where a base is -- so
@@ -607,15 +622,17 @@ gridCellSize = 170
 gridCell :: V2 Float -> (Int, Int)
 gridCell (V2 x y) = (floor (x / gridCellSize), floor (y / gridCellSize))
 
--- | Rebuild the snapshot in one transaction. Used by the synchronous matchup
--- harness, where there is no concurrent writer to contend with. Bases carry a
--- Role too, so they land in the grid and stay visible as targets.
-rebuildGrid :: SystemSTM ()
+-- | Rebuild the snapshot: read the world in one transaction, then publish to the
+-- IO-side 'Grid' cell. Used by the synchronous matchup harness, where there is no
+-- concurrent writer to contend with. Bases carry a Role too, so they land in the
+-- grid and stay visible as targets.
+rebuildGrid :: SystemIO ()
 rebuildGrid = do
   m <-
-    cfold
-      (\acc (t :: Team, k :: Kind, r :: Role, Position q, e :: Entity) -> DM.insertWith (++) (gridCell q) [(t, k, r, e, q)] acc)
-      DM.empty
+    STM.atomically $
+      cfold
+        (\acc (t :: Team, k :: Kind, r :: Role, Position q, e :: Entity) -> DM.insertWith (++) (gridCell q) [(t, k, r, e, q)] acc)
+        DM.empty
   set global (Grid m)
 
 -- | Every entity in the 3x3 cell block around a point -- the candidate neighbours.
@@ -647,7 +664,10 @@ gridRefresher _cfg = loop
     loop = do
       ents <- STM.atomically $ cfold (\acc (t :: Team, k :: Kind, r :: Role, e :: Entity) -> (t, k, r, e) : acc) []
       entries <- foldM addEntry [] ents
-      STM.atomically $ set global (Grid (DM.fromListWith (++) entries))
+      -- Publish to the IO-side cell: a single IORef write, no transaction -- so it
+      -- can never invalidate an in-flight unit transaction (the whole point of
+      -- keeping 'Grid' out of STM).
+      set global (Grid (DM.fromListWith (++) entries))
       STM.threadDelay gridRefreshUs
       loop
     addEntry acc (t, k, r, e) = do
@@ -673,8 +693,8 @@ vision radius:
 
 With nothing in sight the soldier marches to its colony's waypoint instead.
 -}
-stepUnit :: Config -> Entity -> SystemSTM Bool
-stepUnit cfg ety = do
+stepUnit :: Config -> Grid -> Entity -> SystemSTM Bool
+stepUnit cfg grid ety = do
   alive <- exists ety (Proxy @Health)
   if not alive
     then pure False
@@ -688,8 +708,9 @@ stepUnit cfg ety = do
           speed = typeSpeed myType
       -- Cohesion is /role-local/: a unit pulls only toward same-role friends, so
       -- the flank coheres into its own fist (concentration at the decisive point)
-      -- rather than being sucked into the main-body blob.
-      grid <- get global
+      -- rather than being sucked into the main-body blob. The grid snapshot is
+      -- read in IO by the caller and passed in, so it never joins this
+      -- transaction's read-set (it is approximate by design).
       let (mUnit, mBase, sep, allyNear, coh) =
             foldl' (gather p myTeam myRole vis2) (Nothing, Nothing, V2 0 0, 0 :: Int, V2 0 0) (gridNeighbors grid p)
       -- The nearest enemy /soldier/'s type, for the kiting decision. The target
@@ -962,7 +983,10 @@ attack killer atkType victim = do
 -- | The thread driving one soldier: tick, sleep, repeat, until it dies.
 unitAI :: Config -> Entity -> SystemIO ()
 unitAI cfg ety = do
-  living <- STM.atomically (stepUnit cfg ety)
+  -- Read the (approximate, IO-side) spatial snapshot OUTSIDE the transaction, so
+  -- a concurrent grid refresh never forces this unit's turn to retry.
+  grid <- get global
+  living <- STM.atomically (stepUnit cfg grid ety)
   when living $ do
     STM.threadDelay (cTick cfg)
     unitAI cfg ety
@@ -1640,9 +1664,15 @@ draw = do
   -- never a half-destroyed unit, even with hundreds of threads mutating the
   -- stores. Bases, soldiers, populations and the optional vision overlay all
   -- come from this one snapshot.
-  (visionPic, attackPic, basePic, soldierPic, fogPic, vp, redPop, bluePop, KillScore kr kb, Wins wr wb, phase, Plans rPlan bPlan, dl) <-
+  -- The UI toggles live in plain IO 'Global's (one writer, the event thread; one
+  -- reader, here) -- read them up front, outside the snapshot transaction they
+  -- have no need to be consistent with.
+  vp <- get global :: SystemIO Viewpoint
+  ShowVision showV <- get global
+  ShowRange showR <- get global
+  ShowAttacks showA <- get global
+  (visionPic, attackPic, basePic, soldierPic, fogPic, redPop, bluePop, KillScore kr kb, Wins wr wb, phase, Plans rPlan bPlan, dl) <-
     STM.atomically $ do
-      vp <- get global :: SystemSTM Viewpoint
       -- When viewing through one side's eyes, gather that side's sight sources
       -- (its base plus every friendly soldier's recon); enemies outside them are
       -- hidden. 'vis t q' = is a thing of team t at q visible to the viewer?
@@ -1692,9 +1722,6 @@ draw = do
                in pure (acc', rp', bp')
           )
           (mempty, 0 :: Int, 0 :: Int)
-      ShowVision showV <- get global
-      ShowRange showR <- get global
-      ShowAttacks showA <- get global
       visionPic <-
         mappend
           <$> (if showV then visionOverlay else pure mempty)
@@ -1709,7 +1736,7 @@ draw = do
       wns <- get global :: SystemSTM Wins
       ph <- get global :: SystemSTM Phase
       dmg <- get global :: SystemSTM DamageLog
-      pure (visionPic, attackPic, basePic, soldierPic, fogPic <> memPic, vp, rp, bp, ks, wns, ph, plansNow, dmg)
+      pure (visionPic, attackPic, basePic, soldierPic, fogPic <> memPic, rp, bp, ks, wns, ph, plansNow, dmg)
   -- Two left-aligned rows in the top-left of the (1600x900) window.
   let viewLabel = case vp of
         ViewAll -> "viewpoint: ALL (omniscient)"
@@ -1890,8 +1917,9 @@ runBattle cfg = loop (0 :: Int)
             STM.atomically $
               cfold (\acc (k :: Kind, e :: Entity) -> if k == Soldier then e : acc else acc) []
           order <- liftIO (shuffleIO ents)
-          STM.atomically rebuildGrid
-          mapM_ (\e -> STM.atomically (void (stepUnit cfg e))) order
+          rebuildGrid
+          grid <- get global
+          mapM_ (\e -> STM.atomically (void (stepUnit cfg grid e))) order
           when (cArena cfg > 0) $
             STM.atomically $
               cmap $ \(Position (V2 x y)) ->
