@@ -1474,33 +1474,36 @@ coordinator cfg = loop (1 :: Int)
     -- A gated 2 Hz pulse of each colony's live composition and current plan,
     -- so you can watch the counter-play shift through the fog.
     heartbeat = do
-      (ph, rc, bc, Plans rp bp, DamageLog dm, rHp, bHp, rCov, bCov, rFront, bFront, rBad, bBad, rConc, bConc, BaseDamage bdR bdB, (rInit, bInit)) <- STM.atomically $ do
-        ph <- get global
-        rc <- teamCensus Red
-        bc <- teamCensus Blue
-        pl <- get global
-        dl <- get global
-        rh <- baseHpOf Red
-        bh <- baseHpOf Blue
-        rcov <- enemyCoverage Red
-        bcov <- enemyCoverage Blue
-        rf <- teamFront Red
-        bf <- teamFront Blue
-        (rbad, bbad, rout, bout) <- engageRates
-        rsg <- siegeCount Red
-        bsg <- siegeCount Blue
-        rconc <- concentration Red
-        bconc <- concentration Blue
-        rgrp <- groupCount Red
-        bgrp <- groupCount Blue
-        rovl <- reconOverlap Red
-        bovl <- reconOverlap Blue
-        tm <- get global
-        bd <- get global
-        bpos <- get global :: SystemSTM BasePos
-        let rInit = initiative (homePos Red bpos) (homePos Blue bpos) (fst rf)
-            bInit = initiative (homePos Blue bpos) (homePos Red bpos) (fst bf)
-        pure (ph, rc, bc, pl, dl, rh, bh, rcov, bcov, rf, bf, (rbad, rout, rsg), (bbad, bout, bsg), (rconc, rgrp, rovl, teamThreat Red tm), (bconc, bgrp, bovl, teamThreat Blue tm), bd, (rInit, bInit))
+      -- This is pure diagnostic telemetry -- printed, never acted on -- so each
+      -- metric is read in its OWN transaction rather than one consistent snapshot.
+      -- The old single transaction folded the whole world ~15 times, building a
+      -- read-set that conflicted with every unit's position write and so retried
+      -- endlessly (the quadratic blowup the STM store warns about). Small
+      -- independent reads each commit at once; the slight cross-metric skew is
+      -- irrelevant for a 2 Hz pulse. The renderer, by contrast, keeps its single
+      -- snapshot transaction on purpose -- it must draw a consistent frame.
+      ph <- STM.atomically (get global :: SystemSTM Phase)
+      (rc, bc) <- STM.atomically ((,) <$> teamCensus Red <*> teamCensus Blue)
+      Plans rp bp <- STM.atomically (get global)
+      DamageLog dm <- STM.atomically (get global)
+      (rHp, bHp) <- STM.atomically ((,) <$> baseHpOf Red <*> baseHpOf Blue)
+      (rCov, bCov) <- STM.atomically ((,) <$> enemyCoverage Red <*> enemyCoverage Blue)
+      (rFront, bFront) <- STM.atomically ((,) <$> teamFront Red <*> teamFront Blue)
+      (rbad, bbad, rout, bout) <- STM.atomically engageRates
+      (rsg, bsg) <- STM.atomically ((,) <$> siegeCount Red <*> siegeCount Blue)
+      (rconc, bconc) <- STM.atomically ((,) <$> concentration Red <*> concentration Blue)
+      (rgrp, bgrp) <- STM.atomically ((,) <$> groupCount Red <*> groupCount Blue)
+      (rovl, bovl) <- STM.atomically ((,) <$> reconOverlap Red <*> reconOverlap Blue)
+      -- The globals are cheap single-cell reads that rarely conflict, so they ride
+      -- together in one small transaction.
+      (tm, BaseDamage bdR bdB, bpos) <-
+        STM.atomically ((,,) <$> get global <*> get global <*> (get global :: SystemSTM BasePos))
+      let rBad = (rbad, rout, rsg)
+          bBad = (bbad, bout, bsg)
+          rConc = (rconc, rgrp, rovl, teamThreat Red tm)
+          bConc = (bconc, bgrp, bovl, teamThreat Blue tm)
+          rInit = initiative (homePos Red bpos) (homePos Blue bpos) (fst rFront)
+          bInit = initiative (homePos Blue bpos) (homePos Red bpos) (fst bFront)
       let teamDmgF t = sum [v | ((t', _, _), v) <- DM.toList dm, t' == t]
           teamDmg t = round (teamDmgF t) :: Int
       let foundFlag p = (if isJust (planContact p) then "c" else "-") ++ (if isJust (planEnemyBase p) then "B" else "-")
@@ -1660,10 +1663,14 @@ contactMarker enemy = color (withAlpha 0.28 (teamColor enemy)) (thickCircle 26 2
 
 draw :: SystemIO Picture
 draw = do
-  -- Fold the whole frame in a single STM transaction: a consistent snapshot,
-  -- never a half-destroyed unit, even with hundreds of threads mutating the
-  -- stores. Bases, soldiers, populations and the optional vision overlay all
-  -- come from this one snapshot.
+  -- Fold the BATTLEFIELD in a single STM transaction: a consistent snapshot,
+  -- never a half-destroyed unit (and never a fold crashing on a component a
+  -- concurrent 'destroy' just removed mid-read), even with hundreds of threads
+  -- mutating the stores. Bases, soldiers, populations and the fog all come from
+  -- this one snapshot -- that frame consistency is a deliberate STM showcase.
+  -- The decorative overlays (vision/range/attack), by contrast, are NOT part of
+  -- that guarantee, so they each take their own small transaction below rather
+  -- than enlarging this one's read-set (see further down).
   -- The UI toggles live in plain IO 'Global's (one writer, the event thread; one
   -- reader, here) -- read them up front, outside the snapshot transaction they
   -- have no need to be consistent with.
@@ -1671,7 +1678,7 @@ draw = do
   ShowVision showV <- get global
   ShowRange showR <- get global
   ShowAttacks showA <- get global
-  (visionPic, attackPic, basePic, soldierPic, fogPic, redPop, bluePop, KillScore kr kb, Wins wr wb, phase, Plans rPlan bPlan, dl) <-
+  (basePic, soldierPic, fogPic, redPop, bluePop, KillScore kr kb, Wins wr wb, phase, Plans rPlan bPlan, dl) <-
     STM.atomically $ do
       -- When viewing through one side's eyes, gather that side's sight sources
       -- (its base plus every friendly soldier's recon); enemies outside them are
@@ -1722,11 +1729,6 @@ draw = do
                in pure (acc', rp', bp')
           )
           (mempty, 0 :: Int, 0 :: Int)
-      visionPic <-
-        mappend
-          <$> (if showV then visionOverlay else pure mempty)
-          <*> (if showR then rangeOverlay else pure mempty)
-      attackPic <- if showA then attackLines else pure mempty
       -- A faint wash over the viewer's own sight discs, marking the lit area so
       -- the dark unseen field is obvious.
       let fogPic = case viewer of
@@ -1736,7 +1738,21 @@ draw = do
       wns <- get global :: SystemSTM Wins
       ph <- get global :: SystemSTM Phase
       dmg <- get global :: SystemSTM DamageLog
-      pure (visionPic, attackPic, basePic, soldierPic, fogPic <> memPic, rp, bp, ks, wns, ph, plansNow, dmg)
+      pure (basePic, soldierPic, fogPic <> memPic, rp, bp, ks, wns, ph, plansNow, dmg)
+  -- Decorative overlays: each its own transaction, off the battlefield snapshot's
+  -- read-set. They are at most a frame inconsistent with it (a tracer to a unit
+  -- the snapshot already dropped) -- purely cosmetic, and crash-free since each
+  -- cfold is itself atomic. Skipped entirely when toggled off, so no empty
+  -- transaction is paid for the common case.
+  visionPic <-
+    if showV || showR
+      then
+        STM.atomically $
+          mappend
+            <$> (if showV then visionOverlay else pure mempty)
+            <*> (if showR then rangeOverlay else pure mempty)
+      else pure mempty
+  attackPic <- if showA then STM.atomically attackLines else pure mempty
   -- Two left-aligned rows in the top-left of the (1600x900) window.
   let viewLabel = case vp of
         ViewAll -> "viewpoint: ALL (omniscient)"
