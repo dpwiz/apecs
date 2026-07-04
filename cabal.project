@@ -2,6 +2,7 @@ packages:
   apecs
   apecs-physics
   apecs-gloss
+  apecs-gloss-3d
   apecs-box2d
   apecs-box3d
   apecs-stm

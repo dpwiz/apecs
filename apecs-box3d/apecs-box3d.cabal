@@ -39,7 +39,9 @@ executable apecs-box3d-demo
       apecs
     , apecs-box3d
     , apecs-gloss
-    , base         >=4.16 && <5
+    , apecs-gloss-3d
+    , base            >=4.16 && <5
+    , linear
     , random
 
   default-language: GHC2021

@@ -14,10 +14,9 @@ your own build-depends to import the raw modules those ids unlock.
 
 `apecs-box3d-demo` is the tumbler one dimension up: a kinematic box
 cage tumbling about two axes, full of spheres and cubes, rendered with
-[apecs-gloss](https://hackage.haskell.org/package/apecs-gloss) through
-a CPU perspective projection — painter's-algorithm depth sort across
-bodies, backface culling within each convex cube, flat shading and
-distance fog. Click to drop in more debris.
+apecs-gloss-3d (painter's-algorithm depth sort across bodies, backface
+culling within each convex cube, flat shading and distance fog) inside
+an apecs-gloss window. Click to drop in more debris.
 
 ```sh
 stack run apecs-box3d-demo
