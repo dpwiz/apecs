@@ -14,7 +14,7 @@ allow-newer: true
 
 extra-deps:
   - git: https://gitlab.com/dpwiz/box-nd
-    commit: 60cb77b7c7a77fc157b9a42baef0f633f965383f
+    commit: d962162c67fa33d53b943d2446a30b4f3742e343
     subdirs:
       - Box2D
       - Box3D

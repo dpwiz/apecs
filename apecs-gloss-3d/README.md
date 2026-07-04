@@ -13,7 +13,11 @@ per-body rendering needs only backface culling.
 Primitives (`sphere3`, `solid3`, `wire3`, `hiddenWire3`, `blob3`)
 return depth-tagged `Piece`s; `assemble` (or `foldDraw3`) sorts them
 far-to-near into a `Picture`. A `Camera3` look-at camera and an `Env3`
-light/fog environment resolve into a per-frame `Scene3`. Vectors are
+light/fog environment resolve into a per-frame `Scene3`. Convex
+`Solid`s come prebuilt (`boxSolid`, `cubeSolid`) or from arbitrary
+face cycles via `facesSolid` (normals computed and auto-oriented);
+`solidEdges` extracts a solid's edges for `wire3`. Vectors are
 linear's `V3 Float` with `Quaternion Float` rotations; adapt your
-engine's types at the call site — see the apecs-box3d demo for the
-tumbler rendered this way.
+engine's types at the call site — see the apecs-box3d demos: the
+tumbler rendered with `solid3`/`sphere3`/`wire3`, and the
+`apecs-box3d-elite` chase built on `facesSolid` hulls.

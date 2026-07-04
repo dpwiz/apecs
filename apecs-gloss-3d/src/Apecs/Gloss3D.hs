@@ -41,9 +41,11 @@ module Apecs.Gloss3D
 
     -- * Solids
   , Solid (..)
+  , facesSolid
   , boxSolid
   , cubeSolid
   , boxEdges
+  , solidEdges
 
     -- * Primitives
   , sphere3
@@ -210,6 +212,26 @@ convexity.
 -}
 newtype Solid = Solid [(V3 Float, [V3 Float])]
 
+{- | A solid from faces given as corner cycles in body-local space.
+Outward unit normals are computed from each face's winding (Newell's
+method) and flipped to point away from the solid's centroid, so the
+winding direction need not be consistent across faces. Faces should
+be planar and the solid convex; degenerate faces (fewer than three
+corners) are dropped.
+-}
+facesSolid :: [[V3 Float]] -> Solid
+facesSolid faces = Solid [orient cs | cs <- faces, length cs >= 3]
+  where
+    corners = concat faces
+    centroid = sum corners ^/ fromIntegral (length corners)
+    orient cs =
+      let
+        n = normalize (newell cs)
+        c = sum cs ^/ fromIntegral (length cs)
+      in
+        (if dot n (c - centroid) < 0 then negate n else n, cs)
+    newell cs = sum [cross a b | (a, b) <- zip cs (drop 1 cs <> take 1 cs)]
+
 -- | An axis-aligned box from half-extents.
 boxSolid :: V3 Float -> Solid
 boxSolid half =
@@ -230,6 +252,17 @@ boxSolid half =
 -- | A cube from a half-width.
 cubeSolid :: Float -> Solid
 cubeSolid h = boxSolid (V3 h h h)
+
+{- | The unique edges of a 'Solid', for 'wire3': segments shared by two
+faces (or bounding a lone face) appear once.
+-}
+solidEdges :: Solid -> [(V3 Float, V3 Float)]
+solidEdges (Solid faces) = dedup [ordered a b | (_, cs) <- faces, (a, b) <- zip cs (drop 1 cs <> take 1 cs)]
+  where
+    ordered a b = if key a <= key b then (a, b) else (b, a)
+    key (V3 x y z) = (x, y, z)
+    dedup [] = []
+    dedup (e : es) = e : dedup (filter (/= e) es)
 
 -- | The 12 edges of an axis-aligned box, for 'wire3'.
 boxEdges :: V3 Float -> [(V3 Float, V3 Float)]

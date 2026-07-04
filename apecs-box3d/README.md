@@ -10,7 +10,7 @@ and rotations are quaternions. The raw engine stays reachable through
 `B3BodyId`, `B3ShapeId`, `B3JointId` and `getWorldId` — add `Box3D` to
 your own build-depends to import the raw modules those ids unlock.
 
-## Demo
+## Demos
 
 `apecs-box3d-demo` is the tumbler one dimension up: a kinematic box
 cage tumbling about two axes, full of spheres and cubes, rendered with
@@ -20,4 +20,16 @@ an apecs-gloss window. Click to drop in more debris.
 
 ```sh
 stack run apecs-box3d-demo
+```
+
+`apecs-box3d-elite` is a kinetic chase through an asteroid field,
+flat-shaded: a Courier runs, two Eagles pursue, and
+everything is autopiloted — each ship is a rigid body flown by a small
+PD controller writing `Torque` and `Force`, and the guns fire real
+dynamic bodies, so hits are momentum transfer resolved by the engine.
+A classic scanner ellipse at the bottom shows contacts as height
+lollipops. Click to scramble another Eagle.
+
+```sh
+stack run apecs-box3d-elite
 ```

@@ -16,3 +16,6 @@
 - `CollisionFilter` on shapes, re-exporting `Filter`.
 - `apecs-box3d-demo`: a 3D tumbler rendered with apecs-gloss via a CPU
   perspective projection and painter's-algorithm depth sorting.
+- `apecs-box3d-elite`: an autopiloted kinetic chase through an asteroid
+  field of flat-shaded convex hulls — PD-controller ships flown with
+  `Torque`/`Force`, guns firing real dynamic bodies.
