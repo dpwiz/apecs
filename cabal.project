@@ -2,8 +2,16 @@ packages:
   apecs
   apecs-physics
   apecs-gloss
+  apecs-box2d
+  apecs-box3d
   apecs-stm
   examples
+
+source-repository-package
+  type: git
+  location: https://gitlab.com/dpwiz/box-nd
+  tag: 60cb77b7c7a77fc157b9a42baef0f633f965383f
+  subdir: Box2D Box3D
 
 package apecs
   tests: True

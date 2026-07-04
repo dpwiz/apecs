@@ -1,0 +1,964 @@
+{-# LANGUAGE TypeFamilies #-}
+{-# LANGUAGE UndecidableInstances #-}
+
+{-| Apecs glue for the Box2D physics engine, modelled on apecs-physics.
+
+Add 'Physics' to your world to get a Box2D world. Giving an entity a
+'Body' component creates an engine body and unlocks its sub-components
+('Position', 'Velocity', 'Angle', ...), which read and write the engine
+directly instead of mirroring state into apecs stores. Shapes hang off
+a body entity through the 'Shape' component, like in apecs-physics.
+As in apecs-physics, setting a sub-component on an entity that has no
+'Body' (or 'Shape') is a silent no-op.
+
+Deviations from apecs-physics: vectors are Box2D's native
+single-precision 'Vec2' (convert to your vector library of choice at
+the boundary); 'Elasticity' is Box2D restitution; 'Substeps' replaces
+@Iterations@.
+
+The raw engine is reachable through 'B2BodyId', 'B2ShapeId' and
+'getWorldId' together with the "Box2D" modules.
+-}
+module Apecs.Box2D
+  ( -- * World
+    Physics
+  , B2Space
+  , Gravity (..)
+  , earthGravity
+  , Substeps (..)
+  , stepPhysics
+  , destroyPhysics
+  , getWorldId
+
+    -- * Body
+  , Body (..)
+  , Position (..)
+  , Velocity (..)
+  , Angle (..)
+  , AngularVelocity (..)
+  , BodyMass (..)
+  , Force (..)
+  , Torque (..)
+  , LinearImpulse (..)
+  , AngularImpulse (..)
+  , LinearDamping (..)
+  , AngularDamping (..)
+  , GravityScale (..)
+  , B2BodyId (..)
+
+    -- * Shape
+  , Geometry (..)
+  , Shape (..)
+  , Density (..)
+  , Friction (..)
+  , Elasticity (..)
+  , CollisionFilter (..)
+  , Filter (..)
+  , B2ShapeId (..)
+
+    -- * Joint
+  , JointSpec (..)
+  , Joint (..)
+  , B2JointId (..)
+
+    -- * Vectors
+  , Vec2 (..)
+  , vec2Zero
+  , BVec
+  , WVec
+  ) where
+
+import Apecs
+import Apecs.Core
+import Control.Monad (forM_, when)
+import Control.Monad.IO.Class (MonadIO)
+import Data.IORef
+import Data.IntMap.Strict (IntMap)
+import Data.IntMap.Strict qualified as IM
+import Data.Vector.Storable qualified as VS
+import Data.Vector.Unboxed qualified as U
+
+import Box2D.Body qualified as B2Body
+import Box2D.Collision qualified as B2Collision
+import Box2D.DistanceJoint qualified as B2DistanceJoint
+import Box2D.Id (BodyId, JointId, ShapeId, WorldId)
+import Box2D.Joint qualified as B2Joint
+import Box2D.MathFunctions (makeRot, rotGetAngle)
+import Box2D.MathTypes (Rot (..), Transform (..), Vec2 (..), vec2Zero)
+import Box2D.RevoluteJoint qualified as B2RevoluteJoint
+import Box2D.Shape qualified as B2Shape
+import Box2D.Types (Filter (..))
+import Box2D.Types qualified as B2T
+import Box2D.UserData (setUserIndex)
+import Box2D.WeldJoint qualified as B2WeldJoint
+import Box2D.World qualified as B2World
+
+-- | A vector in body-space coordinates.
+type BVec = Vec2
+
+-- | A vector in world-space coordinates.
+type WVec = Vec2
+
+-- | Uninhabited component; add it to your world to get a physics space.
+data Physics
+
+-- | The engine shape plus the exact 'Shape' value that created it.
+data ShapeRecord = ShapeRecord !ShapeId !Shape
+
+-- | The engine joint plus the exact 'Joint' value that created it.
+data JointRecord = JointRecord !JointId !Joint
+
+{- | The store shared by 'Physics' and all its sub-components: the engine
+world plus entity registries for bodies, shapes and joints.
+-}
+data B2Space c = B2Space
+  { spWorld :: !WorldId
+  , spBodyDef :: !B2T.BodyDef
+  , spShapeDef :: !B2T.ShapeDef
+  , spBodies :: !(IORef (IntMap BodyId))
+  , spShapes :: !(IORef (IntMap ShapeRecord))
+  , spJoints :: !(IORef (IntMap JointRecord))
+  , spSubsteps :: !(IORef Int)
+  }
+
+cast :: B2Space a -> B2Space b
+cast (B2Space w bd sd b s j i) = B2Space w bd sd b s j i
+
+type instance Elem (B2Space c) = c
+
+instance Component Physics where
+  type Storage Physics = B2Space Physics
+
+instance (MonadIO m) => ExplInit m (B2Space Physics) where
+  explInit = liftIO $ do
+    wd <- B2T.defaultWorldDef
+    B2Space
+      <$> B2World.create wd
+      <*> B2T.defaultBodyDef
+      <*> B2T.defaultShapeDef
+      <*> newIORef mempty
+      <*> newIORef mempty
+      <*> newIORef mempty
+      <*> newIORef 4
+
+-- | The raw Box2D world, for use with the "Box2D" modules directly.
+getWorldId :: forall w m. (MonadIO m, Has w m Physics) => SystemT w m WorldId
+getWorldId = spWorld <$> (getStore :: SystemT w m (B2Space Physics))
+
+{- | Advance the simulation by a time delta, resolving contacts with the
+'Substeps' number of substeps.
+-}
+stepPhysics :: forall w m. (MonadIO m, Has w m Physics) => Float -> SystemT w m ()
+stepPhysics dT = do
+  sp :: B2Space Physics <- getStore
+  liftIO $ do
+    substeps <- readIORef (spSubsteps sp)
+    B2World.step (spWorld sp) dT substeps
+
+{- | Destroy the engine world along with all its bodies and shapes, and
+clear the registries. The store is unusable afterwards; call this on
+teardown. Box2D keeps worlds in a fixed-size global registry, so
+sessions that repeatedly create worlds (test suites, GHCi reloads) must
+destroy them too or world creation eventually fails.
+-}
+destroyPhysics :: forall w m. (MonadIO m, Has w m Physics) => SystemT w m ()
+destroyPhysics = do
+  sp :: B2Space Physics <- getStore
+  liftIO $ do
+    B2World.destroy (spWorld sp)
+    writeIORef (spBodies sp) mempty
+    writeIORef (spShapes sp) mempty
+    writeIORef (spJoints sp) mempty
+
+-- Registries ----------------------------------------------------------------
+
+{- | Look up an entity's engine object. Only safe under the apecs 'ExplGet'
+contract: the caller has checked existence.
+-}
+withReg :: String -> IORef (IntMap v) -> Int -> (v -> IO a) -> IO a
+withReg what ref ety f = do
+  m <- readIORef ref
+  case IM.lookup ety m of
+    Just v -> f v
+    Nothing -> error ("Entity " <> show ety <> " has no Box2D " <> what)
+
+{- | Run an action over an entity's engine object, or do nothing when the
+entity has none — setter semantics, matching apecs-physics.
+-}
+overReg :: IORef (IntMap v) -> Int -> (v -> IO ()) -> IO ()
+overReg ref ety f = readIORef ref >>= mapM_ f . IM.lookup ety
+
+regExists :: (MonadIO m) => IORef (IntMap v) -> Int -> m Bool
+regExists ref ety = liftIO $ IM.member ety <$> readIORef ref
+
+regMembers :: (MonadIO m) => IORef (IntMap v) -> m (U.Vector Int)
+regMembers ref = liftIO $ do
+  m <- readIORef ref
+  pure (U.fromListN (IM.size m) (IM.keys m))
+
+withBody :: B2Space c -> Int -> (BodyId -> IO a) -> IO a
+withBody sp = withReg "Body" (spBodies sp)
+
+overBody :: B2Space c -> Int -> (BodyId -> IO ()) -> IO ()
+overBody sp = overReg (spBodies sp)
+
+bodyExists :: (MonadIO m) => B2Space c -> Int -> m Bool
+bodyExists sp = regExists (spBodies sp)
+
+bodyMembers :: (MonadIO m) => B2Space c -> m (U.Vector Int)
+bodyMembers sp = regMembers (spBodies sp)
+
+withShape :: B2Space c -> Int -> (ShapeId -> IO a) -> IO a
+withShape sp ety f = withReg "Shape" (spShapes sp) ety (\(ShapeRecord s _) -> f s)
+
+overShape :: B2Space c -> Int -> (ShapeId -> IO ()) -> IO ()
+overShape sp ety f = overReg (spShapes sp) ety (\(ShapeRecord s _) -> f s)
+
+shapeExists :: (MonadIO m) => B2Space c -> Int -> m Bool
+shapeExists sp = regExists (spShapes sp)
+
+shapeMembers :: (MonadIO m) => B2Space c -> m (U.Vector Int)
+shapeMembers sp = regMembers (spShapes sp)
+
+withJoint :: B2Space c -> Int -> (JointId -> IO a) -> IO a
+withJoint sp ety f = withReg "Joint" (spJoints sp) ety (\(JointRecord j _) -> f j)
+
+jointExists :: (MonadIO m) => B2Space c -> Int -> m Bool
+jointExists sp = regExists (spJoints sp)
+
+jointMembers :: (MonadIO m) => B2Space c -> m (U.Vector Int)
+jointMembers sp = regMembers (spJoints sp)
+
+-- Space sub-components ----------------------------------------------------
+
+-- | The world's gravity vector.
+newtype Gravity = Gravity WVec
+  deriving (Eq, Show)
+
+earthGravity :: Gravity
+earthGravity = Gravity (Vec2 0 (-9.81))
+
+instance Component Gravity where
+  type Storage Gravity = B2Space Gravity
+
+instance (MonadIO m, Has w m Physics) => Has w m Gravity where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space Gravity) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ Gravity <$> B2World.getGravity (spWorld sp)
+
+instance (MonadIO m) => ExplSet m (B2Space Gravity) where
+  explSet sp _ (Gravity v) = liftIO $ B2World.setGravity (spWorld sp) v
+
+{- | The number of contact substeps per 'stepPhysics' call (the analog of
+apecs-physics @Iterations@). Defaults to 4; clamped to at least 1.
+-}
+newtype Substeps = Substeps Int
+  deriving (Eq, Show)
+
+instance Component Substeps where
+  type Storage Substeps = B2Space Substeps
+
+instance (MonadIO m, Has w m Physics) => Has w m Substeps where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space Substeps) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ Substeps <$> readIORef (spSubsteps sp)
+
+instance (MonadIO m) => ExplSet m (B2Space Substeps) where
+  explSet sp _ (Substeps n) = liftIO $ writeIORef (spSubsteps sp) (max 1 n)
+
+-- Body --------------------------------------------------------------------
+
+{- | Gives an entity a Box2D body. Deleting it also deletes the shapes
+attached to it. A body carries the sub-components 'Position',
+'Velocity', 'Angle', 'AngularVelocity', 'BodyMass', 'Force' and
+'Torque'; they exist as long as the entity has a @Body@, and setting
+them on an entity without one does nothing.
+-}
+data Body = DynamicBody | KinematicBody | StaticBody
+  deriving (Eq, Ord, Enum, Show)
+
+toB2BodyType :: Body -> B2T.BodyType
+toB2BodyType DynamicBody = B2T.DynamicBody
+toB2BodyType KinematicBody = B2T.KinematicBody
+toB2BodyType StaticBody = B2T.StaticBody
+
+fromB2BodyType :: B2T.BodyType -> Body
+fromB2BodyType ty = case ty of
+  B2T.DynamicBody -> DynamicBody
+  B2T.KinematicBody -> KinematicBody
+  B2T.StaticBody -> StaticBody
+
+instance Component Body where
+  type Storage Body = B2Space Body
+
+instance (MonadIO m, Has w m Physics) => Has w m Body where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplSet m (B2Space Body) where
+  explSet sp ety btype = liftIO $ do
+    bodies <- readIORef (spBodies sp)
+    case IM.lookup ety bodies of
+      Just b -> B2Body.setType b (toB2BodyType btype)
+      Nothing -> do
+        b <- B2Body.create (spWorld sp) (spBodyDef sp){B2T.bodyDefType = toB2BodyType btype}
+        setUserIndex b ety
+        modifyIORef' (spBodies sp) (IM.insert ety b)
+
+instance (MonadIO m) => ExplGet m (B2Space Body) where
+  explExists = bodyExists
+  explGet sp ety =
+    liftIO $
+      withBody sp ety $
+        fmap fromB2BodyType . B2Body.getType
+
+instance (MonadIO m) => ExplDestroy m (B2Space Body) where
+  explDestroy sp ety = liftIO $ do
+    bodies <- readIORef (spBodies sp)
+    forM_ (IM.lookup ety bodies) $ \b -> do
+      -- the engine destroys attached shapes and joints along with the
+      -- body, so drop their entity records too
+      modifyIORef' (spShapes sp) (IM.filter (\(ShapeRecord _ (Shape (Entity be) _)) -> be /= ety))
+      modifyIORef' (spJoints sp) (IM.filter (\(JointRecord _ (Joint (Entity a) (Entity b') _)) -> a /= ety && b' /= ety))
+      modifyIORef' (spBodies sp) (IM.delete ety)
+      B2Body.destroy b
+
+instance (MonadIO m) => ExplMembers m (B2Space Body) where
+  explMembers = bodyMembers
+
+-- | The raw Box2D body of an entity, for use with "Box2D.Body" directly.
+newtype B2BodyId = B2BodyId BodyId
+  deriving (Eq, Show)
+
+instance Component B2BodyId where
+  type Storage B2BodyId = B2Space B2BodyId
+
+instance (MonadIO m, Has w m Physics) => Has w m B2BodyId where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space B2BodyId) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety (pure . B2BodyId)
+
+instance (MonadIO m) => ExplMembers m (B2Space B2BodyId) where
+  explMembers = bodyMembers
+
+-- Body sub-components ------------------------------------------------------
+
+-- | Where a 'Body' is, in world coordinates.
+newtype Position = Position WVec
+  deriving (Eq, Show)
+
+instance Component Position where
+  type Storage Position = B2Space Position
+
+instance (MonadIO m, Has w m Physics) => Has w m Position where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space Position) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap Position . B2Body.getPosition
+
+instance (MonadIO m) => ExplSet m (B2Space Position) where
+  explSet sp ety (Position p) = liftIO $
+    overBody sp ety $ \b -> do
+      rot <- B2Body.getRotation b
+      B2Body.setTransform b p rot
+
+instance (MonadIO m) => ExplMembers m (B2Space Position) where
+  explMembers = bodyMembers
+
+-- | Where a 'Body' is going, in world coordinates.
+newtype Velocity = Velocity WVec
+  deriving (Eq, Show)
+
+instance Component Velocity where
+  type Storage Velocity = B2Space Velocity
+
+instance (MonadIO m, Has w m Physics) => Has w m Velocity where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space Velocity) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap Velocity . B2Body.getLinearVelocity
+
+instance (MonadIO m) => ExplSet m (B2Space Velocity) where
+  explSet sp ety (Velocity v) = liftIO $
+    overBody sp ety $ \b ->
+      B2Body.setLinearVelocity b v
+
+instance (MonadIO m) => ExplMembers m (B2Space Velocity) where
+  explMembers = bodyMembers
+
+-- | A 'Body'\'s rotation, in radians.
+newtype Angle = Angle Float
+  deriving (Eq, Show)
+
+instance Component Angle where
+  type Storage Angle = B2Space Angle
+
+instance (MonadIO m, Has w m Physics) => Has w m Angle where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space Angle) where
+  explExists = bodyExists
+  explGet sp ety =
+    liftIO $
+      withBody sp ety $
+        fmap (Angle . rotGetAngle) . B2Body.getRotation
+
+instance (MonadIO m) => ExplSet m (B2Space Angle) where
+  explSet sp ety (Angle theta) = liftIO $
+    overBody sp ety $ \b -> do
+      pos <- B2Body.getPosition b
+      rot <- makeRot theta
+      B2Body.setTransform b pos rot
+
+instance (MonadIO m) => ExplMembers m (B2Space Angle) where
+  explMembers = bodyMembers
+
+-- | A 'Body'\'s angular velocity, in radians per second.
+newtype AngularVelocity = AngularVelocity Float
+  deriving (Eq, Show)
+
+instance Component AngularVelocity where
+  type Storage AngularVelocity = B2Space AngularVelocity
+
+instance (MonadIO m, Has w m Physics) => Has w m AngularVelocity where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space AngularVelocity) where
+  explExists = bodyExists
+  explGet sp ety =
+    liftIO $
+      withBody sp ety $
+        fmap AngularVelocity . B2Body.getAngularVelocity
+
+instance (MonadIO m) => ExplSet m (B2Space AngularVelocity) where
+  explSet sp ety (AngularVelocity omega) = liftIO $
+    overBody sp ety $ \b ->
+      B2Body.setAngularVelocity b omega
+
+instance (MonadIO m) => ExplMembers m (B2Space AngularVelocity) where
+  explMembers = bodyMembers
+
+{- | The mass of a 'Body'. Read-only: Box2D computes it from the attached
+shapes' densities.
+-}
+newtype BodyMass = BodyMass Float
+  deriving (Eq, Show)
+
+instance Component BodyMass where
+  type Storage BodyMass = B2Space BodyMass
+
+instance (MonadIO m, Has w m Physics) => Has w m BodyMass where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space BodyMass) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap BodyMass . B2Body.getMass
+
+instance (MonadIO m) => ExplMembers m (B2Space BodyMass) where
+  explMembers = bodyMembers
+
+{- | Write-only: setting it applies a force to the 'Body'\'s center.
+Forces are additive and reset by the next 'stepPhysics'.
+-}
+newtype Force = Force WVec
+  deriving (Eq, Show)
+
+instance Component Force where
+  type Storage Force = B2Space Force
+
+instance (MonadIO m, Has w m Physics) => Has w m Force where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplSet m (B2Space Force) where
+  explSet sp ety (Force v) = liftIO $
+    overBody sp ety $ \b ->
+      B2Body.applyForceToCenter b v True
+
+{- | Write-only: setting it applies a torque to the 'Body'. Torques are
+additive and reset by the next 'stepPhysics'.
+-}
+newtype Torque = Torque Float
+  deriving (Eq, Show)
+
+instance Component Torque where
+  type Storage Torque = B2Space Torque
+
+instance (MonadIO m, Has w m Physics) => Has w m Torque where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplSet m (B2Space Torque) where
+  explSet sp ety (Torque t) = liftIO $
+    overBody sp ety $
+      \b -> B2Body.applyTorque b t True
+
+-- | Write-only: setting it applies an impulse to the 'Body'\'s center.
+newtype LinearImpulse = LinearImpulse WVec
+  deriving (Eq, Show)
+
+instance Component LinearImpulse where
+  type Storage LinearImpulse = B2Space LinearImpulse
+
+instance (MonadIO m, Has w m Physics) => Has w m LinearImpulse where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplSet m (B2Space LinearImpulse) where
+  explSet sp ety (LinearImpulse v) = liftIO $
+    overBody sp ety $ \b ->
+      B2Body.applyLinearImpulseToCenter b v True
+
+-- | Write-only: setting it applies an angular impulse to the 'Body'.
+newtype AngularImpulse = AngularImpulse Float
+  deriving (Eq, Show)
+
+instance Component AngularImpulse where
+  type Storage AngularImpulse = B2Space AngularImpulse
+
+instance (MonadIO m, Has w m Physics) => Has w m AngularImpulse where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplSet m (B2Space AngularImpulse) where
+  explSet sp ety (AngularImpulse i) = liftIO $
+    overBody sp ety $ \b ->
+      B2Body.applyAngularImpulse b i True
+
+-- | A 'Body'\'s linear velocity damping.
+newtype LinearDamping = LinearDamping Float
+  deriving (Eq, Show)
+
+instance Component LinearDamping where
+  type Storage LinearDamping = B2Space LinearDamping
+
+instance (MonadIO m, Has w m Physics) => Has w m LinearDamping where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space LinearDamping) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap LinearDamping . B2Body.getLinearDamping
+
+instance (MonadIO m) => ExplSet m (B2Space LinearDamping) where
+  explSet sp ety (LinearDamping d) = liftIO $
+    overBody sp ety $ \b ->
+      B2Body.setLinearDamping b d
+
+instance (MonadIO m) => ExplMembers m (B2Space LinearDamping) where
+  explMembers = bodyMembers
+
+-- | A 'Body'\'s angular velocity damping.
+newtype AngularDamping = AngularDamping Float
+  deriving (Eq, Show)
+
+instance Component AngularDamping where
+  type Storage AngularDamping = B2Space AngularDamping
+
+instance (MonadIO m, Has w m Physics) => Has w m AngularDamping where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space AngularDamping) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap AngularDamping . B2Body.getAngularDamping
+
+instance (MonadIO m) => ExplSet m (B2Space AngularDamping) where
+  explSet sp ety (AngularDamping d) = liftIO $
+    overBody sp ety $ \b ->
+      B2Body.setAngularDamping b d
+
+instance (MonadIO m) => ExplMembers m (B2Space AngularDamping) where
+  explMembers = bodyMembers
+
+-- | How strongly gravity affects a 'Body'; 1 is normal, 0 disables it.
+newtype GravityScale = GravityScale Float
+  deriving (Eq, Show)
+
+instance Component GravityScale where
+  type Storage GravityScale = B2Space GravityScale
+
+instance (MonadIO m, Has w m Physics) => Has w m GravityScale where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space GravityScale) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap GravityScale . B2Body.getGravityScale
+
+instance (MonadIO m) => ExplSet m (B2Space GravityScale) where
+  explSet sp ety (GravityScale g) = liftIO $
+    overBody sp ety $ \b ->
+      B2Body.setGravityScale b g
+
+instance (MonadIO m) => ExplMembers m (B2Space GravityScale) where
+  explMembers = bodyMembers
+
+-- Shape ---------------------------------------------------------------------
+
+-- | Shape geometry in body-local coordinates.
+data Geometry
+  = -- | Center and radius.
+    GeoCircle BVec Float
+  | -- | The two centers and the radius around the segment between them.
+    GeoCapsule BVec BVec Float
+  | -- | A two-sided line segment.
+    GeoSegment BVec BVec
+  | -- | An axis-aligned box from half-width and half-height.
+    GeoBox Float Float
+  | {- | The convex hull of 3 to 'B2T.maxPolygonVertices' points. Setting
+    an out-of-range or degenerate (collinear) point set raises an error.
+    -}
+    GeoPolygon (VS.Vector Vec2)
+  deriving (Eq, Show)
+
+{- | Gives an entity a collision shape attached to the 'Body' of the given
+entity (which may be the same entity). Carries the sub-components
+'Density', 'Friction' and 'Elasticity'; re-setting the geometry
+preserves them. Reads return the exact value written; geometry mutated
+through the raw engine is not reflected.
+-}
+data Shape = Shape Entity Geometry
+  deriving (Eq, Show)
+
+instance Component Shape where
+  type Storage Shape = B2Space Shape
+
+instance (MonadIO m, Has w m Physics) => Has w m Shape where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplSet m (B2Space Shape) where
+  explSet sp ety shape@(Shape (Entity bEty) geo) = liftIO $
+    overBody sp bEty $ \b -> do
+      old <- IM.lookup ety <$> readIORef (spShapes sp)
+      -- carry the material state over the recreate; the old shape is only
+      -- destroyed after the new one exists, so a failed create (e.g. a bad
+      -- polygon) leaves everything intact
+      sd <- case old of
+        Nothing -> pure (spShapeDef sp)
+        Just (ShapeRecord s _) -> do
+          material <- B2Shape.getSurfaceMaterial s
+          density <- B2Shape.getDensity s
+          filtr <- B2Shape.getFilter s
+          pure
+            (spShapeDef sp)
+              { B2T.shapeDefMaterial = material
+              , B2T.shapeDefDensity = density
+              , B2T.shapeDefFilter = filtr
+              }
+      s <- case geo of
+        GeoCircle c r -> B2Shape.createCircle b sd (B2T.Circle c r)
+        GeoCapsule c1 c2 r -> B2Shape.createCapsule b sd (B2T.Capsule c1 c2 r)
+        GeoSegment p1 p2 -> B2Shape.createSegment b sd (B2T.Segment p1 p2)
+        GeoBox hw hh -> B2Collision.makeBox hw hh >>= B2Shape.createPolygon b sd
+        GeoPolygon pts -> do
+          let n = VS.length pts
+          when (n < 3 || n > B2T.maxPolygonVertices) $
+            error ("GeoPolygon needs 3 to " <> show B2T.maxPolygonVertices <> " points, got " <> show n)
+          hull <- VS.unsafeWith pts $ \p -> B2Collision.computeHull p n
+          when (VS.length (B2T.hullPoints hull) < 3) $
+            error "GeoPolygon points are degenerate (collinear or coincident)"
+          B2Collision.makePolygon hull 0 >>= B2Shape.createPolygon b sd
+      setUserIndex s ety
+      forM_ old $ \(ShapeRecord s' _) -> B2Shape.destroy s' True
+      modifyIORef' (spShapes sp) (IM.insert ety (ShapeRecord s shape))
+
+instance (MonadIO m) => ExplGet m (B2Space Shape) where
+  explExists = shapeExists
+  explGet sp ety = liftIO $
+    withReg "Shape" (spShapes sp) ety $
+      \(ShapeRecord _ shape) -> pure shape
+
+instance (MonadIO m) => ExplDestroy m (B2Space Shape) where
+  explDestroy sp ety = liftIO $ do
+    shapes <- readIORef (spShapes sp)
+    forM_ (IM.lookup ety shapes) $ \(ShapeRecord s _) -> do
+      modifyIORef' (spShapes sp) (IM.delete ety)
+      B2Shape.destroy s True
+
+instance (MonadIO m) => ExplMembers m (B2Space Shape) where
+  explMembers = shapeMembers
+
+-- | The raw Box2D shape of an entity, for use with "Box2D.Shape" directly.
+newtype B2ShapeId = B2ShapeId ShapeId
+  deriving (Eq, Show)
+
+instance Component B2ShapeId where
+  type Storage B2ShapeId = B2Space B2ShapeId
+
+instance (MonadIO m, Has w m Physics) => Has w m B2ShapeId where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space B2ShapeId) where
+  explExists = shapeExists
+  explGet sp ety = liftIO $ withShape sp ety (pure . B2ShapeId)
+
+instance (MonadIO m) => ExplMembers m (B2Space B2ShapeId) where
+  explMembers = shapeMembers
+
+-- Shape sub-components -----------------------------------------------------
+
+-- | The density of a 'Shape'. Setting it updates the body's mass.
+newtype Density = Density Float
+  deriving (Eq, Show)
+
+instance Component Density where
+  type Storage Density = B2Space Density
+
+instance (MonadIO m, Has w m Physics) => Has w m Density where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space Density) where
+  explExists = shapeExists
+  explGet sp ety = liftIO $ withShape sp ety $ fmap Density . B2Shape.getDensity
+
+instance (MonadIO m) => ExplSet m (B2Space Density) where
+  explSet sp ety (Density d) = liftIO $
+    overShape sp ety $
+      \s -> B2Shape.setDensity s d True
+
+instance (MonadIO m) => ExplMembers m (B2Space Density) where
+  explMembers = shapeMembers
+
+-- | The friction coefficient of a 'Shape'.
+newtype Friction = Friction Float
+  deriving (Eq, Show)
+
+instance Component Friction where
+  type Storage Friction = B2Space Friction
+
+instance (MonadIO m, Has w m Physics) => Has w m Friction where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space Friction) where
+  explExists = shapeExists
+  explGet sp ety = liftIO $ withShape sp ety $ fmap Friction . B2Shape.getFriction
+
+instance (MonadIO m) => ExplSet m (B2Space Friction) where
+  explSet sp ety (Friction f) = liftIO $
+    overShape sp ety $
+      \s -> B2Shape.setFriction s f
+
+instance (MonadIO m) => ExplMembers m (B2Space Friction) where
+  explMembers = shapeMembers
+
+-- | The elasticity of a 'Shape' (Box2D calls this restitution).
+newtype Elasticity = Elasticity Float
+  deriving (Eq, Show)
+
+instance Component Elasticity where
+  type Storage Elasticity = B2Space Elasticity
+
+instance (MonadIO m, Has w m Physics) => Has w m Elasticity where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space Elasticity) where
+  explExists = shapeExists
+  explGet sp ety = liftIO $ withShape sp ety $ fmap Elasticity . B2Shape.getRestitution
+
+instance (MonadIO m) => ExplSet m (B2Space Elasticity) where
+  explSet sp ety (Elasticity e) = liftIO $
+    overShape sp ety $
+      \s -> B2Shape.setRestitution s e
+
+instance (MonadIO m) => ExplMembers m (B2Space Elasticity) where
+  explMembers = shapeMembers
+
+-- | The collision 'Filter' of a 'Shape' (category, mask, group).
+newtype CollisionFilter = CollisionFilter Filter
+  deriving (Eq, Show)
+
+instance Component CollisionFilter where
+  type Storage CollisionFilter = B2Space CollisionFilter
+
+instance (MonadIO m, Has w m Physics) => Has w m CollisionFilter where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space CollisionFilter) where
+  explExists = shapeExists
+  explGet sp ety = liftIO $ withShape sp ety $ fmap CollisionFilter . B2Shape.getFilter
+
+instance (MonadIO m) => ExplSet m (B2Space CollisionFilter) where
+  explSet sp ety (CollisionFilter f) = liftIO $
+    overShape sp ety $
+      \s -> B2Shape.setFilter s f
+
+instance (MonadIO m) => ExplMembers m (B2Space CollisionFilter) where
+  explMembers = shapeMembers
+
+-- Joint ----------------------------------------------------------------------
+
+{- | A joint between two bodies, specified in world space at creation
+time. Joint frames are derived from the given world points with zero
+reference rotation.
+-}
+data JointSpec
+  = -- | A revolute joint: the bodies rotate around a shared world point.
+    PivotJoint WVec
+  | -- | Keeps the two world anchor points at their current distance.
+    DistanceJoint WVec WVec
+  | -- | Rigidly welds the bodies together at a world point.
+    WeldJoint WVec
+  | {- | A damped spring between two world anchors, resting at their
+    current distance: stiffness in Hertz and a damping ratio.
+    -}
+    SpringJoint WVec WVec Float Float
+  | -- | The anchor distance moves freely between a minimum and maximum.
+    SlideJoint WVec WVec Float Float
+  | {- | A pivot with an angular spring back to the creation orientation:
+    stiffness in Hertz and a damping ratio.
+    -}
+    RotarySpringJoint WVec Float Float
+  | -- | A pivot with the relative angle limited to (lower, upper) radians.
+    RotaryLimitJoint WVec Float Float
+  | {- | A motorised pivot driving the relative angle at a speed (radians
+    per second) with a maximum torque.
+    -}
+    MotorJoint WVec Float Float
+  deriving (Eq, Show)
+
+{- | Gives an entity a joint connecting the 'Body's of the two given
+entities. Reads return the exact value written.
+-}
+data Joint = Joint Entity Entity JointSpec
+  deriving (Eq, Show)
+
+instance Component Joint where
+  type Storage Joint = B2Space Joint
+
+instance (MonadIO m, Has w m Physics) => Has w m Joint where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+-- | A joint frame at a world point, with zero rotation in world space.
+frameAt :: BodyId -> Vec2 -> IO Transform
+frameAt b p = do
+  local <- B2Body.getLocalPoint b p
+  Rot c s <- B2Body.getRotation b
+  pure (Transform local (Rot c (-s)))
+
+{- | Fill a joint def's base with the two bodies and their frames at a
+shared world anchor.
+-}
+baseAt :: B2T.JointDef -> BodyId -> BodyId -> Vec2 -> IO B2T.JointDef
+baseAt jd a b p = do
+  fa <- frameAt a p
+  fb <- frameAt b p
+  pure
+    jd
+      { B2T.jointDefBodyIdA = a
+      , B2T.jointDefBodyIdB = b
+      , B2T.jointDefLocalFrameA = fa
+      , B2T.jointDefLocalFrameB = fb
+      }
+
+createJoint :: WorldId -> BodyId -> BodyId -> JointSpec -> IO JointId
+createJoint w a b spec = case spec of
+  PivotJoint p -> revoluteAt p id
+  RotarySpringJoint p hertz damping ->
+    revoluteAt p $ \jd ->
+      jd
+        { B2T.revoluteJointDefEnableSpring = 1
+        , B2T.revoluteJointDefHertz = hertz
+        , B2T.revoluteJointDefDampingRatio = damping
+        }
+  RotaryLimitJoint p lower upper ->
+    revoluteAt p $ \jd ->
+      jd
+        { B2T.revoluteJointDefEnableLimit = 1
+        , B2T.revoluteJointDefLowerAngle = lower
+        , B2T.revoluteJointDefUpperAngle = upper
+        }
+  MotorJoint p speed maxTorque ->
+    revoluteAt p $ \jd ->
+      jd
+        { B2T.revoluteJointDefEnableMotor = 1
+        , B2T.revoluteJointDefMotorSpeed = speed
+        , B2T.revoluteJointDefMaxMotorTorque = maxTorque
+        }
+  DistanceJoint pA pB -> distanceAt pA pB id
+  SpringJoint pA pB hertz damping ->
+    distanceAt pA pB $ \jd ->
+      jd
+        { B2T.distanceJointDefEnableSpring = 1
+        , B2T.distanceJointDefHertz = hertz
+        , B2T.distanceJointDefDampingRatio = damping
+        }
+  SlideJoint pA pB minLen maxLen ->
+    -- a zero-stiffness spring exerts no force, leaving the distance free
+    -- within the enabled limits
+    distanceAt pA pB $ \jd ->
+      jd
+        { B2T.distanceJointDefEnableSpring = 1
+        , B2T.distanceJointDefHertz = 0
+        , B2T.distanceJointDefEnableLimit = 1
+        , B2T.distanceJointDefMinLength = minLen
+        , B2T.distanceJointDefMaxLength = maxLen
+        }
+  WeldJoint p -> do
+    jd <- B2T.defaultWeldJointDef
+    base <- baseAt (B2T.weldJointDefBase jd) a b p
+    B2WeldJoint.create w jd{B2T.weldJointDefBase = base}
+  where
+    revoluteAt p f = do
+      jd <- B2T.defaultRevoluteJointDef
+      base <- baseAt (B2T.revoluteJointDefBase jd) a b p
+      B2RevoluteJoint.create w (f jd){B2T.revoluteJointDefBase = base}
+    distanceAt pA pB f = do
+      jd <- B2T.defaultDistanceJointDef
+      fa <- frameAt a pA
+      fb <- frameAt b pB
+      let
+        Vec2 x1 y1 = pA
+        Vec2 x2 y2 = pB
+        len = sqrt ((x2 - x1) ^ (2 :: Int) + (y2 - y1) ^ (2 :: Int))
+        base =
+          (B2T.distanceJointDefBase jd)
+            { B2T.jointDefBodyIdA = a
+            , B2T.jointDefBodyIdB = b
+            , B2T.jointDefLocalFrameA = fa
+            , B2T.jointDefLocalFrameB = fb
+            }
+      B2DistanceJoint.create w (f jd){B2T.distanceJointDefBase = base, B2T.distanceJointDefLength = len}
+
+instance (MonadIO m) => ExplSet m (B2Space Joint) where
+  explSet sp ety joint@(Joint (Entity aEty) (Entity bEty) spec) = liftIO $ do
+    bodies <- readIORef (spBodies sp)
+    forM_ ((,) <$> IM.lookup aEty bodies <*> IM.lookup bEty bodies) $ \(a, b) -> do
+      old <- IM.lookup ety <$> readIORef (spJoints sp)
+      j <- createJoint (spWorld sp) a b spec
+      setUserIndex j ety
+      forM_ old $ \(JointRecord j' _) -> B2Joint.destroy j' True
+      modifyIORef' (spJoints sp) (IM.insert ety (JointRecord j joint))
+
+instance (MonadIO m) => ExplGet m (B2Space Joint) where
+  explExists = jointExists
+  explGet sp ety = liftIO $
+    withReg "Joint" (spJoints sp) ety $
+      \(JointRecord _ joint) -> pure joint
+
+instance (MonadIO m) => ExplDestroy m (B2Space Joint) where
+  explDestroy sp ety = liftIO $ do
+    joints <- readIORef (spJoints sp)
+    forM_ (IM.lookup ety joints) $ \(JointRecord j _) -> do
+      modifyIORef' (spJoints sp) (IM.delete ety)
+      B2Joint.destroy j True
+
+instance (MonadIO m) => ExplMembers m (B2Space Joint) where
+  explMembers = jointMembers
+
+-- | The raw Box2D joint of an entity, for use with the joint modules.
+newtype B2JointId = B2JointId JointId
+  deriving (Eq, Show)
+
+instance Component B2JointId where
+  type Storage B2JointId = B2Space B2JointId
+
+instance (MonadIO m, Has w m Physics) => Has w m B2JointId where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space B2JointId) where
+  explExists = jointExists
+  explGet sp ety = liftIO $ withJoint sp ety (pure . B2JointId)
+
+instance (MonadIO m) => ExplMembers m (B2Space B2JointId) where
+  explMembers = jointMembers
