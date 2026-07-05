@@ -132,7 +132,7 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
 - [x] **Body-move events global (`Moved`).** Efficient render-sync (only
   bodies that actually moved, with sleep flag) instead of iterating every
   `Position`. Upstream: `Events.bodyMoveEvents`. (S)
-- [ ] **Recording / replay / snapshots.** `World.startRecording/stopRecording`,
+- [x] **Recording / replay / snapshots.** `World.startRecording/stopRecording`,
   `Collision.saveRecordingToFile/loadRecordingFromFile/validateReplay`,
   `RecPlayer`, and [2D-only] `World.snapshot/restore/createFromSnapshot`.
   High value for *this repo's* demo-verification workflow (deterministic
