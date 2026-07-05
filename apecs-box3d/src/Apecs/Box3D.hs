@@ -41,6 +41,8 @@ module Apecs.Box3D
   , Torque (..)
   , LinearImpulse (..)
   , AngularImpulse (..)
+  , ForceAt (..)
+  , ImpulseAt (..)
   , LinearDamping (..)
   , AngularDamping (..)
   , GravityScale (..)
@@ -573,6 +575,41 @@ instance (MonadIO m) => ExplSet m (B3Space AngularImpulse) where
   explSet sp ety (AngularImpulse i) = liftIO $
     overBody sp ety $ \b ->
       B3Body.applyAngularImpulse b i True
+
+{- | Write-only: setting it applies a force to the 'Body' at a world
+point; applying off the center of mass also induces spin. Forces are
+additive and reset by the next 'stepPhysics'.
+-}
+data ForceAt = ForceAt WVec WVec
+  deriving (Eq, Show)
+
+instance Component ForceAt where
+  type Storage ForceAt = B3Space ForceAt
+
+instance (MonadIO m, Has w m Physics) => Has w m ForceAt where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplSet m (B3Space ForceAt) where
+  explSet sp ety (ForceAt v p) = liftIO $
+    overBody sp ety $ \b ->
+      B3Body.applyForce b v p True
+
+{- | Write-only: setting it applies an impulse to the 'Body' at a world
+point; applying off the center of mass also induces spin.
+-}
+data ImpulseAt = ImpulseAt WVec WVec
+  deriving (Eq, Show)
+
+instance Component ImpulseAt where
+  type Storage ImpulseAt = B3Space ImpulseAt
+
+instance (MonadIO m, Has w m Physics) => Has w m ImpulseAt where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplSet m (B3Space ImpulseAt) where
+  explSet sp ety (ImpulseAt v p) = liftIO $
+    overBody sp ety $ \b ->
+      B3Body.applyLinearImpulse b v p True
 
 -- | A 'Body'\'s linear velocity damping.
 newtype LinearDamping = LinearDamping Float
