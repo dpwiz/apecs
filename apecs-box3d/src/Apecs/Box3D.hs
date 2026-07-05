@@ -63,6 +63,9 @@ module Apecs.Box3D
 
     -- * Shape
   , Geometry (..)
+  , Mesh
+  , HeightField
+  , Hull
   , Shape (..)
   , Density (..)
   , Friction (..)
@@ -71,6 +74,19 @@ module Apecs.Box3D
   , Sensor (..)
   , Filter (..)
   , B3ShapeId (..)
+
+    -- * Static geometry
+  , boxMesh
+  , hollowBoxMesh
+  , platformMesh
+  , gridMesh
+  , torusMesh
+  , waveMesh
+  , gridHeightField
+  , waveHeightField
+  , rockHull
+  , coneHull
+  , cylinderHull
 
     -- * Joint
   , JointSpec (..)
@@ -122,25 +138,41 @@ import Data.List (sortOn)
 import Data.Maybe (catMaybes)
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
+import Foreign.Concurrent qualified as Concurrent
+import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (fromBool, toBool)
-import Foreign.Ptr (nullPtr)
+import Foreign.Ptr (Ptr, nullPtr)
 
 import Box3D.Body qualified as B3Body
+import Box3D.BoxMesh qualified as B3BoxMesh
 import Box3D.Callbacks (withCastResultFcn, withOverlapResultFcn)
+import Box3D.Cone qualified as B3Cone
+import Box3D.Cylinder qualified as B3Cylinder
 import Box3D.DistanceJoint qualified as B3DistanceJoint
 import Box3D.Events qualified as B3Events
+import Box3D.Grid qualified as B3Grid
+import Box3D.GridMesh qualified as B3GridMesh
+import Box3D.HeightField qualified as B3HeightField
+import Box3D.HollowBoxMesh qualified as B3HollowBoxMesh
 import Box3D.Hull qualified as B3Hull
 import Box3D.Id (BodyId, JointId, ShapeId, WorldId)
 import Box3D.Joint qualified as B3Joint
 import Box3D.MathFunctions (computeQuatBetweenUnitVectors)
 import Box3D.MathTypes (AABB (..), Quat (..), Transform (..), Vec3 (..), quatIdentity, vec3Zero)
+import Box3D.Mesh qualified as B3Mesh
+import Box3D.PlatformMesh qualified as B3PlatformMesh
 import Box3D.PrismaticJoint qualified as B3PrismaticJoint
 import Box3D.RevoluteJoint qualified as B3RevoluteJoint
+import Box3D.Rock qualified as B3Rock
 import Box3D.Shape qualified as B3Shape
 import Box3D.SphericalJoint qualified as B3SphericalJoint
+import Box3D.Tags (HeightFieldData, HullData, MeshData)
+import Box3D.TorusMesh qualified as B3TorusMesh
 import Box3D.Types (Filter (..))
 import Box3D.Types qualified as B3T
 import Box3D.UserData (getUserIndex, setUserIndex)
+import Box3D.Wave qualified as B3Wave
+import Box3D.WaveMesh qualified as B3WaveMesh
 import Box3D.WeldJoint qualified as B3WeldJoint
 import Box3D.WheelJoint qualified as B3WheelJoint
 import Box3D.World qualified as B3World
@@ -1048,6 +1080,49 @@ instance (MonadIO m) => ExplMembers m (B3Space SleepThreshold) where
 
 -- Shape ---------------------------------------------------------------------
 
+{- | Wrap a freshly generated engine data pointer in a 'ForeignPtr' whose
+finalizer destroys it, and hand it to GC: once the last 'Shape' (and the
+last user binding) referencing it is gone, the finalizer runs and frees
+the engine-side data. Errors immediately, without allocating a
+'ForeignPtr', if the generator rejected its parameters and returned a
+null pointer.
+-}
+wrapGenerated :: String -> (Ptr a -> IO ()) -> IO (Ptr a) -> IO (ForeignPtr a)
+wrapGenerated what destroyIt gen = do
+  p <- gen
+  when (p == nullPtr) $
+    error (what <> ": the engine rejected the parameters (returned a null pointer)")
+  Concurrent.newForeignPtr p (destroyIt p)
+
+{- | Shared triangle-mesh collision data, produced by the mesh generators
+('boxMesh', 'hollowBoxMesh', 'platformMesh', 'gridMesh', 'torusMesh',
+'waveMesh'). A 'GeoMesh' shape references this data instead of cloning
+it, so the same 'Mesh' can be shared between shapes at different
+per-shape scales. The underlying engine mesh is destroyed automatically
+once no 'Shape' (and no user binding) references it any more.
+-}
+newtype Mesh = Mesh (ForeignPtr MeshData)
+  deriving (Eq, Show)
+
+{- | Shared height-field collision data, produced by 'gridHeightField' and
+'waveHeightField'. A 'GeoHeightField' shape references this data
+instead of cloning it, so the same 'HeightField' can be shared between
+shapes. The underlying engine height field is destroyed automatically
+once no 'Shape' (and no user binding) references it any more.
+-}
+newtype HeightField = HeightField (ForeignPtr HeightFieldData)
+  deriving (Eq, Show)
+
+{- | A pre-built convex hull, produced by 'rockHull', 'coneHull' or
+'cylinderHull'. Unlike mesh and height-field data, the engine clones a
+hull into the shape at creation time, so the handle only needs to stay
+alive until the shape referencing it (a 'GeoReadyHull') is created; the
+underlying engine hull is destroyed automatically once no 'Shape' (and
+no user binding) references it any more.
+-}
+newtype Hull = Hull (ForeignPtr HullData)
+  deriving (Eq, Show)
+
 -- | Shape geometry in body-local coordinates.
 data Geometry
   = -- | Center and radius.
@@ -1065,6 +1140,26 @@ data Geometry
     (coplanar) point set raises an error.
     -}
     GeoHull (VS.Vector Vec3)
+  | {- | A triangle mesh at a per-shape scale ('Vec3 1 1 1' for
+    unscaled). Static bodies only: mesh contacts are only generated
+    against static bodies, so attaching this to a dynamic or kinematic
+    body creates a shape with no contacts. The engine does /not/ clone
+    the mesh data the way it clones hulls — it keeps a reference to the
+    'Mesh' for as long as the engine shape exists, which is exactly why
+    'Mesh' is GC-lifetime managed; see its docs.
+    -}
+    GeoMesh Mesh Vec3
+  | {- | A height field. Static bodies only, for the same reason as
+    'GeoMesh', and likewise the engine references the 'HeightField'
+    rather than cloning it.
+    -}
+    GeoHeightField HeightField
+  | {- | A pre-built convex hull from 'rockHull', 'coneHull' or
+    'cylinderHull'. Unlike 'GeoMesh'\/'GeoHeightField', the engine
+    clones the hull data into the shape, so the 'Hull' handle only needs
+    to live until the shape is created.
+    -}
+    GeoReadyHull Hull
   deriving (Eq, Show)
 
 {- | Gives an entity a collision shape attached to the 'Body' of the given
@@ -1114,6 +1209,140 @@ createGeometry b sd geo = case geo of
   GeoCapsule c1 c2 r -> B3Shape.createCapsule b sd (B3T.Capsule c1 c2 r)
   GeoBox c half -> createHullShape "GeoBox" b sd (boxCorners c half)
   GeoHull pts -> createHullShape "GeoHull" b sd pts
+  GeoMesh (Mesh fp) scale -> withForeignPtr fp $ \p -> B3Shape.createMesh b sd p scale
+  GeoHeightField (HeightField fp) -> withForeignPtr fp $ \p -> B3Shape.createHeightField b sd p
+  GeoReadyHull (Hull fp) -> withForeignPtr fp $ \p -> B3Shape.createHull b sd p
+
+-- Static geometry generators ------------------------------------------------
+
+{- | A solid box mesh: 12 triangles from a local center and half-extents
+along each axis (matching 'GeoBox'\'s half-extent convention). Triangle
+adjacency is always identified (see the "internal edges" note on
+'gridMesh') since there is no legitimate reason to skip it for a shape
+this small.
+-}
+boxMesh :: BVec -> Vec3 -> IO Mesh
+boxMesh center halfExtents =
+  Mesh <$> wrapGenerated "boxMesh" B3Mesh.destroy (B3BoxMesh.create center halfExtents True)
+
+{- | A hollow box mesh: the same box as 'boxMesh' but with every triangle's
+winding reversed, so its inside faces are solid and its outside is
+open — a box-shaped room instead of a box-shaped solid.
+-}
+hollowBoxMesh :: BVec -> Vec3 -> IO Mesh
+hollowBoxMesh center halfExtents =
+  Mesh <$> wrapGenerated "hollowBoxMesh" B3Mesh.destroy (B3HollowBoxMesh.create center halfExtents)
+
+{- | A platform mesh: a truncated pyramid (frustum) centered locally on
+'center', with a 'topWidth' square face at +height\/2 and a
+'bottomWidth' square face at -height\/2.
+-}
+platformMesh :: BVec -> Float -> Float -> Float -> IO Mesh
+platformMesh center height topWidth bottomWidth =
+  Mesh <$> wrapGenerated "platformMesh" B3Mesh.destroy (B3PlatformMesh.create center height topWidth bottomWidth)
+
+{- | A flat grid mesh of @xCount * zCount@ cells (each 'cellWidth' wide) in
+the local XZ plane, centered on the origin. 'materialCount' round-robins
+the triangles across that many per-shape material slots for
+'B3Shape.setMeshMaterial' (0 or 1 for a single material). Triangle
+adjacency is always identified: this flags shared edges between
+coplanar (or near-coplanar) triangles as non-colliding "internal
+edges", which is what stops a ball or capsule from catching on the
+seams between a mesh's triangles as it rolls across them. There is no
+real use case for turning this off, so unlike the upstream C API this
+binding does not expose the choice.
+-}
+gridMesh :: Int -> Int -> Float -> Int -> IO Mesh
+gridMesh xCount zCount cellWidth materialCount =
+  Mesh <$> wrapGenerated "gridMesh" B3Mesh.destroy (B3GridMesh.create xCount zCount cellWidth materialCount True)
+
+{- | A torus mesh centered on the origin, its main ring lying in the local
+XY plane (the tube's axis is local Z). 'radialResolution' is the number
+of segments around the tube's circular cross-section and
+'tubularResolution' is the number of segments around the main ring;
+'radius' is the distance from the origin to the tube's center line and
+'thickness' is the tube's cross-section radius.
+-}
+torusMesh :: Int -> Int -> Float -> Float -> IO Mesh
+torusMesh radialResolution tubularResolution radius thickness =
+  Mesh <$> wrapGenerated "torusMesh" B3Mesh.destroy (B3TorusMesh.create radialResolution tubularResolution radius thickness)
+
+{- | A wavy grid mesh like 'gridMesh', with the vertex at row @ix@, column
+@iz@ (0-based, along local x and z respectively) displaced to height
+@amplitude * sin (2*pi*columnFrequency*cellWidth*ix) * sin
+(2*pi*rowFrequency*cellWidth*iz)@. Note this is /not/ a typo in this
+binding: in the upstream generator, 'columnFrequency' is the frequency
+along x and 'rowFrequency' is the frequency along z — the reverse of
+what the names suggest. Triangle adjacency is always identified, as
+for 'gridMesh'.
+-}
+waveMesh :: Int -> Int -> Float -> Float -> Float -> Float -> IO Mesh
+waveMesh xCount zCount cellWidth amplitude rowFrequency columnFrequency =
+  Mesh
+    <$> wrapGenerated
+      "waveMesh"
+      B3Mesh.destroy
+      (B3WaveMesh.create xCount zCount cellWidth amplitude rowFrequency columnFrequency)
+
+{- | A flat height-field grid of 'rowCount' * 'columnCount' samples.
+'scale' converts grid index space to local space: index spacing along
+x is @scale@\'s x component, spacing along z is its z component, and
+sample heights (all zero for a flat grid) are multiplied by its y
+component. Unlike the mesh generators, a height field's local origin
+is a corner (grid index @(0, 0)@), not its center.
+
+When 'makeHoles' is true, every 16th cell (by row-major index,
+starting at the 16th) is punched out as a hole shapes fall through —
+a fixed test pattern baked into the upstream generator, not a
+configurable spacing; use 'gridMesh'\/a custom 'GeoMesh' instead if you
+need holes somewhere specific.
+-}
+gridHeightField :: Int -> Int -> Vec3 -> Bool -> IO HeightField
+gridHeightField rowCount columnCount scale makeHoles =
+  HeightField <$> wrapGenerated "gridHeightField" B3HeightField.destroy (B3Grid.create rowCount columnCount scale makeHoles)
+
+{- | A wavy height-field grid like 'gridHeightField', with the sample at
+row @i@, column @j@ (0-based, in grid index space) set to
+@sin (2*pi*rowFrequency*i) * sin (2*pi*columnFrequency*j)@ — unlike
+'waveMesh', these frequencies are cycles per grid cell, not per local
+unit. Raw samples are therefore always in @[-1, 1]@; scale the result
+in local space with 'scale'\'s y component. 'makeHoles' is as in
+'gridHeightField'.
+-}
+waveHeightField :: Int -> Int -> Vec3 -> Float -> Float -> Bool -> IO HeightField
+waveHeightField rowCount columnCount scale rowFrequency columnFrequency makeHoles =
+  HeightField
+    <$> wrapGenerated
+      "waveHeightField"
+      B3HeightField.destroy
+      (B3Wave.create rowCount columnCount scale rowFrequency columnFrequency makeHoles)
+
+{- | A rock-shaped convex hull: 10 points spread over a sphere of the given
+radius by a Fibonacci lattice, giving an irregular but bounded hull
+useful for scatter/debris. Errors if the points come out degenerate
+(e.g. 'radius' is zero, collapsing them to a point).
+-}
+rockHull :: Float -> IO Hull
+rockHull radius =
+  Hull <$> wrapGenerated "rockHull" B3Hull.destroy (B3Rock.create radius)
+
+{- | A tessellated cone as a convex hull: a 'radius1' circle at local y 0
+and a 'radius2' circle at local y 'height', joined by 'slices' sides
+(the engine clamps this to [4, 32]). Equal radii give a cylinder-like
+shape, but prefer 'cylinderHull' for that since it also supports an
+axial offset.
+-}
+coneHull :: Float -> Float -> Float -> Int -> IO Hull
+coneHull height radius1 radius2 slices =
+  Hull <$> wrapGenerated "coneHull" B3Hull.destroy (B3Cone.create height radius1 radius2 slices)
+
+{- | A tessellated cylinder as a convex hull: 'radius' circles at local y
+'yOffset' and 'yOffset' + 'height', joined by 'sides' sides (the engine
+clamps this to [3, 32]).
+-}
+cylinderHull :: Float -> Float -> Float -> Int -> IO Hull
+cylinderHull height radius yOffset sides =
+  Hull <$> wrapGenerated "cylinderHull" B3Hull.destroy (B3Cylinder.create height radius yOffset sides)
 
 {- | A shape def with the surface material, density and filter carried
 over from the shape being replaced, if any.

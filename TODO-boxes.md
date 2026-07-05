@@ -97,7 +97,7 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
   point of motors — currently requires the raw escape hatch. Needs a small
   per-type dispatch on the stored `JointSpec`. `CollideConnected` also restores
   apecs-physics `CollideBodies` parity. (M)
-- [ ] **[3D] Static world geometry: `GeoMesh`, `GeoHeightField`, `GeoCompound`.**
+- [x] **[3D] Static world geometry: `GeoMesh`, `GeoHeightField`, `GeoCompound`.**
   A 3D physics binding without triangle meshes or heightfields cannot load a
   level; this is the biggest absolute gap. Upstream: `Shape.createMesh/
   createHeightField/createCompound` plus data lifecycles (`Mesh.create/destroy`,
@@ -106,6 +106,11 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
   `Cylinder`, `Grid`, `Wave`, ...). Box3D owns
   `MeshData` (shared between shapes?) — suggest a `ShapeRecord`-style
   refcounted registry, generators exposed as plain `IO Geometry` helpers. (L)
+  *Done as `GeoMesh`/`GeoHeightField`/`GeoReadyHull` over GC-managed
+  `Mesh`/`HeightField`/`Hull` handles (the `ShapeRecord` registry keeps the
+  ForeignPtr alive while any shape uses it) plus all procedural generators.
+  `GeoCompound` deferred: `CompoundDef` is an opaque tag in box-nd with no
+  Haskell constructor, same upstream gap as `ShapeProxy`.*
 - [ ] **Character mover support: `castMover`/`collideMover`/`solvePlanes`.**
   The engine-blessed kinematic character controller; platformers and
   first-person demos need it and hand-rolling it via rays is much worse.
