@@ -83,6 +83,8 @@ module Apecs.Box2D
   , CollideConnected (..)
   , JointForce (..)
   , JointTorque (..)
+  , JointForceThreshold (..)
+  , JointTorqueThreshold (..)
   , B2JointId (..)
 
     -- * Queries
@@ -105,6 +107,7 @@ module Apecs.Box2D
   , Impacts (..)
   , SensorEvent (..)
   , SensorEvents (..)
+  , JointEvents (..)
 
     -- * Vectors
   , Vec2 (..)
@@ -1814,6 +1817,62 @@ instance (MonadIO m) => ExplGet m (B2Space JointTorque) where
 instance (MonadIO m) => ExplMembers m (B2Space JointTorque) where
   explMembers = jointMembers
 
+{- | The constraint force a 'Joint' must exceed, in Newtons, for the
+engine to report it in 'JointEvents'. Applies to every joint kind.
+Defaults to @FLT_MAX@ (effectively off) until set. The engine only
+raises the event — it never destroys the joint itself; break it (or
+lower the thresholds further) from your own systems after reading
+'JointEvents'. A joint that stays overloaded across several steps
+raises the event once per step it is exceeded in, not once overall.
+-}
+newtype JointForceThreshold = JointForceThreshold Float
+  deriving (Eq, Show)
+
+instance Component JointForceThreshold where
+  type Storage JointForceThreshold = B2Space JointForceThreshold
+
+instance (MonadIO m, Has w m Physics) => Has w m JointForceThreshold where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space JointForceThreshold) where
+  explExists = jointExists
+  explGet sp ety = liftIO $ withJoint sp ety $ fmap JointForceThreshold . B2Joint.getForceThreshold
+
+instance (MonadIO m) => ExplSet m (B2Space JointForceThreshold) where
+  explSet sp ety (JointForceThreshold t) = liftIO $
+    overJoint sp ety $
+      \j -> B2Joint.setForceThreshold j t
+
+instance (MonadIO m) => ExplMembers m (B2Space JointForceThreshold) where
+  explMembers = jointMembers
+
+{- | The constraint torque a 'Joint' must exceed, in Newton-meters, for
+the engine to report it in 'JointEvents'. Applies to every joint kind.
+Defaults to @FLT_MAX@ (effectively off) until set. As with
+'JointForceThreshold', the engine only raises the event and leaves the
+joint intact.
+-}
+newtype JointTorqueThreshold = JointTorqueThreshold Float
+  deriving (Eq, Show)
+
+instance Component JointTorqueThreshold where
+  type Storage JointTorqueThreshold = B2Space JointTorqueThreshold
+
+instance (MonadIO m, Has w m Physics) => Has w m JointTorqueThreshold where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space JointTorqueThreshold) where
+  explExists = jointExists
+  explGet sp ety = liftIO $ withJoint sp ety $ fmap JointTorqueThreshold . B2Joint.getTorqueThreshold
+
+instance (MonadIO m) => ExplSet m (B2Space JointTorqueThreshold) where
+  explSet sp ety (JointTorqueThreshold t) = liftIO $
+    overJoint sp ety $
+      \j -> B2Joint.setTorqueThreshold j t
+
+instance (MonadIO m) => ExplMembers m (B2Space JointTorqueThreshold) where
+  explMembers = jointMembers
+
 -- * Queries
 
 {- | The closest shape a 'segmentQuery' found: the shape entity, the
@@ -1861,6 +1920,25 @@ shapeEntities sp s = do
       -- read back as 0, a legitimate entity; requiring the registered
       -- engine shape to be this very shape drops them instead
       Just (ShapeRecord s' (Shape bodyEty _)) | s' == s -> Just (Entity ix, bodyEty)
+      _ -> Nothing
+
+{- | The joint entity behind an engine joint, if it is still alive and
+registered (event buffers can reference joints destroyed after the
+step).
+-}
+jointEntity :: B2Space c -> JointId -> IO (Maybe Entity)
+jointEntity sp j = do
+  alive <- B2Joint.isValid j
+  if not alive then
+    pure Nothing
+  else do
+    ix <- getUserIndex j
+    joints <- readIORef (spJoints sp)
+    pure $ case IM.lookup ix joints of
+      -- joints created through the raw engine API have no user index and
+      -- read back as 0, a legitimate entity; requiring the registered
+      -- engine joint to be this very joint drops them instead
+      Just (JointRecord j' _) | j' == j -> Just (Entity ix)
       _ -> Nothing
 
 {- | The closest shape along a world-space segment, if any. Initial
@@ -2399,3 +2477,26 @@ instance (MonadIO m) => ExplGet m (B2Space SensorEvents) where
       fmap catMaybes . forM (VS.toList ends) $ \ev ->
         toSensorEvent sp (B2T.sensorEndTouchEventSensorShapeId ev) (B2T.sensorEndTouchEventVisitorShapeId ev)
     pure (SensorEvents beginEvs endEvs)
+
+{- | The joints whose force or torque threshold ('JointForceThreshold',
+'JointTorqueThreshold') was exceeded during the last 'stepPhysics', a
+read-only global: @JointEvents overloaded <- get global@ after
+stepping. The engine leaves the joint intact — destroy the entity's
+'Joint' (or lower the thresholds) yourself if it should break. Events
+whose joints were destroyed since the step are dropped.
+-}
+newtype JointEvents = JointEvents [Entity]
+  deriving (Show)
+
+instance Component JointEvents where
+  type Storage JointEvents = B2Space JointEvents
+
+instance (MonadIO m, Has w m Physics) => Has w m JointEvents where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space JointEvents) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ do
+    evs <- B2Events.jointEvents (spWorld sp)
+    fmap (JointEvents . catMaybes) . forM (VS.toList evs) $ \ev ->
+      jointEntity sp (B2T.jointEventJointId ev)

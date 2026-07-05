@@ -118,7 +118,7 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
 
 ## P3 — Fill-ins and infrastructure (do opportunistically)
 
-- [ ] **Breakable joints: `JointForceThreshold`/`JointTorqueThreshold`
+- [x] **Breakable joints: `JointForceThreshold`/`JointTorqueThreshold`
   components + `JointEvents` global.** Upstream: `Joint.setForceThreshold/
   setTorqueThreshold`, `Events.jointEvents`. Pairs naturally with the P2
   joint-tuning work. (S once P2 joint work exists)
