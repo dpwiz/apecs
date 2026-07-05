@@ -44,6 +44,7 @@ module Apecs.Box2D
   , AngularImpulse (..)
   , ForceAt (..)
   , ImpulseAt (..)
+  , TargetTransform (..)
   , LinearDamping (..)
   , AngularDamping (..)
   , GravityScale (..)
@@ -624,6 +625,28 @@ instance (MonadIO m) => ExplSet m (B2Space ImpulseAt) where
   explSet sp ety (ImpulseAt v p) = liftIO $
     overBody sp ety $ \b ->
       B2Body.applyLinearImpulse b v p True
+
+{- | Write-only: setting it sets a kinematic 'Body'\'s velocity so it reaches
+the given world position and angle (radians) over the given time step — pass
+the time delta of your next 'stepPhysics' call. This is the engine path for
+moving platforms: unlike teleporting via 'Position', the body carries real
+velocity, so it pushes and carries riders. The target is skipped when the
+body is asleep and the implied velocity is below the sleep threshold.
+-}
+data TargetTransform = TargetTransform WVec Float Float
+  deriving (Eq, Show)
+
+instance Component TargetTransform where
+  type Storage TargetTransform = B2Space TargetTransform
+
+instance (MonadIO m, Has w m Physics) => Has w m TargetTransform where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplSet m (B2Space TargetTransform) where
+  explSet sp ety (TargetTransform p theta dt) = liftIO $
+    overBody sp ety $ \b -> do
+      rot <- makeRot theta
+      B2Body.setTargetTransform b (Transform p rot) dt True
 
 -- | A 'Body'\'s linear velocity damping.
 newtype LinearDamping = LinearDamping Float

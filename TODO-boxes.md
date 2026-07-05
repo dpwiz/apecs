@@ -56,7 +56,7 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
   platformer characters need locked rotation on day one. Upstream:
   `Body.setMotionLocks/getMotionLocks`. [2D] expose as `FixedRotation Bool`
   sugar too. (S)
-- [ ] **Kinematic target transform: `TargetTransform`/`TargetPosition`
+- [x] **Kinematic target transform: `TargetTransform`/`TargetPosition`
   write-only component.** Moving platforms via `setTransform` teleport and
   don't impart velocity; `setTargetTransform` is the correct engine path. (S)
 - [ ] **`BodyEnabled` component.** Cheap despawn/pooling without destroying
