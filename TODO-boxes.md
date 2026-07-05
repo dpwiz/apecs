@@ -247,7 +247,7 @@ upstream side is spelled out in `NOTES-upstream.md`.
   `HeightFieldDef`. NOTES-upstream §3. (S here once unblocked)
 - [ ] **[3D] `GeoCompound`.** `CompoundDef` and its child defs are opaque.
   NOTES-upstream §4. (M here once unblocked)
-- [ ] **[3D] Exact containment via the engine.** `containsPointQuery`
+- [x] **[3D] Exact containment via the engine.** `containsPointQuery`
   special-cases spheres and capsules analytically because
   `getClosestPoint`'s `useRadii` mode keeps witness points on the
   perimeter even when overlapped; an `hsg_b3Shape_TestPoint` shim gives

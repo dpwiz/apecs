@@ -166,7 +166,6 @@ import Data.IntMap.Strict qualified as IM
 import Data.IntSet qualified as IS
 import Data.List (sortOn)
 import Data.Maybe (catMaybes)
-import Data.Ord (clamp)
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
 import Foreign.C.String (peekCString, withCString)
@@ -2508,28 +2507,11 @@ pointQuery (Vec3 x y z) r =
 {- | The body entities with a shape that actually contains a world point:
 an exact geometry test, unlike the broad-phase 'pointQuery'. Candidates
 come from a broad-phase 'B3World.overlapAABB' at a degenerate (zero-size)
-AABB pinned to the point, then refined against each candidate's exact
-geometry; bodies are deduplicated when more than one of their shapes
-contains the point.
-
-Box3D has no direct point-in-shape test, so spheres and capsules are
-tested analytically in the body's local frame (point-to-center and
-point-to-segment distance against the radius), and everything else uses
-'B3Shape.getClosestPoint' (the nearest point on a shape to a target): it
-runs a GJK query between the shape and the target treated as a
-degenerate point shape, and for a target inside or on a shape whose GJK
-proxy carries no radius (hulls, boxes, meshes, height fields) the query
-simplex encloses the origin, at which point the returned \"closest\"
-point is a witness point that, worked out in exact arithmetic, coincides
-with the target itself. In floating point the simplex weights can still
-land the witness point a small distance off, so containment is decided
-by comparing squared distance against a small scale-relative tolerance
-rather than requiring bit-exact equality. The closest-point route cannot
-be used for spheres and capsules — @b3ShapeDistance@'s @useRadii@ mode
-deliberately keeps witness points on the perimeter even when the shapes
-overlap (\"this way the points move smoothly\"), so for a target inside
-a radius-carrying shape it reports a surface point far from the target,
-which would read as non-containment.
+AABB pinned to the point, and each candidate shape is then refined with
+'B3Shape.testPoint', an exact point-in-shape test; bodies are
+deduplicated when more than one of their shapes contains the point.
+Non-convex shapes — meshes, height fields and compounds — report no
+containment, per 'B3Shape.testPoint's documented behavior.
 -}
 containsPointQuery
   :: forall w m
@@ -2537,43 +2519,20 @@ containsPointQuery
   => WVec
   -> Filter
   -> SystemT w m [Entity]
-containsPointQuery point@(Vec3 px py pz) fltr = do
+containsPointQuery point fltr = do
   sp :: B3Space Physics <- getStore
   liftIO $ do
     qf <- toQueryFilter fltr
     found <- newIORef IS.empty
-    let
-      -- scale-relative tolerance: float rounding in the GJK simplex
-      -- weights is roughly proportional to the magnitude of the
-      -- coordinates involved, so a fixed epsilon would be too tight far
-      -- from the origin and too loose near it
-      tolerance = 1e-9 * (1 + px * px + py * py + pz * pz)
-      contains s = do
-        ty <- B3Shape.getType s
-        case ty of
-          B3T.SphereShape -> do
-            B3T.Sphere c r <- B3Shape.getSphere s
-            b <- B3Shape.getBody s
-            lp <- B3Body.getLocalPoint b point
-            pure (vecLenSq (vecSub lp c) <= r * r)
-          B3T.CapsuleShape -> do
-            B3T.Capsule c1 c2 r <- B3Shape.getCapsule s
-            b <- B3Shape.getBody s
-            lp <- B3Body.getLocalPoint b point
-            pure (segmentDistSq lp c1 c2 <= r * r)
-          _ -> do
-            Vec3 cx cy cz <- B3Shape.getClosestPoint s point
-            let
-              dx = cx - px
-              dy = cy - py
-              dz = cz - pz
-            pure (dx * dx + dy * dy + dz * dz <= tolerance)
-      visit s = do
-        hit <- shapeEntities sp s
-        forM_ hit $ \(_, Entity bodyIx) -> do
-          inside <- contains s
-          when inside $ modifyIORef' found (IS.insert bodyIx)
-        pure True
+    let visit s = do
+          -- the exact test first: most broad-phase candidates only
+          -- overlap by AABB, and testPoint is one FFI call while entity
+          -- resolution is two plus a registry lookup
+          inside <- B3Shape.testPoint s point
+          when inside $ do
+            hit <- shapeEntities sp s
+            forM_ hit $ \(_, Entity bodyIx) -> modifyIORef' found (IS.insert bodyIx)
+          pure True
     _ <- withOverlapResultFcn visit $ \fp ctx ->
       B3World.overlapAABB (spWorld sp) (AABB point point) qf fp ctx
     map Entity . IS.toList <$> readIORef found
@@ -2606,18 +2565,6 @@ vecDot (Vec3 ax ay az) (Vec3 bx by bz) = ax * bx + ay * by + az * bz
 
 vecLenSq :: Vec3 -> Float
 vecLenSq v = vecDot v v
-
--- | @b3MulAdd@: @a + s*b@.
-vecMulAdd :: Vec3 -> Float -> Vec3 -> Vec3
-vecMulAdd a s b = vecAdd a (vecScale s b)
-
--- | Squared distance from a point to the segment between two points.
-segmentDistSq :: Vec3 -> Vec3 -> Vec3 -> Float
-segmentDistSq p a b = vecLenSq (vecSub p (vecMulAdd a t ab))
-  where
-    ab = vecSub b a
-    t = clamp (0, 1) (if lenSq == 0 then 0 else vecDot (vecSub p a) ab / lenSq)
-    lenSq = vecLenSq ab
 
 {- | A 'B3T.PlaneResult' as a fresh 'B3T.CollisionPlane' for
 "Box3D.Mover": no push limit (the sample's per-shape @maxPush@ user
