@@ -108,6 +108,8 @@ module Apecs.Box2D
   , SensorEvent (..)
   , SensorEvents (..)
   , JointEvents (..)
+  , BodyMove (..)
+  , Moved (..)
 
     -- * Vectors
   , Vec2 (..)
@@ -1941,6 +1943,25 @@ jointEntity sp j = do
       Just (JointRecord j' _) | j' == j -> Just (Entity ix)
       _ -> Nothing
 
+{- | The entity behind an engine body id, if it is still alive and
+registered (event buffers can reference bodies destroyed after the
+step).
+-}
+bodyEntity :: B2Space c -> BodyId -> IO (Maybe Entity)
+bodyEntity sp b = do
+  alive <- B2Body.isValid b
+  if not alive then
+    pure Nothing
+  else do
+    ix <- getUserIndex b
+    bodies <- readIORef (spBodies sp)
+    pure $ case IM.lookup ix bodies of
+      -- bodies created through the raw engine API have no user index and
+      -- read back as 0, a legitimate entity; requiring the registered
+      -- engine body to be this very body drops them instead
+      Just b' | b' == b -> Just (Entity ix)
+      _ -> Nothing
+
 {- | The closest shape along a world-space segment, if any. Initial
 overlaps are ignored: a segment starting inside a shape does not hit
 it.
@@ -2500,3 +2521,50 @@ instance (MonadIO m) => ExplGet m (B2Space JointEvents) where
     evs <- B2Events.jointEvents (spWorld sp)
     fmap (JointEvents . catMaybes) . forM (VS.toList evs) $ \ev ->
       jointEntity sp (B2T.jointEventJointId ev)
+
+{- | A body that moved during the last 'stepPhysics': its entity, its new
+transform, and whether it fell asleep on this step (sleeping bodies stop
+emitting moves — use the flag for a final render sync).
+-}
+data BodyMove = BodyMove
+  { bodyMoveBody :: !Entity
+  , bodyMovePosition :: !WVec
+  , bodyMoveAngle :: !Float
+  , bodyMoveFellAsleep :: !Bool
+  }
+  deriving (Eq, Show)
+
+{- | The bodies that moved during the last 'stepPhysics', a read-only
+global: @Moved moves <- get global@ after stepping. Iterating this
+instead of every 'Position' makes render sync O(moved) instead of
+O(bodies): sleeping and static bodies don't appear. Box2D generates move
+events unconditionally — there is no per-body opt-in flag, unlike
+'Collisions'\/'Impacts'\/'SensorEvents', which need contact\/hit\/sensor
+events enabled per shape. Events whose bodies were destroyed since the
+step are dropped.
+-}
+newtype Moved = Moved [BodyMove]
+  deriving (Show)
+
+instance Component Moved where
+  type Storage Moved = B2Space Moved
+
+instance (MonadIO m, Has w m Physics) => Has w m Moved where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space Moved) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ do
+    evs <- B2Events.bodyMoveEvents (spWorld sp)
+    fmap (Moved . catMaybes) . forM (VS.toList evs) $ \ev -> do
+      met <- bodyEntity sp (B2T.bodyMoveEventBodyId ev)
+      pure $ do
+        ety <- met
+        let Transform pos rot = B2T.bodyMoveEventTransform ev
+        Just
+          BodyMove
+            { bodyMoveBody = ety
+            , bodyMovePosition = pos
+            , bodyMoveAngle = rotGetAngle rot
+            , bodyMoveFellAsleep = toBool (B2T.bodyMoveEventFellAsleep ev)
+            }

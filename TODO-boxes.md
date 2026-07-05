@@ -125,7 +125,7 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
 - [ ] **Manifold/contact data on `Collisions`.** Begin-touch events carry
   contact data upstream; exposing point/normal would save a follow-up query.
   Check what `ContactBeginTouchEvent` actually carries before promising. (M)
-- [ ] **Body-move events global (`Moved`).** Efficient render-sync (only
+- [x] **Body-move events global (`Moved`).** Efficient render-sync (only
   bodies that actually moved, with sleep flag) instead of iterating every
   `Position`. Upstream: `Events.bodyMoveEvents`. (S)
 - [ ] **Recording / replay / snapshots.** `World.startRecording/stopRecording`,
