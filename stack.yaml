@@ -18,6 +18,7 @@ extra-deps:
     subdirs:
       - Box2D
       - Box3D
+  - gloss-export-0.1.0.4
 
 nix:
   pure: false

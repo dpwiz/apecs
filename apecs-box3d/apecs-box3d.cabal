@@ -56,6 +56,7 @@ executable apecs-box3d-elite
     , apecs-gloss
     , apecs-gloss-3d
     , base            >=4.16 && <5
+    , gloss-export
     , linear
     , random
     , vector

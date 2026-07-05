@@ -44,6 +44,7 @@ module Apecs.Box3D
   , LinearDamping (..)
   , AngularDamping (..)
   , GravityScale (..)
+  , BulletBody (..)
   , B3BodyId (..)
 
     -- * Shape
@@ -67,6 +68,12 @@ module Apecs.Box3D
   , aabbQuery
   , pointQuery
 
+    -- * Collisions
+  , Collision (..)
+  , Collisions (..)
+  , Impact (..)
+  , Impacts (..)
+
     -- * Vectors
   , Vec3 (..)
   , vec3Zero
@@ -78,12 +85,13 @@ module Apecs.Box3D
 
 import Apecs
 import Apecs.Core
-import Control.Monad (forM_, when)
+import Control.Monad (forM, forM_, when)
 import Control.Monad.IO.Class (MonadIO)
 import Data.IORef
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
 import Data.IntSet qualified as IS
+import Data.Maybe (catMaybes)
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
 import Foreign.Ptr (nullPtr)
@@ -91,6 +99,7 @@ import Foreign.Ptr (nullPtr)
 import Box3D.Body qualified as B3Body
 import Box3D.Callbacks (withOverlapResultFcn)
 import Box3D.DistanceJoint qualified as B3DistanceJoint
+import Box3D.Events qualified as B3Events
 import Box3D.Hull qualified as B3Hull
 import Box3D.Id (BodyId, JointId, ShapeId, WorldId)
 import Box3D.Joint qualified as B3Joint
@@ -142,10 +151,13 @@ instance Component Physics where
 instance (MonadIO m) => ExplInit m (B3Space Physics) where
   explInit = liftIO $ do
     wd <- B3T.defaultWorldDef
+    sd <- B3T.defaultShapeDef
     B3Space
       <$> B3World.create wd
       <*> B3T.defaultBodyDef
-      <*> B3T.defaultShapeDef
+      -- Box3D defaults both event flags off; opt every layer-created
+      -- shape in so 'Collisions' and 'Impacts' have something to read.
+      <*> pure sd{B3T.shapeDefEnableContactEvents = 1, B3T.shapeDefEnableHitEvents = 1}
       <*> newIORef mempty
       <*> newIORef mempty
       <*> newIORef mempty
@@ -598,6 +610,31 @@ instance (MonadIO m) => ExplSet m (B3Space GravityScale) where
 instance (MonadIO m) => ExplMembers m (B3Space GravityScale) where
   explMembers = bodyMembers
 
+{- | Continuous collision detection for this body (the engine's "bullet"
+flag): keeps small, fast bodies from tunnelling through other dynamic
+bodies between substeps. Off by default; the cost scales with speed.
+-}
+newtype BulletBody = BulletBody Bool
+  deriving (Eq, Show)
+
+instance Component BulletBody where
+  type Storage BulletBody = B3Space BulletBody
+
+instance (MonadIO m, Has w m Physics) => Has w m BulletBody where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplGet m (B3Space BulletBody) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap BulletBody . B3Body.isBullet
+
+instance (MonadIO m) => ExplSet m (B3Space BulletBody) where
+  explSet sp ety (BulletBody b) = liftIO $
+    overBody sp ety $ \bd ->
+      B3Body.setBullet bd b
+
+instance (MonadIO m) => ExplMembers m (B3Space BulletBody) where
+  explMembers = bodyMembers
+
 -- Shape ---------------------------------------------------------------------
 
 -- | Shape geometry in body-local coordinates.
@@ -960,14 +997,21 @@ toQueryFilter f = do
       , B3T.queryFilterMaskBits = filterMaskBits f
       }
 
--- | The shape and body entities behind an engine shape, if registered.
+{- | The shape and body entities behind an engine shape, if it is still
+alive and registered (event buffers can reference shapes destroyed
+after the step).
+-}
 shapeEntities :: B3Space c -> ShapeId -> IO (Maybe (Entity, Entity))
 shapeEntities sp s = do
-  ix <- getUserIndex s
-  shapes <- readIORef (spShapes sp)
-  pure $ case IM.lookup ix shapes of
-    Just (ShapeRecord _ (Shape bodyEty _)) -> Just (Entity ix, bodyEty)
-    Nothing -> Nothing
+  alive <- B3Shape.isValid s
+  if not alive then
+    pure Nothing
+  else do
+    ix <- getUserIndex s
+    shapes <- readIORef (spShapes sp)
+    pure $ case IM.lookup ix shapes of
+      Just (ShapeRecord _ (Shape bodyEty _)) -> Just (Entity ix, bodyEty)
+      Nothing -> Nothing
 
 {- | The closest shape along a world-space segment, if any. Initial
 overlaps are ignored: a segment starting inside a shape does not hit
@@ -1037,3 +1081,92 @@ the body entities with shapes broad-phase within reach.
 pointQuery :: (MonadIO m, Has w m Physics) => WVec -> Float -> Filter -> SystemT w m [Entity]
 pointQuery (Vec3 x y z) r =
   aabbQuery (Vec3 (x - r) (y - r) (z - r)) (Vec3 (x + r) (y + r) (z + r))
+
+-- * Collisions
+
+{- | A contact that began touching during the last 'stepPhysics': the
+shapes involved and the bodies they hang off.
+-}
+data Collision = Collision
+  { collisionBodyA :: !Entity
+  , collisionShapeA :: !Entity
+  , collisionBodyB :: !Entity
+  , collisionShapeB :: !Entity
+  }
+  deriving (Eq, Show)
+
+{- | The begin-touch contacts of the last 'stepPhysics', a read-only
+global: @Collisions touches <- get global@ after stepping. Shapes
+created by this layer opt into contact events; events whose shapes
+were destroyed since the step are dropped.
+-}
+newtype Collisions = Collisions [Collision]
+  deriving (Show)
+
+instance Component Collisions where
+  type Storage Collisions = B3Space Collisions
+
+instance (MonadIO m, Has w m Physics) => Has w m Collisions where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplGet m (B3Space Collisions) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ do
+    evs <- B3Events.contactBeginTouchEvents (spWorld sp)
+    fmap (Collisions . catMaybes) . forM (VS.toList evs) $ \ev -> do
+      ma <- shapeEntities sp (B3T.contactBeginTouchEventShapeIdA ev)
+      mb <- shapeEntities sp (B3T.contactBeginTouchEventShapeIdB ev)
+      pure $ do
+        (sa, ba) <- ma
+        (sb, bb) <- mb
+        Just (Collision ba sa bb sb)
+
+{- | An above-threshold impact from the last 'stepPhysics': the entities
+involved, the world-space contact point, the contact normal (pointing
+from A to B) and the approach speed. Only generated when the approach
+speed exceeds the world's hit-event threshold (engine default 1;
+tune with 'Box3D.World.setHitEventThreshold' via 'getWorldId').
+-}
+data Impact = Impact
+  { impactBodyA :: !Entity
+  , impactShapeA :: !Entity
+  , impactBodyB :: !Entity
+  , impactShapeB :: !Entity
+  , impactPoint :: !WVec
+  , impactNormal :: !WVec
+  , impactSpeed :: !Float
+  }
+  deriving (Eq, Show)
+
+{- | The impacts of the last 'stepPhysics', a read-only global:
+@Impacts hits <- get global@ after stepping.
+-}
+newtype Impacts = Impacts [Impact]
+  deriving (Show)
+
+instance Component Impacts where
+  type Storage Impacts = B3Space Impacts
+
+instance (MonadIO m, Has w m Physics) => Has w m Impacts where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplGet m (B3Space Impacts) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ do
+    evs <- B3Events.contactHitEvents (spWorld sp)
+    fmap (Impacts . catMaybes) . forM (VS.toList evs) $ \ev -> do
+      ma <- shapeEntities sp (B3T.contactHitEventShapeIdA ev)
+      mb <- shapeEntities sp (B3T.contactHitEventShapeIdB ev)
+      pure $ do
+        (sa, ba) <- ma
+        (sb, bb) <- mb
+        Just
+          Impact
+            { impactBodyA = ba
+            , impactShapeA = sa
+            , impactBodyB = bb
+            , impactShapeB = sb
+            , impactPoint = B3T.contactHitEventPoint ev
+            , impactNormal = B3T.contactHitEventNormal ev
+            , impactSpeed = B3T.contactHitEventApproachSpeed ev
+            }

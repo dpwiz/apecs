@@ -6,20 +6,36 @@
 runs, two Eagles pursue, and everything is autopiloted: each ship is a
 Box3D rigid body flown by a small PD controller (torque toward the
 desired direction, thrust along the nose). The guns fire real dynamic
-bodies, so hits are resolved by the engine as momentum transfer — no
-collision-event plumbing, just getting shoved. Rendered as flat-shaded
-solids with apecs-gloss-3d. Click to scramble another Eagle.
+bodies with continuous collision detection ('BulletBody'), so hits are
+resolved by the engine as momentum transfer; the step's 'Impacts' then
+despawn spent slugs and throw explosion flashes at the contact points.
+Rendered as flat-shaded solids with apecs-gloss-3d. Click to scramble
+another Eagle.
+
+The elite demo also has a headless verification and recording mode
+that simulates at a fixed 60 Hz and exports exact frames via
+gloss-export (no window, so no compositor throttling in the way),
+logging the explosion pieces in view per frame. Stride 1 exports every
+frame, ready for `ffmpeg -framerate 60`. Runs are deterministic: the
+seed is printed, and passing it back reproduces the encounter bit for
+bit.
+
+@
+apecs-box3d-elite -- film <warmup-seconds> <frames> <stride> <prefix> [seed]
+@
 -}
 module Main (main) where
 
 import Apecs
 import Apecs.Gloss
 import Apecs.Gloss3D
-import Control.Monad (forM_, replicateM, replicateM_, when)
+import Control.Monad (forM, forM_, replicateM, replicateM_, when)
 import Data.Vector.Storable qualified as VS
+import Graphics.Gloss.Export.PNG (exportPictureToPNG)
 import Linear (Quaternion (..), V3 (..), cross, dot, norm, normalize, quadrance, (*^), (^*), (^/))
 import Linear qualified
-import System.Random (randomRIO)
+import System.Environment (getArgs)
+import System.Random (mkStdGen, randomRIO, setStdGen)
 
 import Apecs.Box3D
 
@@ -56,6 +72,12 @@ newtype Roid = Roid Float
 
 instance Component Roid where
   type Storage Roid = Map Roid
+
+-- | An explosion flash: position, magnitude, age. Pure VFX, no body.
+data Boom = Boom (V3 Float) Float Float
+
+instance Component Boom where
+  type Storage Boom = Map Boom
 
 -- | Elapsed scene time, for the Courier's jinking.
 newtype Time = Time Float
@@ -101,6 +123,7 @@ makeWorld
   , ''Gun
   , ''Bullet
   , ''Roid
+  , ''Boom
   , ''Time
   , ''ChaseCam
   , ''Stars
@@ -260,6 +283,7 @@ fireBullet pos vel = do
   b <-
     newEntity
       ( DynamicBody
+      , BulletBody True
       , Position (vec3 pos)
       , Velocity (vec3 vel)
       , Bullet 2.2
@@ -382,12 +406,12 @@ flyCourier t eagles e p v = do
   let
     rear = negate fwd
     muzzle = p + rear ^* 2
-    lined = [ep | (_, ep, _) <- eagles, norm (ep - p) < 20, dot (normalize (ep - p)) rear > 0.96]
+    lined = [ep | (_, ep, _) <- eagles, norm (ep - p) < 20, dot (normalize (ep - p)) rear > 0.92]
   case lined of
     (target : _) | cool <= 0 -> do
       clear <- lineOfSight muzzle target
       when clear $ do
-        set e (Gun 0.7)
+        set e (Gun 0.5)
         fireBullet muzzle (v + bulletSpeed *^ rear)
     _ -> pure ()
 
@@ -406,10 +430,10 @@ flyEagle e p v cp cv = do
   (fwd, _) <- pilot e (pursue + avoid + arenaPull p) 13
   Gun cool <- get e
   let muzzle = p + fwd ^* 1.4
-  when (cool <= 0 && dist < 26 && dot fwd (normalize sep) > 0.982) $ do
+  when (cool <= 0 && dist < 26 && dot fwd (normalize sep) > 0.94) $ do
     clear <- lineOfSight muzzle cp
     when clear $ do
-      set e (Gun 0.55)
+      set e (Gun 0.4)
       fireBullet muzzle (v + bulletSpeed *^ fwd)
 
 -- * Loop
@@ -433,7 +457,37 @@ step dT' = do
   forM_ eagles $ \(e, p, v) ->
     forM_ (take 1 couriers) $ \(_, cp, cv) -> flyEagle e p v cp cv
   stepPhysics dT
+  detonations dT
   forM_ (take 1 couriers) $ \(e, _, _) -> chaseCamera e
+
+{- | Turn the step's 'Impacts' into pyrotechnics: slugs expend
+themselves in a flash sized by the approach speed (the momentum was
+already delivered by the engine), and any other hard impact throws a
+smaller dust burst. Then age out the flashes.
+-}
+detonations :: Float -> SystemT World IO ()
+detonations dT = do
+  Impacts hits <- get global
+  forM_ hits $ \hit -> do
+    spent <- fmap or . forM [impactBodyA hit, impactBodyB hit] $ \b -> do
+      slug <- get b
+      case slug of
+        Just (Bullet _) -> do
+          destroy b (Proxy @(Body, Bullet, Look))
+          pure True
+        Nothing -> pure False
+    let
+      speed = impactSpeed hit
+      mag
+        | spent = 0.5 + speed * 0.04
+        | otherwise = 0.25 + speed * 0.02
+    when (spent || speed > 6) $
+      newEntity_ (Boom (v3 (impactPoint hit)) mag 0)
+  cmapM_ $ \(Boom pos mag age, e :: Entity) ->
+    if age > boomLife then
+      destroy e (Proxy @Boom)
+    else
+      set e (Boom pos mag (age + dT))
 
 -- | Trail the Courier: smoothed eye behind its motion, looking ahead.
 chaseCamera :: Entity -> SystemT World IO ()
@@ -508,6 +562,21 @@ radarPicture cam c blips = Translate 0 (-250) (Pictures (frame <> marks))
           hp = dot rel up * s * 0.5
       ]
 
+boomLife :: Float
+boomLife = 0.45
+
+{- | An expanding two-tone fireball: a hot core inside a reddening,
+fading shell, both sphere impostors.
+-}
+drawBoom :: Scene3 -> Boom -> [Piece]
+drawBoom sc (Boom pos mag age) =
+  sphere3 sc shell (mag * (0.5 + 3 * t)) pos
+    <> sphere3 sc core (mag * (0.3 + 1.2 * t)) pos
+  where
+    t = min 1 (age / boomLife)
+    shell = makeColor 1 (0.6 - 0.45 * t) 0.1 (0.75 * (1 - t))
+    core = makeColor 1 1 (0.8 - 0.5 * t) (1 - 0.6 * t)
+
 drawLook :: Scene3 -> Vec3 -> Quat -> Look -> [Piece]
 drawLook sc p q = \case
   LookSolid tint solid -> solid3 sc tint solid (v3 p) (q3 q)
@@ -528,8 +597,9 @@ draw = do
       , let (px, py) = projectPoint sc vp
       ]
   pieces <- cfold (\acc (look :: Look, Position p, Rotation q) -> drawLook sc p q look <> acc) []
+  booms <- cfold (\acc (b :: Boom) -> drawBoom sc b <> acc) []
   radar <- drawRadar cam
-  pure (Pictures [assemble (starfield <> pieces), radar])
+  pure (Pictures [assemble (starfield <> pieces <> booms), radar])
 
 handle :: Event -> SystemT World IO ()
 handle (EventKey (MouseButton LeftButton) Down _ _) = do
@@ -537,9 +607,47 @@ handle (EventKey (MouseButton LeftButton) Down _ _) = do
   spawnShip Eagle (dim red) eagleHull (arenaR *^ dir) (negate (8 *^ dir))
 handle _ = pure ()
 
+{- | Headless verification and recording: warm the simulation up at a
+fixed 60 Hz, then export frames (every @stride@th simulated frame)
+straight to PNGs via gloss-export — exact pixels, no window, no
+compositor in the way. Prints the explosion pieces in view per frame.
+Stride 1 films every frame, ready for encoding into a 60 fps video.
+
+The fixed timestep plus the seeded generator (main prints the seed)
+make film runs fully deterministic: the same seed and parameters
+reproduce the encounter bit for bit.
+-}
+film :: Float -> Int -> Int -> String -> SystemT World IO ()
+film warm count stride prefix = do
+  replicateM_ (round (warm * 60)) (step (1 / 60))
+  forM_ [1 .. count] $ \i -> do
+    replicateM_ (max 1 stride) (step (1 / 60))
+    pic <- draw
+    cam <- get global
+    env <- get global
+    let sc = scene3 cam env
+    flashes <- cfold (\acc (b :: Boom) -> drawBoom sc b <> acc) []
+    let name = prefix <> pad i <> ".png"
+    liftIO $ do
+      exportPictureToPNG (960, 720) black name pic
+      putStrLn (name <> " boomPiecesInView=" <> show (length flashes))
+  where
+    pad i = let s = show i in replicate (4 - length s) '0' <> s
+
 main :: IO ()
 main = do
-  w <- initWorld
-  runSystem (initialize >> play disp black 60 draw handle step) w
+  args <- getArgs
+  case args of
+    ("film" : warm : count : stride : prefix : rest) -> do
+      seed <- case rest of
+        [s] -> pure (read s)
+        _ -> randomRIO (0, 999999 :: Int)
+      putStrLn ("seed " <> show seed)
+      setStdGen (mkStdGen seed)
+      w <- initWorld
+      runSystem (initialize >> film (read warm) (read count) (read stride) prefix) w
+    _ -> do
+      w <- initWorld
+      runSystem (initialize >> play disp black 60 draw handle step) w
   where
     disp = InWindow "elitelite" (960, 720) (10, 10)

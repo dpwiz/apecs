@@ -19,8 +19,15 @@
   `pointQuery` (broad-phase box overlap returning body entities).
   Note: Box3D's default shape category is all bits set, so give shapes
   explicit `CollisionFilter` categories to partition them for queries.
+- Collision events: `Collisions` (begin-touch pairs) and `Impacts`
+  (hits with contact point, normal and approach speed) as read-only
+  globals reflecting the last `stepPhysics`; shapes created by the
+  layer opt into both event kinds.
+- `BulletBody`: continuous collision detection toggle — without it,
+  small fast bodies tunnel through dynamic targets between substeps.
 - `apecs-box3d-demo`: a 3D tumbler rendered with apecs-gloss via a CPU
   perspective projection and painter's-algorithm depth sorting.
 - `apecs-box3d-elite`: an autopiloted kinetic chase through an asteroid
   field of flat-shaded convex hulls — PD-controller ships flown with
-  `Torque`/`Force`, guns firing real dynamic bodies.
+  `Torque`/`Force`, guns firing real dynamic bodies. A headless `film`
+  mode exports exact frames to PNG via gloss-export for verification.

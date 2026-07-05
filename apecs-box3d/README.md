@@ -26,7 +26,9 @@ stack run apecs-box3d-demo
 flat-shaded: a Courier runs, two Eagles pursue, and
 everything is autopiloted — each ship is a rigid body flown by a small
 PD controller writing `Torque` and `Force`, and the guns fire real
-dynamic bodies, so hits are momentum transfer resolved by the engine.
+dynamic bodies (with `BulletBody` continuous collision), so hits are
+momentum transfer resolved by the engine — and the step's `Impacts`
+despawn spent slugs and flash explosions at the contact points.
 A classic scanner ellipse at the bottom shows contacts as height
 lollipops. Click to scramble another Eagle.
 

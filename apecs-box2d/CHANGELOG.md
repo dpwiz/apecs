@@ -21,5 +21,11 @@
 - World queries: `segmentQuery` (closest hit along a segment as a
   `RayHit` with the shape and body entities), `aabbQuery` and
   `pointQuery` (broad-phase box overlap returning body entities).
+- Collision events: `Collisions` (begin-touch pairs) and `Impacts`
+  (hits with contact point, normal and approach speed) as read-only
+  globals reflecting the last `stepPhysics`; shapes created by the
+  layer opt into both event kinds.
+- `BulletBody`: continuous collision detection toggle — without it,
+  small fast bodies tunnel through dynamic targets between substeps.
 - `apecs-box2d-demo`: a tumbler scene driven by Box2D and rendered with
   apecs-gloss.
