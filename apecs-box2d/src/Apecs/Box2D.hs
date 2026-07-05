@@ -37,6 +37,7 @@ module Apecs.Box2D
   , HitEventThreshold (..)
   , RestitutionThreshold (..)
   , MaximumLinearSpeed (..)
+  , WorkerCount (..)
   , stepPhysics
   , destroyPhysics
   , explode
@@ -522,6 +523,28 @@ instance (MonadIO m) => ExplGet m (B2Space MaximumLinearSpeed) where
 
 instance (MonadIO m) => ExplSet m (B2Space MaximumLinearSpeed) where
   explSet sp _ (MaximumLinearSpeed s) = liftIO $ B2World.setMaximumLinearSpeed (spWorld sp) s
+
+{- | The number of solver worker threads the world uses (default 1).
+Raising it parallelises the solver across islands; it only pays off on
+scenes with many independent islands, and the program must be built
+with the threaded runtime. Settable at any time between 'stepPhysics'
+calls. Must be in the range [1, B2_MAX_WORKERS].
+-}
+newtype WorkerCount = WorkerCount Int
+  deriving (Eq, Show)
+
+instance Component WorkerCount where
+  type Storage WorkerCount = B2Space WorkerCount
+
+instance (MonadIO m, Has w m Physics) => Has w m WorkerCount where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space WorkerCount) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ WorkerCount <$> B2World.getWorkerCount (spWorld sp)
+
+instance (MonadIO m) => ExplSet m (B2Space WorkerCount) where
+  explSet sp _ (WorkerCount c) = liftIO $ B2World.setWorkerCount (spWorld sp) c
 
 -- Body --------------------------------------------------------------------
 

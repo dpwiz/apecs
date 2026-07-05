@@ -138,12 +138,16 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
   High value for *this repo's* demo-verification workflow (deterministic
   replay beats screenshot probing), but a niche of one — wrap as plain
   functions, no components. Note the 2D/3D asymmetry (no 3D snapshot). (M)
-- [ ] **World init configuration.** `explInit` bakes in `defaultWorldDef`, so
+- [x] **World init configuration.** `explInit` bakes in `defaultWorldDef`, so
   worker count / task system (`withThreadPoolTaskSystem`, WorldDef enqueue
   callbacks), capacities and bounds are unreachable at creation. Options:
   read config from a `Global` the user sets before init, or provide
   `initPhysicsWith :: WorldDef -> ...`. `World.setWorkerCount` post-create
   may cover the common case cheaply — verify. (M)
+  *Common case done as the `WorkerCount` global (settable any time between
+  steps). Full WorldDef-at-creation config (task system, capacities,
+  bounds) still open — needs an `initPhysicsWith` store-bootstrap path,
+  which would also unlock wrapping 2D `createFromSnapshot`.*
 - [ ] **[2D] Chain shapes (`GeoChain`).** Terrain outlines without ghost
   collisions. Separate `ChainId` lifecycle, so it doesn't fit `ShapeRecord`
   directly. (M)
