@@ -158,7 +158,7 @@ module Apecs.Box3D
 
 import Apecs
 import Apecs.Core
-import Control.Monad (forM, forM_, when)
+import Control.Monad (filterM, forM, forM_, when)
 import Control.Monad.IO.Class (MonadIO)
 import Data.IORef
 import Data.IntMap.Strict (IntMap)
@@ -166,6 +166,7 @@ import Data.IntMap.Strict qualified as IM
 import Data.IntSet qualified as IS
 import Data.List (sortOn)
 import Data.Maybe (catMaybes)
+import Data.Ord (clamp)
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
 import Foreign.C.String (peekCString, withCString)
@@ -403,6 +404,18 @@ jointIsKind sp ety kinds = do
     Nothing -> pure False
     Just (JointRecord j _) -> (`elem` kinds) <$> B3Joint.getType j
 
+{- | The entities whose 'Joint' engine type is one of the given kinds.
+Kind-restricted components must keep their members consistent with
+'jointIsKind' in @explExists@: @cmap@\/@cfold@ call @explGet@ on every
+member without an existence check, and an unfiltered members list
+would hand joints of the wrong kind to a type-specific engine getter.
+-}
+jointKindMembers :: (MonadIO m) => B3Space c -> [B3T.JointType] -> m (U.Vector Int)
+jointKindMembers sp kinds = liftIO $ do
+  m <- readIORef (spJoints sp)
+  U.fromList . map fst
+    <$> filterM (\(_, JointRecord j _) -> (`elem` kinds) <$> B3Joint.getType j) (IM.toList m)
+
 -- Space sub-components ----------------------------------------------------
 
 -- | The world's gravity vector.
@@ -622,12 +635,16 @@ instance (MonadIO m) => ExplDestroy m (B3Space Body) where
   explDestroy sp ety = liftIO $ do
     bodies <- readIORef (spBodies sp)
     forM_ (IM.lookup ety bodies) $ \b -> do
+      -- destroy the engine body first: the ShapeRecords keep mesh and
+      -- height-field ForeignPtrs alive, and dropping them before the
+      -- engine call would let a GC finalize geometry the engine shapes
+      -- still reference
+      B3Body.destroy b
       -- the engine destroys attached shapes and joints along with the
       -- body, so drop their entity records too
       modifyIORef' (spShapes sp) (IM.filter (\(ShapeRecord _ (Shape (Entity be) _)) -> be /= ety))
       modifyIORef' (spJoints sp) (IM.filter (\(JointRecord _ (Joint (Entity a) (Entity b') _)) -> a /= ety && b' /= ety))
       modifyIORef' (spBodies sp) (IM.delete ety)
-      B3Body.destroy b
 
 instance (MonadIO m) => ExplMembers m (B3Space Body) where
   explMembers = bodyMembers
@@ -1469,8 +1486,8 @@ cylinderHull :: Float -> Float -> Float -> Int -> IO Hull
 cylinderHull height radius yOffset sides =
   Hull <$> wrapGenerated "cylinderHull" B3Hull.destroy (B3Cylinder.create height radius yOffset sides)
 
-{- | A shape def with the surface material, density and filter carried
-over from the shape being replaced, if any.
+{- | A shape def with the surface material, density, filter and sensor
+flag carried over from the shape being replaced, if any.
 -}
 carryMaterial :: B3T.ShapeDef -> Maybe ShapeRecord -> IO B3T.ShapeDef
 carryMaterial sd Nothing = pure sd
@@ -1478,11 +1495,13 @@ carryMaterial sd (Just (ShapeRecord s _)) = do
   material <- B3Shape.getSurfaceMaterial s
   density <- B3Shape.getDensity s
   filtr <- B3Shape.getFilter s
+  sensor <- B3Shape.isSensor s
   pure
     sd
       { B3T.shapeDefBaseMaterial = material
       , B3T.shapeDefDensity = density
       , B3T.shapeDefFilter = filtr
+      , B3T.shapeDefIsSensor = fromBool sensor
       }
 
 {- | Create a fresh engine shape for a 'Shape' value with the given def,
@@ -1516,8 +1535,11 @@ instance (MonadIO m) => ExplDestroy m (B3Space Shape) where
   explDestroy sp ety = liftIO $ do
     shapes <- readIORef (spShapes sp)
     forM_ (IM.lookup ety shapes) $ \(ShapeRecord s _) -> do
-      modifyIORef' (spShapes sp) (IM.delete ety)
+      -- destroy the engine shape before dropping the record: the record
+      -- keeps mesh and height-field ForeignPtrs alive, and the engine
+      -- shape references that geometry until it is destroyed
       B3Shape.destroy s True
+      modifyIORef' (spShapes sp) (IM.delete ety)
 
 instance (MonadIO m) => ExplMembers m (B3Space Shape) where
   explMembers = shapeMembers
@@ -1635,7 +1657,10 @@ has no way to change a live shape's sensor flag, so setting this
 recreates the engine shape (as 'Shape' does, preserving 'Density',
 'Friction', 'Elasticity' and 'CollisionFilter') whenever the requested
 value differs from the shape's current one; setting the value it
-already has is a no-op. Reads reflect the engine.
+already has is a no-op. Re-setting 'Shape' preserves the sensor flag
+the same way. Reads reflect the engine. Setting it on an entity that
+has no 'Shape' yet is a silent no-op, so in a 'newEntity' tuple put
+'Shape' before 'Sensor' — components are set left to right.
 -}
 newtype Sensor = Sensor Bool
   deriving (Eq, Show)
@@ -2003,6 +2028,10 @@ no 'Joint', is a silent no-op.
 newtype MotorSpeed = MotorSpeed Float
   deriving (Eq, Show)
 
+-- | Joint kinds 'MotorSpeed' covers; keeps exists\/get\/members in sync.
+motorSpeedKinds :: [B3T.JointType]
+motorSpeedKinds = [B3T.RevoluteJoint, B3T.PrismaticJoint, B3T.WheelJoint]
+
 instance Component MotorSpeed where
   type Storage MotorSpeed = B3Space MotorSpeed
 
@@ -2010,7 +2039,7 @@ instance (MonadIO m, Has w m Physics) => Has w m MotorSpeed where
   getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
 
 instance (MonadIO m) => ExplGet m (B3Space MotorSpeed) where
-  explExists sp ety = liftIO $ jointIsKind sp ety [B3T.RevoluteJoint, B3T.PrismaticJoint, B3T.WheelJoint]
+  explExists sp ety = liftIO $ jointIsKind sp ety motorSpeedKinds
   explGet sp ety = liftIO $ withJoint sp ety $ \j -> do
     ty <- B3Joint.getType j
     MotorSpeed <$> case ty of
@@ -2029,7 +2058,7 @@ instance (MonadIO m) => ExplSet m (B3Space MotorSpeed) where
         _ -> pure ()
 
 instance (MonadIO m) => ExplMembers m (B3Space MotorSpeed) where
-  explMembers = jointMembers
+  explMembers sp = jointKindMembers sp motorSpeedKinds
 
 {- | The motor's maximum torque on a 'Joint', usually in newton-meters:
 a hinge (revolute) joint's motor, or a wheel joint's spin motor
@@ -2041,6 +2070,10 @@ other joint kind, or on an entity with no 'Joint', is a silent no-op.
 newtype MotorMaxTorque = MotorMaxTorque Float
   deriving (Eq, Show)
 
+-- | Joint kinds 'MotorMaxTorque' covers; keeps exists\/get\/members in sync.
+motorMaxTorqueKinds :: [B3T.JointType]
+motorMaxTorqueKinds = [B3T.RevoluteJoint, B3T.WheelJoint]
+
 instance Component MotorMaxTorque where
   type Storage MotorMaxTorque = B3Space MotorMaxTorque
 
@@ -2048,7 +2081,7 @@ instance (MonadIO m, Has w m Physics) => Has w m MotorMaxTorque where
   getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
 
 instance (MonadIO m) => ExplGet m (B3Space MotorMaxTorque) where
-  explExists sp ety = liftIO $ jointIsKind sp ety [B3T.RevoluteJoint, B3T.WheelJoint]
+  explExists sp ety = liftIO $ jointIsKind sp ety motorMaxTorqueKinds
   explGet sp ety = liftIO $ withJoint sp ety $ \j -> do
     ty <- B3Joint.getType j
     MotorMaxTorque <$> case ty of
@@ -2065,7 +2098,7 @@ instance (MonadIO m) => ExplSet m (B3Space MotorMaxTorque) where
         _ -> pure ()
 
 instance (MonadIO m) => ExplMembers m (B3Space MotorMaxTorque) where
-  explMembers = jointMembers
+  explMembers sp = jointKindMembers sp motorMaxTorqueKinds
 
 {- | The motor's maximum force on a prismatic 'Joint' ('PrismaticJoint',
 'PrismaticSpringJoint', 'PrismaticMotorJoint'), usually in newtons.
@@ -2076,6 +2109,10 @@ with no 'Joint', is a silent no-op.
 newtype MotorMaxForce = MotorMaxForce Float
   deriving (Eq, Show)
 
+-- | Joint kinds 'MotorMaxForce' covers; keeps exists\/get\/members in sync.
+motorMaxForceKinds :: [B3T.JointType]
+motorMaxForceKinds = [B3T.PrismaticJoint]
+
 instance Component MotorMaxForce where
   type Storage MotorMaxForce = B3Space MotorMaxForce
 
@@ -2083,7 +2120,7 @@ instance (MonadIO m, Has w m Physics) => Has w m MotorMaxForce where
   getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
 
 instance (MonadIO m) => ExplGet m (B3Space MotorMaxForce) where
-  explExists sp ety = liftIO $ jointIsKind sp ety [B3T.PrismaticJoint]
+  explExists sp ety = liftIO $ jointIsKind sp ety motorMaxForceKinds
   explGet sp ety = liftIO $ withJoint sp ety $ fmap MotorMaxForce . B3PrismaticJoint.getMaxMotorForce
 
 instance (MonadIO m) => ExplSet m (B3Space MotorMaxForce) where
@@ -2095,7 +2132,7 @@ instance (MonadIO m) => ExplSet m (B3Space MotorMaxForce) where
         _ -> pure ()
 
 instance (MonadIO m) => ExplMembers m (B3Space MotorMaxForce) where
-  explMembers = jointMembers
+  explMembers sp = jointKindMembers sp motorMaxForceKinds
 
 {- | The (lower, upper) limit range on a 'Joint': radians on a hinge
 (revolute) joint, or meters on a prismatic joint. Setting this also
@@ -2105,6 +2142,10 @@ entity with no 'Joint', is a silent no-op.
 data JointLimits = JointLimits !Float !Float
   deriving (Eq, Show)
 
+-- | Joint kinds 'JointLimits' covers; keeps exists\/get\/members in sync.
+jointLimitsKinds :: [B3T.JointType]
+jointLimitsKinds = [B3T.RevoluteJoint, B3T.PrismaticJoint]
+
 instance Component JointLimits where
   type Storage JointLimits = B3Space JointLimits
 
@@ -2112,7 +2153,7 @@ instance (MonadIO m, Has w m Physics) => Has w m JointLimits where
   getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
 
 instance (MonadIO m) => ExplGet m (B3Space JointLimits) where
-  explExists sp ety = liftIO $ jointIsKind sp ety [B3T.RevoluteJoint, B3T.PrismaticJoint]
+  explExists sp ety = liftIO $ jointIsKind sp ety jointLimitsKinds
   explGet sp ety = liftIO $ withJoint sp ety $ \j -> do
     ty <- B3Joint.getType j
     case ty of
@@ -2129,7 +2170,7 @@ instance (MonadIO m) => ExplSet m (B3Space JointLimits) where
         _ -> pure ()
 
 instance (MonadIO m) => ExplMembers m (B3Space JointLimits) where
-  explMembers = jointMembers
+  explMembers sp = jointKindMembers sp jointLimitsKinds
 
 {- | Whether the two bodies connected by a 'Joint' can collide with each
 other. Applies to every joint kind. Restores the parity apecs-physics
@@ -2470,20 +2511,24 @@ AABB pinned to the point, then refined against each candidate's exact
 geometry; bodies are deduplicated when more than one of their shapes
 contains the point.
 
-Box3D has no direct point-in-shape test, so the refinement step uses
-'B3Shape.getClosestPoint' (the nearest point on a shape to a target)
-instead: it runs a GJK query between the shape and the target treated as
-a degenerate point shape, and for a target that is inside or on the shape
-the query simplex encloses the origin, at which point the returned
-\"closest\" point is a witness point that, worked out in exact arithmetic,
-coincides with the target itself (checked against the
-@b3Shape_GetClosestPoint@\/@b3ShapeDistance@ source: the target is the
-only point in its proxy, so every barycentric blend of it is the target
-unchanged, and the overlap branch solves for the target and the witness
-point differing by exactly the origin). In floating point the simplex
-weights can still land the witness point a small distance off, so
-containment is decided by comparing squared distance against a small
-scale-relative tolerance rather than requiring bit-exact equality.
+Box3D has no direct point-in-shape test, so spheres and capsules are
+tested analytically in the body's local frame (point-to-center and
+point-to-segment distance against the radius), and everything else uses
+'B3Shape.getClosestPoint' (the nearest point on a shape to a target): it
+runs a GJK query between the shape and the target treated as a
+degenerate point shape, and for a target inside or on a shape whose GJK
+proxy carries no radius (hulls, boxes, meshes, height fields) the query
+simplex encloses the origin, at which point the returned \"closest\"
+point is a witness point that, worked out in exact arithmetic, coincides
+with the target itself. In floating point the simplex weights can still
+land the witness point a small distance off, so containment is decided
+by comparing squared distance against a small scale-relative tolerance
+rather than requiring bit-exact equality. The closest-point route cannot
+be used for spheres and capsules — @b3ShapeDistance@'s @useRadii@ mode
+deliberately keeps witness points on the perimeter even when the shapes
+overlap (\"this way the points move smoothly\"), so for a target inside
+a radius-carrying shape it reports a surface point far from the target,
+which would read as non-containment.
 -}
 containsPointQuery
   :: forall w m
@@ -2502,16 +2547,31 @@ containsPointQuery point@(Vec3 px py pz) fltr = do
       -- coordinates involved, so a fixed epsilon would be too tight far
       -- from the origin and too loose near it
       tolerance = 1e-9 * (1 + px * px + py * py + pz * pz)
+      contains s = do
+        ty <- B3Shape.getType s
+        case ty of
+          B3T.SphereShape -> do
+            B3T.Sphere c r <- B3Shape.getSphere s
+            b <- B3Shape.getBody s
+            lp <- B3Body.getLocalPoint b point
+            pure (vecLenSq (vecSub lp c) <= r * r)
+          B3T.CapsuleShape -> do
+            B3T.Capsule c1 c2 r <- B3Shape.getCapsule s
+            b <- B3Shape.getBody s
+            lp <- B3Body.getLocalPoint b point
+            pure (segmentDistSq lp c1 c2 <= r * r)
+          _ -> do
+            Vec3 cx cy cz <- B3Shape.getClosestPoint s point
+            let
+              dx = cx - px
+              dy = cy - py
+              dz = cz - pz
+            pure (dx * dx + dy * dy + dz * dz <= tolerance)
       visit s = do
         hit <- shapeEntities sp s
         forM_ hit $ \(_, Entity bodyIx) -> do
-          Vec3 cx cy cz <- B3Shape.getClosestPoint s point
-          let
-            dx = cx - px
-            dy = cy - py
-            dz = cz - pz
-            distSq = dx * dx + dy * dy + dz * dz
-          when (distSq <= tolerance) $ modifyIORef' found (IS.insert bodyIx)
+          inside <- contains s
+          when inside $ modifyIORef' found (IS.insert bodyIx)
         pure True
     _ <- withOverlapResultFcn visit $ \fp ctx ->
       B3World.overlapAABB (spWorld sp) (AABB point point) qf fp ctx
@@ -2586,8 +2646,13 @@ vecMulAdd a s b = vecAdd a (vecScale s b)
 vecMulSub :: Vec3 -> Float -> Vec3 -> Vec3
 vecMulSub a s b = vecSub a (vecScale s b)
 
-clampFloat :: Float -> Float -> Float -> Float
-clampFloat x lo hi = max lo (min hi x)
+-- | Squared distance from a point to the segment between two points.
+segmentDistSq :: Vec3 -> Vec3 -> Vec3 -> Float
+segmentDistSq p a b = vecLenSq (vecSub p (vecMulAdd a t ab))
+  where
+    ab = vecSub b a
+    t = clamp (0, 1) (if lenSq == 0 then 0 else vecDot (vecSub p a) ab / lenSq)
+    lenSq = vecLenSq ab
 
 -- | A 'B3T.PlaneResult' as a fresh 'MoverPlane': no push limit (the sample's per-shape @maxPush@ user data isn't exposed here) and velocity always clipped.
 mkMoverPlane :: B3T.PlaneResult -> MoverPlane
@@ -2610,7 +2675,7 @@ solvePlanesStep = go [] 0
         separation = planeSeparation (mpPlane p) delta + linearSlop
         push = negate separation
         accumulated = mpPush p
-        newPush = clampFloat (accumulated + push) 0 (mpPushLimit p)
+        newPush = clamp (0, mpPushLimit p) (accumulated + push)
         pushDelta = newPush - accumulated
         Plane n _ = mpPlane p
         delta' = vecMulAdd delta pushDelta n

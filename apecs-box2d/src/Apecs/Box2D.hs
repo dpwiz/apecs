@@ -147,7 +147,7 @@ module Apecs.Box2D
 
 import Apecs
 import Apecs.Core
-import Control.Monad (forM, forM_, when)
+import Control.Monad (filterM, forM, forM_, when)
 import Control.Monad.IO.Class (MonadIO)
 import Data.IORef
 import Data.IntMap.Strict (IntMap)
@@ -155,12 +155,12 @@ import Data.IntMap.Strict qualified as IM
 import Data.IntSet qualified as IS
 import Data.List (sortOn)
 import Data.Maybe (catMaybes)
+import Data.Ord (clamp)
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
 import Data.Word (Word8)
 import Foreign.C.String (peekCString, withCString)
-import Foreign.ForeignPtr (ForeignPtr, newForeignPtr, withForeignPtr)
-import Foreign.Marshal.Alloc (finalizerFree, free, mallocBytes)
+import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrBytes, withForeignPtr)
 import Foreign.Marshal.Utils (fromBool, toBool)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 
@@ -393,6 +393,18 @@ jointIsKind sp ety kinds = do
   case IM.lookup ety m of
     Nothing -> pure False
     Just (JointRecord j _) -> (`elem` kinds) <$> B2Joint.getType j
+
+{- | The entities whose 'Joint' engine type is one of the given kinds.
+Kind-restricted components must keep their members consistent with
+'jointIsKind' in @explExists@: @cmap@\/@cfold@ call @explGet@ on every
+member without an existence check, and an unfiltered members list
+would hand joints of the wrong kind to a type-specific engine getter.
+-}
+jointKindMembers :: (MonadIO m) => B2Space c -> [B2T.JointType] -> m (U.Vector Int)
+jointKindMembers sp kinds = liftIO $ do
+  m <- readIORef (spJoints sp)
+  U.fromList . map fst
+    <$> filterM (\(_, JointRecord j _) -> (`elem` kinds) <$> B2Joint.getType j) (IM.toList m)
 
 -- Space sub-components ----------------------------------------------------
 
@@ -1286,8 +1298,8 @@ createGeometry b sd geo = case geo of
     rot <- makeRot angle
     B2Collision.makeOffsetRoundedPolygon hull center rot r >>= B2Shape.createPolygon b sd
 
-{- | A shape def with the surface material, density and filter carried
-over from the shape being replaced, if any.
+{- | A shape def with the surface material, density, filter and sensor
+flag carried over from the shape being replaced, if any.
 -}
 carryMaterial :: B2T.ShapeDef -> Maybe ShapeRecord -> IO B2T.ShapeDef
 carryMaterial sd Nothing = pure sd
@@ -1295,11 +1307,13 @@ carryMaterial sd (Just (ShapeRecord s _)) = do
   material <- B2Shape.getSurfaceMaterial s
   density <- B2Shape.getDensity s
   filtr <- B2Shape.getFilter s
+  sensor <- B2Shape.isSensor s
   pure
     sd
       { B2T.shapeDefMaterial = material
       , B2T.shapeDefDensity = density
       , B2T.shapeDefFilter = filtr
+      , B2T.shapeDefIsSensor = fromBool sensor
       }
 
 {- | Create a fresh engine shape for a 'Shape' value with the given def,
@@ -1382,7 +1396,12 @@ The segments the engine creates for a chain are its own internal
 (there is no matching 'Shape' component for them), so contacts against
 them do not currently surface in 'Collisions', 'CollisionsEnd' or
 'Impacts' — those globals resolve engine shapes back to entities through
-the registry and silently drop anything not found there.
+the registry and silently drop anything not found there. The queries
+have the same blind spot: 'segmentQueryAll' and 'containsPointQuery'
+drop hits on chain segments, and 'segmentQuery' returns 'Nothing'
+outright when a chain segment is the closest hit — the chain occludes
+whatever lies behind it rather than being skipped. Chains still collide
+normally; only event and query reporting is affected.
 -}
 data Chain = Chain Entity (VS.Vector Vec2) Bool
   deriving (Eq, Show)
@@ -1557,7 +1576,10 @@ cannot change a live shape from sensor to solid or back, so setting
 this recreates the engine shape (as 'Shape' does, preserving 'Density',
 'Friction', 'Elasticity' and 'CollisionFilter') whenever the requested
 value differs from the shape's current one; setting the value it
-already has is a no-op. Reads reflect the engine.
+already has is a no-op. Re-setting 'Shape' preserves the sensor flag
+the same way. Reads reflect the engine. Setting it on an entity that
+has no 'Shape' yet is a silent no-op, so in a 'newEntity' tuple put
+'Shape' before 'Sensor' — components are set left to right.
 -}
 newtype Sensor = Sensor Bool
   deriving (Eq, Show)
@@ -1892,6 +1914,10 @@ on an entity with no 'Joint', is a silent no-op.
 newtype MotorSpeed = MotorSpeed Float
   deriving (Eq, Show)
 
+-- | Joint kinds 'MotorSpeed' covers; keeps exists\/get\/members in sync.
+motorSpeedKinds :: [B2T.JointType]
+motorSpeedKinds = [B2T.RevoluteJoint, B2T.PrismaticJoint, B2T.WheelJoint]
+
 instance Component MotorSpeed where
   type Storage MotorSpeed = B2Space MotorSpeed
 
@@ -1899,7 +1925,7 @@ instance (MonadIO m, Has w m Physics) => Has w m MotorSpeed where
   getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
 
 instance (MonadIO m) => ExplGet m (B2Space MotorSpeed) where
-  explExists sp ety = liftIO $ jointIsKind sp ety [B2T.RevoluteJoint, B2T.PrismaticJoint, B2T.WheelJoint]
+  explExists sp ety = liftIO $ jointIsKind sp ety motorSpeedKinds
   explGet sp ety = liftIO $ withJoint sp ety $ \j -> do
     ty <- B2Joint.getType j
     MotorSpeed <$> case ty of
@@ -1918,7 +1944,7 @@ instance (MonadIO m) => ExplSet m (B2Space MotorSpeed) where
         _ -> pure ()
 
 instance (MonadIO m) => ExplMembers m (B2Space MotorSpeed) where
-  explMembers = jointMembers
+  explMembers sp = jointKindMembers sp motorSpeedKinds
 
 {- | The motor's maximum torque on a 'Joint', usually in newton-meters:
 a revolute joint's motor, or a wheel joint's spin motor ('WheelJoint',
@@ -1930,6 +1956,10 @@ entity with no 'Joint', is a silent no-op.
 newtype MotorMaxTorque = MotorMaxTorque Float
   deriving (Eq, Show)
 
+-- | Joint kinds 'MotorMaxTorque' covers; keeps exists\/get\/members in sync.
+motorMaxTorqueKinds :: [B2T.JointType]
+motorMaxTorqueKinds = [B2T.RevoluteJoint, B2T.WheelJoint]
+
 instance Component MotorMaxTorque where
   type Storage MotorMaxTorque = B2Space MotorMaxTorque
 
@@ -1937,7 +1967,7 @@ instance (MonadIO m, Has w m Physics) => Has w m MotorMaxTorque where
   getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
 
 instance (MonadIO m) => ExplGet m (B2Space MotorMaxTorque) where
-  explExists sp ety = liftIO $ jointIsKind sp ety [B2T.RevoluteJoint, B2T.WheelJoint]
+  explExists sp ety = liftIO $ jointIsKind sp ety motorMaxTorqueKinds
   explGet sp ety = liftIO $ withJoint sp ety $ \j -> do
     ty <- B2Joint.getType j
     MotorMaxTorque <$> case ty of
@@ -1954,7 +1984,7 @@ instance (MonadIO m) => ExplSet m (B2Space MotorMaxTorque) where
         _ -> pure ()
 
 instance (MonadIO m) => ExplMembers m (B2Space MotorMaxTorque) where
-  explMembers = jointMembers
+  explMembers sp = jointKindMembers sp motorMaxTorqueKinds
 
 {- | The motor's maximum force on a prismatic 'Joint' ('PrismaticJoint',
 'PrismaticSpringJoint', 'PrismaticMotorJoint'), usually in newtons.
@@ -1965,6 +1995,10 @@ with no 'Joint', is a silent no-op.
 newtype MotorMaxForce = MotorMaxForce Float
   deriving (Eq, Show)
 
+-- | Joint kinds 'MotorMaxForce' covers; keeps exists\/get\/members in sync.
+motorMaxForceKinds :: [B2T.JointType]
+motorMaxForceKinds = [B2T.PrismaticJoint]
+
 instance Component MotorMaxForce where
   type Storage MotorMaxForce = B2Space MotorMaxForce
 
@@ -1972,7 +2006,7 @@ instance (MonadIO m, Has w m Physics) => Has w m MotorMaxForce where
   getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
 
 instance (MonadIO m) => ExplGet m (B2Space MotorMaxForce) where
-  explExists sp ety = liftIO $ jointIsKind sp ety [B2T.PrismaticJoint]
+  explExists sp ety = liftIO $ jointIsKind sp ety motorMaxForceKinds
   explGet sp ety = liftIO $ withJoint sp ety $ fmap MotorMaxForce . B2PrismaticJoint.getMaxMotorForce
 
 instance (MonadIO m) => ExplSet m (B2Space MotorMaxForce) where
@@ -1984,7 +2018,7 @@ instance (MonadIO m) => ExplSet m (B2Space MotorMaxForce) where
         _ -> pure ()
 
 instance (MonadIO m) => ExplMembers m (B2Space MotorMaxForce) where
-  explMembers = jointMembers
+  explMembers sp = jointKindMembers sp motorMaxForceKinds
 
 {- | The (lower, upper) limit range on a 'Joint': radians on a revolute
 joint, meters on a prismatic joint, or the (minimum, maximum) length
@@ -1997,6 +2031,10 @@ on an entity with no 'Joint', is a silent no-op.
 data JointLimits = JointLimits !Float !Float
   deriving (Eq, Show)
 
+-- | Joint kinds 'JointLimits' covers; keeps exists\/get\/members in sync.
+jointLimitsKinds :: [B2T.JointType]
+jointLimitsKinds = [B2T.RevoluteJoint, B2T.PrismaticJoint, B2T.DistanceJoint]
+
 instance Component JointLimits where
   type Storage JointLimits = B2Space JointLimits
 
@@ -2004,7 +2042,7 @@ instance (MonadIO m, Has w m Physics) => Has w m JointLimits where
   getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
 
 instance (MonadIO m) => ExplGet m (B2Space JointLimits) where
-  explExists sp ety = liftIO $ jointIsKind sp ety [B2T.RevoluteJoint, B2T.PrismaticJoint, B2T.DistanceJoint]
+  explExists sp ety = liftIO $ jointIsKind sp ety jointLimitsKinds
   explGet sp ety = liftIO $ withJoint sp ety $ \j -> do
     ty <- B2Joint.getType j
     case ty of
@@ -2023,7 +2061,7 @@ instance (MonadIO m) => ExplSet m (B2Space JointLimits) where
         _ -> pure ()
 
 instance (MonadIO m) => ExplMembers m (B2Space JointLimits) where
-  explMembers = jointMembers
+  explMembers sp = jointKindMembers sp jointLimitsKinds
 
 {- | Whether the two bodies connected by a 'Joint' can collide with each
 other. Applies to every joint kind. Restores the parity apecs-physics
@@ -2374,10 +2412,13 @@ containsPointQuery point fltr = do
     qf <- toQueryFilter fltr
     found <- newIORef IS.empty
     let visit s = do
-          hit <- shapeEntities sp s
-          forM_ hit $ \(_, Entity bodyIx) -> do
-            inside <- B2Shape.testPoint s point
-            when inside $ modifyIORef' found (IS.insert bodyIx)
+          -- the exact test first: most broad-phase candidates only
+          -- overlap by AABB, and testPoint is one FFI call while entity
+          -- resolution is two plus a registry lookup
+          inside <- B2Shape.testPoint s point
+          when inside $ do
+            hit <- shapeEntities sp s
+            forM_ hit $ \(_, Entity bodyIx) -> modifyIORef' found (IS.insert bodyIx)
           pure True
     _ <- withOverlapResultFcn visit $ \fp ctx ->
       B2World.overlapAABB (spWorld sp) vec2Zero (AABB point point) qf fp ctx
@@ -2451,9 +2492,6 @@ vecMulAdd a s b = vecAdd a (vecScale s b)
 vecMulSub :: Vec2 -> Float -> Vec2 -> Vec2
 vecMulSub a s b = vecSub a (vecScale s b)
 
-clampFloat :: Float -> Float -> Float -> Float
-clampFloat x lo hi = max lo (min hi x)
-
 -- | A 'B2T.PlaneResult' as a fresh 'MoverPlane': no push limit (the sample's per-shape @maxPush@ user data isn't exposed here) and velocity always clipped.
 mkMoverPlane :: B2T.PlaneResult -> MoverPlane
 mkMoverPlane pr =
@@ -2475,7 +2513,7 @@ solvePlanesStep = go [] 0
         separation = planeSeparation (mpPlane p) delta + linearSlop
         push = negate separation
         accumulated = mpPush p
-        newPush = clampFloat (accumulated + push) 0 (mpPushLimit p)
+        newPush = clamp (0, mpPushLimit p) (accumulated + push)
         pushDelta = newPush - accumulated
         Plane n _ = mpPlane p
         delta' = vecMulAdd delta pushDelta n
@@ -2702,14 +2740,9 @@ snapshotWorld = do
     if need <= 0 then
       pure Nothing
     else do
-      buf <- mallocBytes need
-      written <- B2World.snapshot wid buf need
-      if written /= need then do
-        free buf
-        pure Nothing
-      else do
-        fp <- newForeignPtr finalizerFree buf
-        pure (Just (Snapshot fp need))
+      fp <- mallocForeignPtrBytes need
+      written <- withForeignPtr fp $ \buf -> B2World.snapshot wid buf need
+      pure $ if written /= need then Nothing else Just (Snapshot fp need)
 
 {- | Restore the world in place from a 'Snapshot' taken from it earlier.
 'B2BodyId'\/'B2ShapeId'\/'B2JointId' values held from objects that
