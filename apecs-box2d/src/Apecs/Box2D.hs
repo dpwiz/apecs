@@ -29,6 +29,7 @@ module Apecs.Box2D
   , SleepingEnabled (..)
   , stepPhysics
   , destroyPhysics
+  , explode
   , getWorldId
 
     -- * Body
@@ -212,6 +213,40 @@ destroyPhysics = do
     writeIORef (spBodies sp) mempty
     writeIORef (spShapes sp) mempty
     writeIORef (spJoints sp) mempty
+
+{- | Apply a radial impulse to every dynamic body within a radius of a
+world point, as if from an explosion: each affected shape is pushed
+away from the center along the line to its nearest surface point,
+scaled by how much of its perimeter faces the blast. Only circles,
+capsules and polygons receive an impulse (segments do not); a body is
+woken even if it was asleep. The impulse has no soft falloff by
+default, so it cuts off sharply at the radius, and every shape passes
+the default filter (nothing is masked out). A negative impulse pulls
+bodies inward instead of pushing them.
+-}
+explode
+  :: forall w m
+   . (MonadIO m, Has w m Physics)
+  => WVec
+  -- ^ Explosion center, in world coordinates.
+  -> Float
+  -- ^ Radius: shapes within this distance get the full impulse.
+  -> Float
+  {- ^ Impulse per unit length of shape perimeter facing the blast;
+  negative for an implosion.
+  -}
+  -> SystemT w m ()
+explode center radius impulse = do
+  sp :: B2Space Physics <- getStore
+  liftIO $ do
+    def <- B2T.defaultExplosionDef
+    B2World.explode
+      (spWorld sp)
+      def
+        { B2T.explosionDefPosition = center
+        , B2T.explosionDefRadius = radius
+        , B2T.explosionDefImpulsePerLength = impulse
+        }
 
 -- Registries ----------------------------------------------------------------
 
