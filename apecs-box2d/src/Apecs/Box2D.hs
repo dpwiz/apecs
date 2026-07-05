@@ -26,6 +26,7 @@ module Apecs.Box2D
   , Gravity (..)
   , earthGravity
   , Substeps (..)
+  , SleepingEnabled (..)
   , stepPhysics
   , destroyPhysics
   , getWorldId
@@ -47,6 +48,9 @@ module Apecs.Box2D
   , AngularDamping (..)
   , GravityScale (..)
   , BulletBody (..)
+  , Awake (..)
+  , SleepEnabled (..)
+  , SleepThreshold (..)
   , B2BodyId (..)
 
     -- * Shape
@@ -304,6 +308,27 @@ instance (MonadIO m) => ExplGet m (B2Space Substeps) where
 
 instance (MonadIO m) => ExplSet m (B2Space Substeps) where
   explSet sp _ (Substeps n) = liftIO $ writeIORef (spSubsteps sp) (max 1 n)
+
+{- | Whether bodies in this world may fall asleep at all (on by
+default). Disabling it wakes everything and saves the bookkeeping when
+nothing would sleep anyway; sleeping gains performance on large scenes
+where most bodies are at rest. Per-body control is 'SleepEnabled'.
+-}
+newtype SleepingEnabled = SleepingEnabled Bool
+  deriving (Eq, Show)
+
+instance Component SleepingEnabled where
+  type Storage SleepingEnabled = B2Space SleepingEnabled
+
+instance (MonadIO m, Has w m Physics) => Has w m SleepingEnabled where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space SleepingEnabled) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ SleepingEnabled <$> B2World.isSleepingEnabled (spWorld sp)
+
+instance (MonadIO m) => ExplSet m (B2Space SleepingEnabled) where
+  explSet sp _ (SleepingEnabled e) = liftIO $ B2World.enableSleeping (spWorld sp) e
 
 -- Body --------------------------------------------------------------------
 
@@ -687,6 +712,81 @@ instance (MonadIO m) => ExplSet m (B2Space BulletBody) where
       B2Body.setBullet bd b
 
 instance (MonadIO m) => ExplMembers m (B2Space BulletBody) where
+  explMembers = bodyMembers
+
+{- | Whether a 'Body' is currently awake and simulating. Set it to wake
+a body explicitly — e.g. after teleporting it via 'Position' — or to
+put it to sleep. Waking or sleeping a body extends to the whole island
+of bodies touching it.
+-}
+newtype Awake = Awake Bool
+  deriving (Eq, Show)
+
+instance Component Awake where
+  type Storage Awake = B2Space Awake
+
+instance (MonadIO m, Has w m Physics) => Has w m Awake where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space Awake) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap Awake . B2Body.isAwake
+
+instance (MonadIO m) => ExplSet m (B2Space Awake) where
+  explSet sp ety (Awake a) = liftIO $
+    overBody sp ety $ \b ->
+      B2Body.setAwake b a
+
+instance (MonadIO m) => ExplMembers m (B2Space Awake) where
+  explMembers = bodyMembers
+
+{- | Whether a 'Body' may fall asleep at all (on by default). Disabling
+it wakes the body (and its island). World-level control is
+'SleepingEnabled'.
+-}
+newtype SleepEnabled = SleepEnabled Bool
+  deriving (Eq, Show)
+
+instance Component SleepEnabled where
+  type Storage SleepEnabled = B2Space SleepEnabled
+
+instance (MonadIO m, Has w m Physics) => Has w m SleepEnabled where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space SleepEnabled) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap SleepEnabled . B2Body.isSleepEnabled
+
+instance (MonadIO m) => ExplSet m (B2Space SleepEnabled) where
+  explSet sp ety (SleepEnabled e) = liftIO $
+    overBody sp ety $ \b ->
+      B2Body.enableSleep b e
+
+instance (MonadIO m) => ExplMembers m (B2Space SleepEnabled) where
+  explMembers = bodyMembers
+
+{- | The speed below which a 'Body' may fall asleep, usually in meters
+per second.
+-}
+newtype SleepThreshold = SleepThreshold Float
+  deriving (Eq, Show)
+
+instance Component SleepThreshold where
+  type Storage SleepThreshold = B2Space SleepThreshold
+
+instance (MonadIO m, Has w m Physics) => Has w m SleepThreshold where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space SleepThreshold) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap SleepThreshold . B2Body.getSleepThreshold
+
+instance (MonadIO m) => ExplSet m (B2Space SleepThreshold) where
+  explSet sp ety (SleepThreshold t) = liftIO $
+    overBody sp ety $ \b ->
+      B2Body.setSleepThreshold b t
+
+instance (MonadIO m) => ExplMembers m (B2Space SleepThreshold) where
   explMembers = bodyMembers
 
 -- Shape ---------------------------------------------------------------------
