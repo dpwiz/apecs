@@ -78,7 +78,7 @@ initialize = do
         newEntity_ (Joint paddle grid (spec (Vec2 cx 0)))
   mkPaddle aquamarine (-1.5) (\p -> RotarySpringJoint p 1 0.1)
   mkPaddle yellow (-0.5) (\p -> RotaryLimitJoint p (-0.6) 0.6)
-  mkPaddle cyan 0.5 (\p -> MotorJoint p pi 5)
+  mkPaddle cyan 0.5 (\p -> RotaryMotorJoint p pi 5)
 
   weldA <- mkBox chartreuse (Vec2 1.4 0.1) 0.15 0.05
   weldB <- mkBox chartreuse (Vec2 1.5 (-0.05)) 0.05 0.15
@@ -104,7 +104,7 @@ initialize = do
 
   -- a spinner batting a couple of boxes around its cell
   spinner <- mkBox cyan (Vec2 1.5 (-1.15)) 0.3 0.05
-  newEntity_ (Joint spinner grid (MotorJoint (Vec2 1.5 (-1.15)) 2 10))
+  newEntity_ (Joint spinner grid (RotaryMotorJoint (Vec2 1.5 (-1.15)) 2 10))
   _ <- mkBox white (Vec2 1.3 (-0.7)) 0.07 0.07
   _ <- mkBox white (Vec2 1.7 (-0.7)) 0.07 0.07
 

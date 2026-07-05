@@ -122,12 +122,15 @@ import Box2D.Id (BodyId, JointId, ShapeId, WorldId)
 import Box2D.Joint qualified as B2Joint
 import Box2D.MathFunctions (makeRot, rotGetAngle)
 import Box2D.MathTypes (AABB (..), Rot (..), Transform (..), Vec2 (..), vec2Zero)
+import Box2D.MotorJoint qualified as B2MotorJoint
+import Box2D.PrismaticJoint qualified as B2PrismaticJoint
 import Box2D.RevoluteJoint qualified as B2RevoluteJoint
 import Box2D.Shape qualified as B2Shape
 import Box2D.Types (Filter (..))
 import Box2D.Types qualified as B2T
 import Box2D.UserData (getUserIndex, setUserIndex)
 import Box2D.WeldJoint qualified as B2WeldJoint
+import Box2D.WheelJoint qualified as B2WheelJoint
 import Box2D.World qualified as B2World
 
 -- | A vector in body-space coordinates.
@@ -1283,7 +1286,8 @@ instance (MonadIO m) => ExplMembers m (B2Space Sensor) where
 
 {- | A joint between two bodies, specified in world space at creation
 time. Joint frames are derived from the given world points with zero
-reference rotation.
+reference rotation, except for the prismatic and wheel variants, whose
+frames are additionally aligned to the given world axis.
 -}
 data JointSpec
   = -- | A revolute joint: the bodies rotate around a shared world point.
@@ -1307,7 +1311,33 @@ data JointSpec
   | {- | A motorised pivot driving the relative angle at a speed (radians
     per second) with a maximum torque.
     -}
-    MotorJoint WVec Float Float
+    RotaryMotorJoint WVec Float Float
+  | {- | A prismatic joint: the bodies slide relative to each other along
+    a world-space axis through the anchor, free between (lower, upper)
+    meters from the anchor, with no relative rotation.
+    -}
+    PrismaticJoint WVec WVec Float Float
+  | {- | A prismatic joint with a damped spring back to the creation
+    translation: stiffness in Hertz and a damping ratio.
+    -}
+    PrismaticSpringJoint WVec WVec Float Float
+  | {- | A motorised prismatic joint driving the translation at a speed
+    (meters per second) with a maximum force.
+    -}
+    PrismaticMotorJoint WVec WVec Float Float
+  | {- | A wheel joint: entity A is the chassis and entity B the wheel,
+    which spins freely and rides the suspension spring along the axis
+    through the anchor, at the given stiffness (Hertz) and damping
+    ratio.
+    -}
+    WheelJoint WVec WVec Float Float
+  | {- | Drives the relative velocity between the bodies at the anchor:
+    desired linear velocity and its maximum force, then desired angular
+    velocity and its maximum torque. With zero velocities it acts as
+    top-down friction, damping relative motion without pinning the
+    bodies to the anchor.
+    -}
+    MotorJoint WVec WVec Float Float Float
   deriving (Eq, Show)
 
 {- | Gives an entity a joint connecting the 'Body's of the two given
@@ -1346,6 +1376,47 @@ baseAt jd a b pA pB = do
       , B2T.jointDefLocalFrameB = fb
       }
 
+-- | Compose two 2D rotations (apply the right one first).
+rotMul :: Rot -> Rot -> Rot
+rotMul (Rot c1 s1) (Rot c2 s2) = Rot (c1 * c2 - s1 * s2) (s1 * c2 + c1 * s2)
+
+-- | Normalize a vector; errors on a zero (or NaN) length, which has no direction.
+normalizeAxis :: Vec2 -> Vec2
+normalizeAxis (Vec2 x y)
+  | m > 0 = Vec2 (x / m) (y / m)
+  | otherwise = error "joint axis has zero length"
+  where
+    m = sqrt (x * x + y * y)
+
+{- | A joint frame at a world point whose x-axis points along a world
+axis. World orientation of a joint frame is @rot(body) * rot(local)@;
+cancelling the body rotation and then composing with the rotation that
+carries the canonical x-axis onto the world axis (a unit direction
+vector is itself that rotation) gives a frame whose x-axis is that
+world axis, independent of the body's own orientation.
+-}
+axisFrameAt :: BodyId -> Vec2 -> Vec2 -> IO Transform
+axisFrameAt b p axis = do
+  local <- B2Body.getLocalPoint b p
+  Rot c s <- B2Body.getRotation b
+  let Vec2 ux uy = normalizeAxis axis
+  pure (Transform local (rotMul (Rot c (-s)) (Rot ux uy)))
+
+{- | Fill a joint def's base with the two bodies and frames at a shared
+world anchor, both x-axis aligned to a world axis.
+-}
+axisBaseAt :: B2T.JointDef -> BodyId -> BodyId -> Vec2 -> Vec2 -> IO B2T.JointDef
+axisBaseAt jd a b p axis = do
+  fa <- axisFrameAt a p axis
+  fb <- axisFrameAt b p axis
+  pure
+    jd
+      { B2T.jointDefBodyIdA = a
+      , B2T.jointDefBodyIdB = b
+      , B2T.jointDefLocalFrameA = fa
+      , B2T.jointDefLocalFrameB = fb
+      }
+
 createJoint :: WorldId -> BodyId -> BodyId -> JointSpec -> IO JointId
 createJoint w a b spec = case spec of
   PivotJoint p -> revoluteAt p id
@@ -1363,7 +1434,7 @@ createJoint w a b spec = case spec of
         , B2T.revoluteJointDefLowerAngle = lower
         , B2T.revoluteJointDefUpperAngle = upper
         }
-  MotorJoint p speed maxTorque ->
+  RotaryMotorJoint p speed maxTorque ->
     revoluteAt p $ \jd ->
       jd
         { B2T.revoluteJointDefEnableMotor = 1
@@ -1393,6 +1464,52 @@ createJoint w a b spec = case spec of
     jd <- B2T.defaultWeldJointDef
     base <- baseAt (B2T.weldJointDefBase jd) a b p p
     B2WeldJoint.create w jd{B2T.weldJointDefBase = base}
+  PrismaticJoint p axis lower upper ->
+    -- prismatic joints already forbid relative rotation, so the limit
+    -- alone is enough to keep the translation free within it
+    prismaticAt p axis $ \jd ->
+      jd
+        { B2T.prismaticJointDefEnableLimit = 1
+        , B2T.prismaticJointDefLowerTranslation = lower
+        , B2T.prismaticJointDefUpperTranslation = upper
+        }
+  PrismaticSpringJoint p axis hertz damping ->
+    prismaticAt p axis $ \jd ->
+      jd
+        { B2T.prismaticJointDefEnableSpring = 1
+        , B2T.prismaticJointDefHertz = hertz
+        , B2T.prismaticJointDefDampingRatio = damping
+        }
+  PrismaticMotorJoint p axis speed maxForce ->
+    prismaticAt p axis $ \jd ->
+      jd
+        { B2T.prismaticJointDefEnableMotor = 1
+        , B2T.prismaticJointDefMotorSpeed = speed
+        , B2T.prismaticJointDefMaxMotorForce = maxForce
+        }
+  WheelJoint p axis hertz damping -> do
+    jd <- B2T.defaultWheelJointDef
+    base <- axisBaseAt (B2T.wheelJointDefBase jd) a b p axis
+    B2WheelJoint.create
+      w
+      jd
+        { B2T.wheelJointDefBase = base
+        , B2T.wheelJointDefEnableSpring = 1
+        , B2T.wheelJointDefHertz = hertz
+        , B2T.wheelJointDefDampingRatio = damping
+        }
+  MotorJoint p linVel maxForce angVel maxTorque -> do
+    jd <- B2T.defaultMotorJointDef
+    base <- baseAt (B2T.motorJointDefBase jd) a b p p
+    B2MotorJoint.create
+      w
+      jd
+        { B2T.motorJointDefBase = base
+        , B2T.motorJointDefLinearVelocity = linVel
+        , B2T.motorJointDefMaxVelocityForce = maxForce
+        , B2T.motorJointDefAngularVelocity = angVel
+        , B2T.motorJointDefMaxVelocityTorque = maxTorque
+        }
   where
     revoluteAt p f = do
       jd <- B2T.defaultRevoluteJointDef
@@ -1406,6 +1523,10 @@ createJoint w a b spec = case spec of
         Vec2 x2 y2 = pB
         len = sqrt ((x2 - x1) ^ (2 :: Int) + (y2 - y1) ^ (2 :: Int))
       B2DistanceJoint.create w (f jd){B2T.distanceJointDefBase = base, B2T.distanceJointDefLength = len}
+    prismaticAt p axis f = do
+      jd <- B2T.defaultPrismaticJointDef
+      base <- axisBaseAt (B2T.prismaticJointDefBase jd) a b p axis
+      B2PrismaticJoint.create w (f jd){B2T.prismaticJointDefBase = base}
 
 instance (MonadIO m) => ExplSet m (B2Space Joint) where
   explSet sp ety joint@(Joint (Entity aEty) (Entity bEty) spec) = liftIO $ when (aEty /= bEty) $ do

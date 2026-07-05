@@ -1292,7 +1292,7 @@ instance (MonadIO m) => ExplMembers m (B3Space Sensor) where
 
 {- | A joint between two bodies, specified in world space at creation
 time. Joint frames are derived from the given world points with zero
-reference rotation, except for the hinge, slider and wheel variants,
+reference rotation, except for the hinge, prismatic and wheel variants,
 whose frames are additionally aligned to the given world axis or axes.
 -}
 data JointSpec
@@ -1323,15 +1323,15 @@ data JointSpec
     each other along a world-space axis through the anchor, free
     between (lower, upper) meters.
     -}
-    SliderJoint WVec WVec Float Float
-  | {- | A slider with a damped spring back to the creation translation:
-    stiffness in Hertz and a damping ratio.
+    PrismaticJoint WVec WVec Float Float
+  | {- | A prismatic (slider) joint with a damped spring back to the
+    creation translation: stiffness in Hertz and a damping ratio.
     -}
-    SliderSpringJoint WVec WVec Float Float
-  | {- | A motorised slider driving the translation at a speed (meters
-    per second) with a maximum force.
+    PrismaticSpringJoint WVec WVec Float Float
+  | {- | A motorised prismatic (slider) joint driving the translation at
+    a speed (meters per second) with a maximum force.
     -}
-    SliderMotorJoint WVec WVec Float Float
+    PrismaticMotorJoint WVec WVec Float Float
   | {- | A wheel joint: entity A is the chassis and entity B the wheel.
     The wheel spins about the axle axis and the suspension lets it
     translate along the suspension axis through the anchor; the
@@ -1522,7 +1522,7 @@ createJoint w a b spec = case spec of
         , B3T.revoluteJointDefMotorSpeed = speed
         , B3T.revoluteJointDefMaxMotorTorque = maxTorque
         }
-  SliderJoint p axis lower upper ->
+  PrismaticJoint p axis lower upper ->
     -- prismatic joints already forbid relative rotation, so the limit
     -- alone is enough to keep the translation free within it
     sliderAt p axis $ \jd ->
@@ -1531,14 +1531,14 @@ createJoint w a b spec = case spec of
         , B3T.prismaticJointDefLowerTranslation = lower
         , B3T.prismaticJointDefUpperTranslation = upper
         }
-  SliderSpringJoint p axis hertz damping ->
+  PrismaticSpringJoint p axis hertz damping ->
     sliderAt p axis $ \jd ->
       jd
         { B3T.prismaticJointDefEnableSpring = 1
         , B3T.prismaticJointDefHertz = hertz
         , B3T.prismaticJointDefDampingRatio = damping
         }
-  SliderMotorJoint p axis speed maxForce ->
+  PrismaticMotorJoint p axis speed maxForce ->
     sliderAt p axis $ \jd ->
       jd
         { B3T.prismaticJointDefEnableMotor = 1

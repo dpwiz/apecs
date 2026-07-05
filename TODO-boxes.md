@@ -76,7 +76,7 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
   are fully bound with defaults; follows the existing `createJoint` pattern.
   Include the 2D-style sugar variants (limits/springs/motors) where the def
   supports them. (M)
-- [ ] **[2D] Add `PrismaticJoint`/`WheelJoint` (and Box2D's actual
+- [x] **[2D] Add `PrismaticJoint`/`WheelJoint` (and Box2D's actual
   `MotorJoint`) to `JointSpec`.** Wheel joint is the vehicle staple; the
   current `MotorJoint` name is a motorised revolute — consider renaming to
   `RotaryMotorJoint` when the real motor joint lands to avoid a trap. (M)
