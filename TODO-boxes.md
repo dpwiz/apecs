@@ -90,7 +90,7 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
   `castShape` remain deferred: the box-nd Haskell API has no way to build
   a `ShapeProxy` (opaque tag, no constructor/size exported), so they need
   an upstream `makeProxy`-with-allocation helper first.*
-- [ ] **Joint tuning sub-components on the joint entity: `MotorSpeed`,
+- [x] **Joint tuning sub-components on the joint entity: `MotorSpeed`,
   `MotorMaxTorque`/`MaxForce`, `JointLimits`, `CollideConnected`,
   read-only `JointForce`/`JointTorque`.** Re-setting `Joint` recreates the
   engine joint (resets accumulated state), so live motor control — the whole

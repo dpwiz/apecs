@@ -76,6 +76,13 @@ module Apecs.Box2D
     -- * Joint
   , JointSpec (..)
   , Joint (..)
+  , MotorSpeed (..)
+  , MotorMaxTorque (..)
+  , MotorMaxForce (..)
+  , JointLimits (..)
+  , CollideConnected (..)
+  , JointForce (..)
+  , JointTorque (..)
   , B2JointId (..)
 
     -- * Queries
@@ -311,11 +318,22 @@ shapeMembers sp = regMembers (spShapes sp)
 withJoint :: B2Space c -> Int -> (JointId -> IO a) -> IO a
 withJoint sp ety f = withReg "Joint" (spJoints sp) ety (\(JointRecord j _) -> f j)
 
+overJoint :: B2Space c -> Int -> (JointId -> IO ()) -> IO ()
+overJoint sp ety f = overReg (spJoints sp) ety (\(JointRecord j _) -> f j)
+
 jointExists :: (MonadIO m) => B2Space c -> Int -> m Bool
 jointExists sp = regExists (spJoints sp)
 
 jointMembers :: (MonadIO m) => B2Space c -> m (U.Vector Int)
 jointMembers sp = regMembers (spJoints sp)
+
+-- | Whether an entity has a 'Joint' whose engine type is one of the given kinds.
+jointIsKind :: B2Space c -> Int -> [B2T.JointType] -> IO Bool
+jointIsKind sp ety kinds = do
+  m <- readIORef (spJoints sp)
+  case IM.lookup ety m of
+    Nothing -> pure False
+    Just (JointRecord j _) -> (`elem` kinds) <$> B2Joint.getType j
 
 -- Space sub-components ----------------------------------------------------
 
@@ -1346,6 +1364,10 @@ data JointSpec
 {- | Gives an entity a joint connecting the 'Body's of the two given
 entities, which must be distinct (the engine rejects self-joints;
 setting one is a silent no-op). Reads return the exact value written.
+The tuning sub-components ('MotorSpeed', 'JointLimits', ...) mutate
+the live engine joint without touching the stored spec, so a re-set
+'Joint' recreates the joint from the original spec and discards
+tuning.
 -}
 data Joint = Joint Entity Entity JointSpec
   deriving (Eq, Show)
@@ -1572,6 +1594,220 @@ instance (MonadIO m) => ExplGet m (B2Space B2JointId) where
   explGet sp ety = liftIO $ withJoint sp ety (pure . B2JointId)
 
 instance (MonadIO m) => ExplMembers m (B2Space B2JointId) where
+  explMembers = jointMembers
+
+{- | The motor's target speed on a 'Joint': radians per second on a
+revolute joint ('PivotJoint', 'RotarySpringJoint', 'RotaryLimitJoint',
+'RotaryMotorJoint'), meters per second on a prismatic joint
+('PrismaticJoint', 'PrismaticSpringJoint', 'PrismaticMotorJoint'), or
+radians per second on a wheel joint's spin motor ('WheelJoint').
+Setting this also enables the corresponding motor, so a speed always
+takes effect immediately; use 'MotorMaxTorque'\/'MotorMaxForce' to cap
+it without starting it. The wheel's suspension spring and limit are
+not covered by this component. Setting it on any other joint kind, or
+on an entity with no 'Joint', is a silent no-op.
+-}
+newtype MotorSpeed = MotorSpeed Float
+  deriving (Eq, Show)
+
+instance Component MotorSpeed where
+  type Storage MotorSpeed = B2Space MotorSpeed
+
+instance (MonadIO m, Has w m Physics) => Has w m MotorSpeed where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space MotorSpeed) where
+  explExists sp ety = liftIO $ jointIsKind sp ety [B2T.RevoluteJoint, B2T.PrismaticJoint, B2T.WheelJoint]
+  explGet sp ety = liftIO $ withJoint sp ety $ \j -> do
+    ty <- B2Joint.getType j
+    MotorSpeed <$> case ty of
+      B2T.PrismaticJoint -> B2PrismaticJoint.getMotorSpeed j
+      B2T.WheelJoint -> B2WheelJoint.getMotorSpeed j
+      _ -> B2RevoluteJoint.getMotorSpeed j
+
+instance (MonadIO m) => ExplSet m (B2Space MotorSpeed) where
+  explSet sp ety (MotorSpeed v) = liftIO $
+    overJoint sp ety $ \j -> do
+      ty <- B2Joint.getType j
+      case ty of
+        B2T.RevoluteJoint -> B2RevoluteJoint.setMotorSpeed j v >> B2RevoluteJoint.enableMotor j True
+        B2T.PrismaticJoint -> B2PrismaticJoint.setMotorSpeed j v >> B2PrismaticJoint.enableMotor j True
+        B2T.WheelJoint -> B2WheelJoint.setMotorSpeed j v >> B2WheelJoint.enableMotor j True
+        _ -> pure ()
+
+instance (MonadIO m) => ExplMembers m (B2Space MotorSpeed) where
+  explMembers = jointMembers
+
+{- | The motor's maximum torque on a 'Joint', usually in newton-meters:
+a revolute joint's motor, or a wheel joint's spin motor ('WheelJoint',
+suspension and limit not covered). Unlike 'MotorSpeed', setting this
+only sets the cap — it does not enable the motor, so setting a cap
+alone does not start it. Setting it on any other joint kind, or on an
+entity with no 'Joint', is a silent no-op.
+-}
+newtype MotorMaxTorque = MotorMaxTorque Float
+  deriving (Eq, Show)
+
+instance Component MotorMaxTorque where
+  type Storage MotorMaxTorque = B2Space MotorMaxTorque
+
+instance (MonadIO m, Has w m Physics) => Has w m MotorMaxTorque where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space MotorMaxTorque) where
+  explExists sp ety = liftIO $ jointIsKind sp ety [B2T.RevoluteJoint, B2T.WheelJoint]
+  explGet sp ety = liftIO $ withJoint sp ety $ \j -> do
+    ty <- B2Joint.getType j
+    MotorMaxTorque <$> case ty of
+      B2T.WheelJoint -> B2WheelJoint.getMaxMotorTorque j
+      _ -> B2RevoluteJoint.getMaxMotorTorque j
+
+instance (MonadIO m) => ExplSet m (B2Space MotorMaxTorque) where
+  explSet sp ety (MotorMaxTorque v) = liftIO $
+    overJoint sp ety $ \j -> do
+      ty <- B2Joint.getType j
+      case ty of
+        B2T.RevoluteJoint -> B2RevoluteJoint.setMaxMotorTorque j v
+        B2T.WheelJoint -> B2WheelJoint.setMaxMotorTorque j v
+        _ -> pure ()
+
+instance (MonadIO m) => ExplMembers m (B2Space MotorMaxTorque) where
+  explMembers = jointMembers
+
+{- | The motor's maximum force on a prismatic 'Joint' ('PrismaticJoint',
+'PrismaticSpringJoint', 'PrismaticMotorJoint'), usually in newtons.
+Like 'MotorMaxTorque', setting this only sets the cap — it does not
+enable the motor. Setting it on any other joint kind, or on an entity
+with no 'Joint', is a silent no-op.
+-}
+newtype MotorMaxForce = MotorMaxForce Float
+  deriving (Eq, Show)
+
+instance Component MotorMaxForce where
+  type Storage MotorMaxForce = B2Space MotorMaxForce
+
+instance (MonadIO m, Has w m Physics) => Has w m MotorMaxForce where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space MotorMaxForce) where
+  explExists sp ety = liftIO $ jointIsKind sp ety [B2T.PrismaticJoint]
+  explGet sp ety = liftIO $ withJoint sp ety $ fmap MotorMaxForce . B2PrismaticJoint.getMaxMotorForce
+
+instance (MonadIO m) => ExplSet m (B2Space MotorMaxForce) where
+  explSet sp ety (MotorMaxForce v) = liftIO $
+    overJoint sp ety $ \j -> do
+      ty <- B2Joint.getType j
+      case ty of
+        B2T.PrismaticJoint -> B2PrismaticJoint.setMaxMotorForce j v
+        _ -> pure ()
+
+instance (MonadIO m) => ExplMembers m (B2Space MotorMaxForce) where
+  explMembers = jointMembers
+
+{- | The (lower, upper) limit range on a 'Joint': radians on a revolute
+joint, meters on a prismatic joint, or the (minimum, maximum) length
+in meters on a distance joint ('DistanceJoint', 'SpringJoint',
+'SlideJoint'). Setting this also enables the limit; on a distance
+joint the limit only has an effect while its spring is enabled (see
+'SpringJoint'\/'SlideJoint'). Setting it on any other joint kind, or
+on an entity with no 'Joint', is a silent no-op.
+-}
+data JointLimits = JointLimits !Float !Float
+  deriving (Eq, Show)
+
+instance Component JointLimits where
+  type Storage JointLimits = B2Space JointLimits
+
+instance (MonadIO m, Has w m Physics) => Has w m JointLimits where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space JointLimits) where
+  explExists sp ety = liftIO $ jointIsKind sp ety [B2T.RevoluteJoint, B2T.PrismaticJoint, B2T.DistanceJoint]
+  explGet sp ety = liftIO $ withJoint sp ety $ \j -> do
+    ty <- B2Joint.getType j
+    case ty of
+      B2T.PrismaticJoint -> JointLimits <$> B2PrismaticJoint.getLowerLimit j <*> B2PrismaticJoint.getUpperLimit j
+      B2T.DistanceJoint -> JointLimits <$> B2DistanceJoint.getMinLength j <*> B2DistanceJoint.getMaxLength j
+      _ -> JointLimits <$> B2RevoluteJoint.getLowerLimit j <*> B2RevoluteJoint.getUpperLimit j
+
+instance (MonadIO m) => ExplSet m (B2Space JointLimits) where
+  explSet sp ety (JointLimits lo hi) = liftIO $
+    overJoint sp ety $ \j -> do
+      ty <- B2Joint.getType j
+      case ty of
+        B2T.RevoluteJoint -> B2RevoluteJoint.enableLimit j True >> B2RevoluteJoint.setLimits j lo hi
+        B2T.PrismaticJoint -> B2PrismaticJoint.enableLimit j True >> B2PrismaticJoint.setLimits j lo hi
+        B2T.DistanceJoint -> B2DistanceJoint.enableLimit j True >> B2DistanceJoint.setLengthRange j lo hi
+        _ -> pure ()
+
+instance (MonadIO m) => ExplMembers m (B2Space JointLimits) where
+  explMembers = jointMembers
+
+{- | Whether the two bodies connected by a 'Joint' can collide with each
+other. Applies to every joint kind. Restores the parity apecs-physics
+has through @CollideBodies@. Setting it on an entity with no 'Joint'
+is a silent no-op.
+-}
+newtype CollideConnected = CollideConnected Bool
+  deriving (Eq, Show)
+
+instance Component CollideConnected where
+  type Storage CollideConnected = B2Space CollideConnected
+
+instance (MonadIO m, Has w m Physics) => Has w m CollideConnected where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space CollideConnected) where
+  explExists = jointExists
+  explGet sp ety = liftIO $ withJoint sp ety $ fmap CollideConnected . B2Joint.getCollideConnected
+
+instance (MonadIO m) => ExplSet m (B2Space CollideConnected) where
+  explSet sp ety (CollideConnected c) = liftIO $
+    overJoint sp ety $
+      \j -> B2Joint.setCollideConnected j c
+
+instance (MonadIO m) => ExplMembers m (B2Space CollideConnected) where
+  explMembers = jointMembers
+
+{- | The constraint force a 'Joint' is exerting to hold, as of the last
+'stepPhysics', usually in Newtons. Applies to every joint kind; useful
+for breakage logic. Read-only: Box2D computes it during the step.
+-}
+newtype JointForce = JointForce Vec2
+  deriving (Eq, Show)
+
+instance Component JointForce where
+  type Storage JointForce = B2Space JointForce
+
+instance (MonadIO m, Has w m Physics) => Has w m JointForce where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space JointForce) where
+  explExists = jointExists
+  explGet sp ety = liftIO $ withJoint sp ety $ fmap JointForce . B2Joint.getConstraintForce
+
+instance (MonadIO m) => ExplMembers m (B2Space JointForce) where
+  explMembers = jointMembers
+
+{- | The constraint torque a 'Joint' is exerting to hold, as of the last
+'stepPhysics', usually in Newton-meters. Applies to every joint kind;
+useful for breakage logic. Read-only: Box2D computes it during the
+step.
+-}
+newtype JointTorque = JointTorque Float
+  deriving (Eq, Show)
+
+instance Component JointTorque where
+  type Storage JointTorque = B2Space JointTorque
+
+instance (MonadIO m, Has w m Physics) => Has w m JointTorque where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space JointTorque) where
+  explExists = jointExists
+  explGet sp ety = liftIO $ withJoint sp ety $ fmap JointTorque . B2Joint.getConstraintTorque
+
+instance (MonadIO m) => ExplMembers m (B2Space JointTorque) where
   explMembers = jointMembers
 
 -- * Queries
