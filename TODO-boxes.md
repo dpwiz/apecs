@@ -63,7 +63,7 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
   bodies. Upstream: `Body.enable/disable/isEnabled`. (S)
 - [x] **`explode` system function.** One world call (`World.explode`,
   `ExplosionDef` exists with defaults); disproportionate fun-per-line. (S)
-- [ ] **World tuning components: `HitEventThreshold`, `RestitutionThreshold`,
+- [x] **World tuning components: `HitEventThreshold`, `RestitutionThreshold`,
   `MaximumLinearSpeed`, `ContinuousEnabled`.** Each is a trivial global
   get/set pair; `Impacts` docs already tell users to reach for the escape
   hatch for the hit threshold — make it a component instead. (S)

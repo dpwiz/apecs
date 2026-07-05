@@ -27,6 +27,10 @@ module Apecs.Box3D
   , earthGravity
   , Substeps (..)
   , SleepingEnabled (..)
+  , ContinuousEnabled (..)
+  , HitEventThreshold (..)
+  , RestitutionThreshold (..)
+  , MaximumLinearSpeed (..)
   , stepPhysics
   , destroyPhysics
   , explode
@@ -369,6 +373,92 @@ instance (MonadIO m) => ExplGet m (B3Space SleepingEnabled) where
 
 instance (MonadIO m) => ExplSet m (B3Space SleepingEnabled) where
   explSet sp _ (SleepingEnabled e) = liftIO $ B3World.enableSleeping (spWorld sp) e
+
+{- | Whether continuous collision detection runs between fast dynamic
+bodies and static geometry, keeping them from tunnelling through walls
+between substeps (on by default; disabling it is a minor performance
+gain). Continuous detection between two dynamic bodies is a separate,
+per-body opt-in: see 'BulletBody'.
+-}
+newtype ContinuousEnabled = ContinuousEnabled Bool
+  deriving (Eq, Show)
+
+instance Component ContinuousEnabled where
+  type Storage ContinuousEnabled = B3Space ContinuousEnabled
+
+instance (MonadIO m, Has w m Physics) => Has w m ContinuousEnabled where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplGet m (B3Space ContinuousEnabled) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ ContinuousEnabled <$> B3World.isContinuousEnabled (spWorld sp)
+
+instance (MonadIO m) => ExplSet m (B3Space ContinuousEnabled) where
+  explSet sp _ (ContinuousEnabled e) = liftIO $ B3World.enableContinuous (spWorld sp) e
+
+{- | The approach speed above which a contact generates a hit event,
+usually in meters per second (engine default 1). Read by 'Impacts',
+which also needs hit events enabled per shape — on by default for every
+shape this layer creates.
+-}
+newtype HitEventThreshold = HitEventThreshold Float
+  deriving (Eq, Show)
+
+instance Component HitEventThreshold where
+  type Storage HitEventThreshold = B3Space HitEventThreshold
+
+instance (MonadIO m, Has w m Physics) => Has w m HitEventThreshold where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplGet m (B3Space HitEventThreshold) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ HitEventThreshold <$> B3World.getHitEventThreshold (spWorld sp)
+
+instance (MonadIO m) => ExplSet m (B3Space HitEventThreshold) where
+  explSet sp _ (HitEventThreshold t) = liftIO $ B3World.setHitEventThreshold (spWorld sp) t
+
+{- | The relative approach speed below which a contact's 'Elasticity'
+is ignored and it doesn't bounce, usually in meters per second. Don't
+set this very low: contacts hovering just above the threshold keep
+bouncing instead of settling, which prevents bodies from falling
+asleep.
+-}
+newtype RestitutionThreshold = RestitutionThreshold Float
+  deriving (Eq, Show)
+
+instance Component RestitutionThreshold where
+  type Storage RestitutionThreshold = B3Space RestitutionThreshold
+
+instance (MonadIO m, Has w m Physics) => Has w m RestitutionThreshold where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplGet m (B3Space RestitutionThreshold) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ RestitutionThreshold <$> B3World.getRestitutionThreshold (spWorld sp)
+
+instance (MonadIO m) => ExplSet m (B3Space RestitutionThreshold) where
+  explSet sp _ (RestitutionThreshold t) = liftIO $ B3World.setRestitutionThreshold (spWorld sp) t
+
+{- | The speed cap applied to every 'Body' in this world, usually in
+meters per second: velocities that would exceed it are clamped each
+step. Guards against tunnelling and blow-ups from stray forces or
+impulses.
+-}
+newtype MaximumLinearSpeed = MaximumLinearSpeed Float
+  deriving (Eq, Show)
+
+instance Component MaximumLinearSpeed where
+  type Storage MaximumLinearSpeed = B3Space MaximumLinearSpeed
+
+instance (MonadIO m, Has w m Physics) => Has w m MaximumLinearSpeed where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplGet m (B3Space MaximumLinearSpeed) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ MaximumLinearSpeed <$> B3World.getMaximumLinearSpeed (spWorld sp)
+
+instance (MonadIO m) => ExplSet m (B3Space MaximumLinearSpeed) where
+  explSet sp _ (MaximumLinearSpeed s) = liftIO $ B3World.setMaximumLinearSpeed (spWorld sp) s
 
 -- Body --------------------------------------------------------------------
 
@@ -1502,7 +1592,7 @@ instance (MonadIO m) => ExplGet m (B3Space CollisionsEnd) where
 involved, the world-space contact point, the contact normal (pointing
 from A to B) and the approach speed. Only generated when the approach
 speed exceeds the world's hit-event threshold (engine default 1;
-tune with 'Box3D.World.setHitEventThreshold' via 'getWorldId').
+tune with 'HitEventThreshold').
 -}
 data Impact = Impact
   { impactBodyA :: !Entity
