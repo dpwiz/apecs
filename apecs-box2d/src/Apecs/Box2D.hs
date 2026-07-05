@@ -54,6 +54,7 @@ module Apecs.Box2D
   , Friction (..)
   , Elasticity (..)
   , CollisionFilter (..)
+  , Sensor (..)
   , Filter (..)
   , B2ShapeId (..)
 
@@ -73,6 +74,8 @@ module Apecs.Box2D
   , Collisions (..)
   , Impact (..)
   , Impacts (..)
+  , SensorEvent (..)
+  , SensorEvents (..)
 
     -- * Vectors
   , Vec2 (..)
@@ -92,6 +95,7 @@ import Data.IntSet qualified as IS
 import Data.Maybe (catMaybes)
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
+import Foreign.Marshal.Utils (fromBool)
 
 import Box2D.Body qualified as B2Body
 import Box2D.Callbacks (withOverlapResultFcn)
@@ -153,9 +157,17 @@ instance (MonadIO m) => ExplInit m (B2Space Physics) where
     B2Space
       <$> B2World.create wd
       <*> B2T.defaultBodyDef
-      -- Box2D defaults both event flags off; opt every layer-created
-      -- shape in so 'Collisions' and 'Impacts' have something to read.
-      <*> pure sd{B2T.shapeDefEnableContactEvents = 1, B2T.shapeDefEnableHitEvents = 1}
+      -- Box2D defaults contact, hit and sensor event flags off; opt every
+      -- layer-created shape in so 'Collisions', 'Impacts' and
+      -- 'SensorEvents' have something to read (a shape both generates
+      -- sensor events when it is itself a sensor and is visible to other
+      -- sensors when it is a visitor).
+      <*> pure
+        sd
+          { B2T.shapeDefEnableContactEvents = 1
+          , B2T.shapeDefEnableHitEvents = 1
+          , B2T.shapeDefEnableSensorEvents = 1
+          }
       <*> newIORef mempty
       <*> newIORef mempty
       <*> newIORef mempty
@@ -672,41 +684,58 @@ instance Component Shape where
 instance (MonadIO m, Has w m Physics) => Has w m Shape where
   getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
 
+-- | Create the engine geometry for a 'Geometry' value on a body.
+createGeometry :: BodyId -> B2T.ShapeDef -> Geometry -> IO ShapeId
+createGeometry b sd geo = case geo of
+  GeoCircle c r -> B2Shape.createCircle b sd (B2T.Circle c r)
+  GeoCapsule c1 c2 r -> B2Shape.createCapsule b sd (B2T.Capsule c1 c2 r)
+  GeoSegment p1 p2 -> B2Shape.createSegment b sd (B2T.Segment p1 p2)
+  GeoBox hw hh -> B2Collision.makeBox hw hh >>= B2Shape.createPolygon b sd
+  GeoPolygon pts -> do
+    let n = VS.length pts
+    when (n < 3 || n > B2T.maxPolygonVertices) $
+      error ("GeoPolygon needs 3 to " <> show B2T.maxPolygonVertices <> " points, got " <> show n)
+    hull <- VS.unsafeWith pts $ \p -> B2Collision.computeHull p n
+    when (VS.length (B2T.hullPoints hull) < 3) $
+      error "GeoPolygon points are degenerate (collinear or coincident)"
+    B2Collision.makePolygon hull 0 >>= B2Shape.createPolygon b sd
+
+{- | A shape def with the surface material, density and filter carried
+over from the shape being replaced, if any.
+-}
+carryMaterial :: B2T.ShapeDef -> Maybe ShapeRecord -> IO B2T.ShapeDef
+carryMaterial sd Nothing = pure sd
+carryMaterial sd (Just (ShapeRecord s _)) = do
+  material <- B2Shape.getSurfaceMaterial s
+  density <- B2Shape.getDensity s
+  filtr <- B2Shape.getFilter s
+  pure
+    sd
+      { B2T.shapeDefMaterial = material
+      , B2T.shapeDefDensity = density
+      , B2T.shapeDefFilter = filtr
+      }
+
+{- | Create a fresh engine shape for a 'Shape' value with the given def,
+tag it with the entity's user index, destroy the shape it replaces (if
+any) only after the new one exists (so a failed create, e.g. a bad
+polygon, leaves everything intact), and update the shape registry.
+Shared by 'Shape' and 'Sensor', which both recreate the shape while
+preserving its material state.
+-}
+recreateShape :: B2Space c -> BodyId -> Int -> B2T.ShapeDef -> Shape -> Maybe ShapeRecord -> IO ()
+recreateShape sp b ety sd shape@(Shape _ geo) old = do
+  s <- createGeometry b sd geo
+  setUserIndex s ety
+  forM_ old $ \(ShapeRecord s' _) -> B2Shape.destroy s' True
+  modifyIORef' (spShapes sp) (IM.insert ety (ShapeRecord s shape))
+
 instance (MonadIO m) => ExplSet m (B2Space Shape) where
-  explSet sp ety shape@(Shape (Entity bEty) geo) = liftIO $
+  explSet sp ety shape@(Shape (Entity bEty) _) = liftIO $
     overBody sp bEty $ \b -> do
       old <- IM.lookup ety <$> readIORef (spShapes sp)
-      -- carry the material state over the recreate; the old shape is only
-      -- destroyed after the new one exists, so a failed create (e.g. a bad
-      -- polygon) leaves everything intact
-      sd <- case old of
-        Nothing -> pure (spShapeDef sp)
-        Just (ShapeRecord s _) -> do
-          material <- B2Shape.getSurfaceMaterial s
-          density <- B2Shape.getDensity s
-          filtr <- B2Shape.getFilter s
-          pure
-            (spShapeDef sp)
-              { B2T.shapeDefMaterial = material
-              , B2T.shapeDefDensity = density
-              , B2T.shapeDefFilter = filtr
-              }
-      s <- case geo of
-        GeoCircle c r -> B2Shape.createCircle b sd (B2T.Circle c r)
-        GeoCapsule c1 c2 r -> B2Shape.createCapsule b sd (B2T.Capsule c1 c2 r)
-        GeoSegment p1 p2 -> B2Shape.createSegment b sd (B2T.Segment p1 p2)
-        GeoBox hw hh -> B2Collision.makeBox hw hh >>= B2Shape.createPolygon b sd
-        GeoPolygon pts -> do
-          let n = VS.length pts
-          when (n < 3 || n > B2T.maxPolygonVertices) $
-            error ("GeoPolygon needs 3 to " <> show B2T.maxPolygonVertices <> " points, got " <> show n)
-          hull <- VS.unsafeWith pts $ \p -> B2Collision.computeHull p n
-          when (VS.length (B2T.hullPoints hull) < 3) $
-            error "GeoPolygon points are degenerate (collinear or coincident)"
-          B2Collision.makePolygon hull 0 >>= B2Shape.createPolygon b sd
-      setUserIndex s ety
-      forM_ old $ \(ShapeRecord s' _) -> B2Shape.destroy s' True
-      modifyIORef' (spShapes sp) (IM.insert ety (ShapeRecord s shape))
+      sd <- carryMaterial (spShapeDef sp) old
+      recreateShape sp b ety sd shape old
 
 instance (MonadIO m) => ExplGet m (B2Space Shape) where
   explExists = shapeExists
@@ -829,6 +858,40 @@ instance (MonadIO m) => ExplSet m (B2Space CollisionFilter) where
       \s -> B2Shape.setFilter s f
 
 instance (MonadIO m) => ExplMembers m (B2Space CollisionFilter) where
+  explMembers = shapeMembers
+
+{- | Whether a 'Shape' is a sensor: a trigger volume that reports
+overlaps through 'SensorEvents' instead of generating contacts. Box2D
+cannot change a live shape from sensor to solid or back, so setting
+this recreates the engine shape (as 'Shape' does, preserving 'Density',
+'Friction', 'Elasticity' and 'CollisionFilter') whenever the requested
+value differs from the shape's current one; setting the value it
+already has is a no-op. Reads reflect the engine.
+-}
+newtype Sensor = Sensor Bool
+  deriving (Eq, Show)
+
+instance Component Sensor where
+  type Storage Sensor = B2Space Sensor
+
+instance (MonadIO m, Has w m Physics) => Has w m Sensor where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space Sensor) where
+  explExists = shapeExists
+  explGet sp ety = liftIO $ withShape sp ety $ fmap Sensor . B2Shape.isSensor
+
+instance (MonadIO m) => ExplSet m (B2Space Sensor) where
+  explSet sp ety (Sensor wantSensor) = liftIO $ do
+    old <- IM.lookup ety <$> readIORef (spShapes sp)
+    forM_ old $ \old'@(ShapeRecord s shape@(Shape (Entity bEty) _)) -> do
+      isSensorNow <- B2Shape.isSensor s
+      when (isSensorNow /= wantSensor) $
+        overBody sp bEty $ \b -> do
+          sd <- carryMaterial (spShapeDef sp) (Just old')
+          recreateShape sp b ety sd{B2T.shapeDefIsSensor = fromBool wantSensor} shape (Just old')
+
+instance (MonadIO m) => ExplMembers m (B2Space Sensor) where
   explMembers = shapeMembers
 
 -- Joint ----------------------------------------------------------------------
@@ -1208,3 +1271,56 @@ instance (MonadIO m) => ExplGet m (B2Space Impacts) where
             , impactNormal = B2T.contactHitEventNormal ev
             , impactSpeed = B2T.contactHitEventApproachSpeed ev
             }
+
+{- | A sensor overlap that began or ended during the last 'stepPhysics':
+the 'Sensor' shape (and the body it hangs off) and the visitor shape
+(and its body) that overlapped it.
+-}
+data SensorEvent = SensorEvent
+  { sensorBody :: !Entity
+  , sensorShape :: !Entity
+  , visitorBody :: !Entity
+  , visitorShape :: !Entity
+  }
+  deriving (Eq, Show)
+
+-- | The shape/body entities behind a sensor overlap's two shape ids, if both are still alive and registered.
+toSensorEvent :: B2Space c -> ShapeId -> ShapeId -> IO (Maybe SensorEvent)
+toSensorEvent sp sensorS visitorS = do
+  ms <- shapeEntities sp sensorS
+  mv <- shapeEntities sp visitorS
+  pure $ do
+    (sShape, sBody) <- ms
+    (vShape, vBody) <- mv
+    Just (SensorEvent sBody sShape vBody vShape)
+
+{- | The sensor overlaps that began and ended during the last
+'stepPhysics', a read-only global: @SensorEvents begins ends <- get
+global@ after stepping. Shapes created by this layer opt into sensor
+events, both as sensors and as visitors; events whose sensor or visitor
+shape was destroyed since the step are dropped.
+-}
+data SensorEvents = SensorEvents
+  { sensorBegins :: [SensorEvent]
+  , sensorEnds :: [SensorEvent]
+  }
+  deriving (Show)
+
+instance Component SensorEvents where
+  type Storage SensorEvents = B2Space SensorEvents
+
+instance (MonadIO m, Has w m Physics) => Has w m SensorEvents where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space SensorEvents) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ do
+    begins <- B2Events.sensorBeginTouchEvents (spWorld sp)
+    ends <- B2Events.sensorEndTouchEvents (spWorld sp)
+    beginEvs <-
+      fmap catMaybes . forM (VS.toList begins) $ \ev ->
+        toSensorEvent sp (B2T.sensorBeginTouchEventSensorShapeId ev) (B2T.sensorBeginTouchEventVisitorShapeId ev)
+    endEvs <-
+      fmap catMaybes . forM (VS.toList ends) $ \ev ->
+        toSensorEvent sp (B2T.sensorEndTouchEventSensorShapeId ev) (B2T.sensorEndTouchEventVisitorShapeId ev)
+    pure (SensorEvents beginEvs endEvs)

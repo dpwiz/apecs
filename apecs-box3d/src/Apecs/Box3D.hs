@@ -54,6 +54,7 @@ module Apecs.Box3D
   , Friction (..)
   , Elasticity (..)
   , CollisionFilter (..)
+  , Sensor (..)
   , Filter (..)
   , B3ShapeId (..)
 
@@ -73,6 +74,8 @@ module Apecs.Box3D
   , Collisions (..)
   , Impact (..)
   , Impacts (..)
+  , SensorEvent (..)
+  , SensorEvents (..)
 
     -- * Vectors
   , Vec3 (..)
@@ -94,6 +97,7 @@ import Data.IntSet qualified as IS
 import Data.Maybe (catMaybes)
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
+import Foreign.Marshal.Utils (fromBool)
 import Foreign.Ptr (nullPtr)
 
 import Box3D.Body qualified as B3Body
@@ -155,9 +159,17 @@ instance (MonadIO m) => ExplInit m (B3Space Physics) where
     B3Space
       <$> B3World.create wd
       <*> B3T.defaultBodyDef
-      -- Box3D defaults both event flags off; opt every layer-created
-      -- shape in so 'Collisions' and 'Impacts' have something to read.
-      <*> pure sd{B3T.shapeDefEnableContactEvents = 1, B3T.shapeDefEnableHitEvents = 1}
+      -- Box3D defaults contact, hit and sensor event flags off; opt every
+      -- layer-created shape in so 'Collisions', 'Impacts' and
+      -- 'SensorEvents' have something to read (a shape both generates
+      -- sensor events when it is itself a sensor and is visible to other
+      -- sensors when it is a visitor).
+      <*> pure
+        sd
+          { B3T.shapeDefEnableContactEvents = 1
+          , B3T.shapeDefEnableHitEvents = 1
+          , B3T.shapeDefEnableSensorEvents = 1
+          }
       <*> newIORef mempty
       <*> newIORef mempty
       <*> newIORef mempty
@@ -713,33 +725,50 @@ boxCorners (Vec3 cx cy cz) (Vec3 hx hy hz) =
     , sz <- [-1, 1]
     ]
 
+-- | Create the engine geometry for a 'Geometry' value on a body.
+createGeometry :: BodyId -> B3T.ShapeDef -> Geometry -> IO ShapeId
+createGeometry b sd geo = case geo of
+  GeoSphere c r -> B3Shape.createSphere b sd (B3T.Sphere c r)
+  GeoCapsule c1 c2 r -> B3Shape.createCapsule b sd (B3T.Capsule c1 c2 r)
+  GeoBox c half -> createHullShape "GeoBox" b sd (boxCorners c half)
+  GeoHull pts -> createHullShape "GeoHull" b sd pts
+
+{- | A shape def with the surface material, density and filter carried
+over from the shape being replaced, if any.
+-}
+carryMaterial :: B3T.ShapeDef -> Maybe ShapeRecord -> IO B3T.ShapeDef
+carryMaterial sd Nothing = pure sd
+carryMaterial sd (Just (ShapeRecord s _)) = do
+  material <- B3Shape.getSurfaceMaterial s
+  density <- B3Shape.getDensity s
+  filtr <- B3Shape.getFilter s
+  pure
+    sd
+      { B3T.shapeDefBaseMaterial = material
+      , B3T.shapeDefDensity = density
+      , B3T.shapeDefFilter = filtr
+      }
+
+{- | Create a fresh engine shape for a 'Shape' value with the given def,
+tag it with the entity's user index, destroy the shape it replaces (if
+any) only after the new one exists (so a failed create, e.g. a bad
+hull, leaves everything intact), and update the shape registry. Shared
+by 'Shape' and 'Sensor', which both recreate the shape while preserving
+its material state.
+-}
+recreateShape :: B3Space c -> BodyId -> Int -> B3T.ShapeDef -> Shape -> Maybe ShapeRecord -> IO ()
+recreateShape sp b ety sd shape@(Shape _ geo) old = do
+  s <- createGeometry b sd geo
+  setUserIndex s ety
+  forM_ old $ \(ShapeRecord s' _) -> B3Shape.destroy s' True
+  modifyIORef' (spShapes sp) (IM.insert ety (ShapeRecord s shape))
+
 instance (MonadIO m) => ExplSet m (B3Space Shape) where
-  explSet sp ety shape@(Shape (Entity bEty) geo) = liftIO $
+  explSet sp ety shape@(Shape (Entity bEty) _) = liftIO $
     overBody sp bEty $ \b -> do
       old <- IM.lookup ety <$> readIORef (spShapes sp)
-      -- carry the material state over the recreate; the old shape is only
-      -- destroyed after the new one exists, so a failed create (e.g. a bad
-      -- hull) leaves everything intact
-      sd <- case old of
-        Nothing -> pure (spShapeDef sp)
-        Just (ShapeRecord s _) -> do
-          material <- B3Shape.getSurfaceMaterial s
-          density <- B3Shape.getDensity s
-          filtr <- B3Shape.getFilter s
-          pure
-            (spShapeDef sp)
-              { B3T.shapeDefBaseMaterial = material
-              , B3T.shapeDefDensity = density
-              , B3T.shapeDefFilter = filtr
-              }
-      s <- case geo of
-        GeoSphere c r -> B3Shape.createSphere b sd (B3T.Sphere c r)
-        GeoCapsule c1 c2 r -> B3Shape.createCapsule b sd (B3T.Capsule c1 c2 r)
-        GeoBox c half -> createHullShape "GeoBox" b sd (boxCorners c half)
-        GeoHull pts -> createHullShape "GeoHull" b sd pts
-      setUserIndex s ety
-      forM_ old $ \(ShapeRecord s' _) -> B3Shape.destroy s' True
-      modifyIORef' (spShapes sp) (IM.insert ety (ShapeRecord s shape))
+      sd <- carryMaterial (spShapeDef sp) old
+      recreateShape sp b ety sd shape old
 
 instance (MonadIO m) => ExplGet m (B3Space Shape) where
   explExists = shapeExists
@@ -862,6 +891,40 @@ instance (MonadIO m) => ExplSet m (B3Space CollisionFilter) where
       \s -> B3Shape.setFilter s f True
 
 instance (MonadIO m) => ExplMembers m (B3Space CollisionFilter) where
+  explMembers = shapeMembers
+
+{- | Whether a 'Shape' is a sensor: a trigger volume that reports
+overlaps through 'SensorEvents' instead of generating contacts. Box3D
+has no way to change a live shape's sensor flag, so setting this
+recreates the engine shape (as 'Shape' does, preserving 'Density',
+'Friction', 'Elasticity' and 'CollisionFilter') whenever the requested
+value differs from the shape's current one; setting the value it
+already has is a no-op. Reads reflect the engine.
+-}
+newtype Sensor = Sensor Bool
+  deriving (Eq, Show)
+
+instance Component Sensor where
+  type Storage Sensor = B3Space Sensor
+
+instance (MonadIO m, Has w m Physics) => Has w m Sensor where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplGet m (B3Space Sensor) where
+  explExists = shapeExists
+  explGet sp ety = liftIO $ withShape sp ety $ fmap Sensor . B3Shape.isSensor
+
+instance (MonadIO m) => ExplSet m (B3Space Sensor) where
+  explSet sp ety (Sensor wantSensor) = liftIO $ do
+    old <- IM.lookup ety <$> readIORef (spShapes sp)
+    forM_ old $ \old'@(ShapeRecord s shape@(Shape (Entity bEty) _)) -> do
+      isSensorNow <- B3Shape.isSensor s
+      when (isSensorNow /= wantSensor) $
+        overBody sp bEty $ \b -> do
+          sd <- carryMaterial (spShapeDef sp) (Just old')
+          recreateShape sp b ety sd{B3T.shapeDefIsSensor = fromBool wantSensor} shape (Just old')
+
+instance (MonadIO m) => ExplMembers m (B3Space Sensor) where
   explMembers = shapeMembers
 
 -- Joint ----------------------------------------------------------------------
@@ -1188,3 +1251,56 @@ instance (MonadIO m) => ExplGet m (B3Space Impacts) where
             , impactNormal = B3T.contactHitEventNormal ev
             , impactSpeed = B3T.contactHitEventApproachSpeed ev
             }
+
+{- | A sensor overlap that began or ended during the last 'stepPhysics':
+the 'Sensor' shape (and the body it hangs off) and the visitor shape
+(and its body) that overlapped it.
+-}
+data SensorEvent = SensorEvent
+  { sensorBody :: !Entity
+  , sensorShape :: !Entity
+  , visitorBody :: !Entity
+  , visitorShape :: !Entity
+  }
+  deriving (Eq, Show)
+
+-- | The shape/body entities behind a sensor overlap's two shape ids, if both are still alive and registered.
+toSensorEvent :: B3Space c -> ShapeId -> ShapeId -> IO (Maybe SensorEvent)
+toSensorEvent sp sensorS visitorS = do
+  ms <- shapeEntities sp sensorS
+  mv <- shapeEntities sp visitorS
+  pure $ do
+    (sShape, sBody) <- ms
+    (vShape, vBody) <- mv
+    Just (SensorEvent sBody sShape vBody vShape)
+
+{- | The sensor overlaps that began and ended during the last
+'stepPhysics', a read-only global: @SensorEvents begins ends <- get
+global@ after stepping. Shapes created by this layer opt into sensor
+events, both as sensors and as visitors; events whose sensor or visitor
+shape was destroyed since the step are dropped.
+-}
+data SensorEvents = SensorEvents
+  { sensorBegins :: [SensorEvent]
+  , sensorEnds :: [SensorEvent]
+  }
+  deriving (Show)
+
+instance Component SensorEvents where
+  type Storage SensorEvents = B3Space SensorEvents
+
+instance (MonadIO m, Has w m Physics) => Has w m SensorEvents where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplGet m (B3Space SensorEvents) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ do
+    begins <- B3Events.sensorBeginTouchEvents (spWorld sp)
+    ends <- B3Events.sensorEndTouchEvents (spWorld sp)
+    beginEvs <-
+      fmap catMaybes . forM (VS.toList begins) $ \ev ->
+        toSensorEvent sp (B3T.sensorBeginTouchEventSensorShapeId ev) (B3T.sensorBeginTouchEventVisitorShapeId ev)
+    endEvs <-
+      fmap catMaybes . forM (VS.toList ends) $ \ev ->
+        toSensorEvent sp (B3T.sensorEndTouchEventSensorShapeId ev) (B3T.sensorEndTouchEventVisitorShapeId ev)
+    pure (SensorEvents beginEvs endEvs)
