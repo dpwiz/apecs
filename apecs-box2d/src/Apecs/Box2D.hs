@@ -17,7 +17,13 @@ the boundary); 'Elasticity' is Box2D restitution; 'Substeps' replaces
 @Iterations@.
 
 The raw engine is reachable through 'B2BodyId', 'B2ShapeId' and
-'getWorldId' together with the "Box2D" modules.
+'getWorldId' together with the "Box2D" modules. The wrapper owns
+the engine's user-index channel: it stamps every body, shape and
+joint with its entity id and resolves events and queries through
+it, so raw-API users must not call @setUserIndex@ on
+wrapper-created objects — and objects created directly through the
+raw API are invisible to the wrapper's components, events and
+queries.
 -}
 module Apecs.Box2D
   ( -- * World
