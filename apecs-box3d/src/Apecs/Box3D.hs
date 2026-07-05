@@ -80,8 +80,10 @@ module Apecs.Box3D
     -- * Queries
   , RayHit (..)
   , segmentQuery
+  , segmentQueryAll
   , aabbQuery
   , pointQuery
+  , containsPointQuery
 
     -- * Collisions
   , Collision (..)
@@ -109,6 +111,7 @@ import Data.IORef
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
 import Data.IntSet qualified as IS
+import Data.List (sortOn)
 import Data.Maybe (catMaybes)
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
@@ -116,7 +119,7 @@ import Foreign.Marshal.Utils (fromBool, toBool)
 import Foreign.Ptr (nullPtr)
 
 import Box3D.Body qualified as B3Body
-import Box3D.Callbacks (withOverlapResultFcn)
+import Box3D.Callbacks (withCastResultFcn, withOverlapResultFcn)
 import Box3D.DistanceJoint qualified as B3DistanceJoint
 import Box3D.Events qualified as B3Events
 import Box3D.Hull qualified as B3Hull
@@ -1694,6 +1697,51 @@ segmentQuery start end fltr = do
         )
         <$> shapeEntities sp (B3T.rayResultShapeId res)
 
+{- | Every shape along a world-space segment, sorted nearest-first by
+'rayHitFraction'. Filter semantics match 'segmentQuery'. Unlike
+'segmentQuery', which goes through the engine's @b3World_CastRayClosest@
+convenience path, this drives the general @b3World_CastRay@ callback
+directly — and that path does /not/ ignore initial overlaps itself (the
+"ignore initial overlap" behaviour lives in the closest-hit callback, which
+skips fraction-0 hits before they reach the caller). So a segment starting
+inside a shape here reports that shape too, with 'rayHitFraction' 0. Hits
+whose shapes were destroyed since the last 'stepPhysics' are dropped, same
+as 'segmentQuery'.
+-}
+segmentQueryAll
+  :: forall w m
+   . (MonadIO m, Has w m Physics)
+  => WVec
+  -> WVec
+  -> Filter
+  -> SystemT w m [RayHit]
+segmentQueryAll start end fltr = do
+  sp :: B3Space Physics <- getStore
+  liftIO $ do
+    qf <- toQueryFilter fltr
+    found <- newIORef []
+    let
+      Vec3 sx sy sz = start
+      Vec3 ex ey ez = end
+      visit s point normal frac _matId _triangleIx _childIx = do
+        hit <- shapeEntities sp s
+        forM_ hit $ \(shapeEty, bodyEty) ->
+          modifyIORef'
+            found
+            ( RayHit
+                { rayHitShape = shapeEty
+                , rayHitBody = bodyEty
+                , rayHitPoint = point
+                , rayHitNormal = normal
+                , rayHitFraction = frac
+                }
+                :
+            )
+        pure 1
+    _ <- withCastResultFcn visit $ \fp ctx ->
+      B3World.castRay (spWorld sp) start (Vec3 (ex - sx) (ey - sy) (ez - sz)) qf fp ctx
+    sortOn rayHitFraction <$> readIORef found
+
 {- | The body entities whose shapes' broad-phase bounding boxes overlap
 the world-space box spanned by two corners (any order). Broad-phase:
 the test is against shape AABBs, not exact geometry.
@@ -1723,11 +1771,69 @@ aabbQuery cornerA cornerB fltr = do
     box = AABB (Vec3 (min ax bx) (min ay by) (min az bz)) (Vec3 (max ax bx) (max ay by) (max az bz))
 
 {- | 'aabbQuery' of the cube reaching @r@ along each axis from a point:
-the body entities with shapes broad-phase within reach.
+the body entities with shapes broad-phase within reach. This is
+broad-phase AABB reach, /not/ exact containment — a shape's AABB is
+larger than the shape itself, so this can return bodies whose shape
+doesn't actually contain the point. See 'containsPointQuery' for the
+exact test.
 -}
 pointQuery :: (MonadIO m, Has w m Physics) => WVec -> Float -> Filter -> SystemT w m [Entity]
 pointQuery (Vec3 x y z) r =
   aabbQuery (Vec3 (x - r) (y - r) (z - r)) (Vec3 (x + r) (y + r) (z + r))
+
+{- | The body entities with a shape that actually contains a world point:
+an exact geometry test, unlike the broad-phase 'pointQuery'. Candidates
+come from a broad-phase 'B3World.overlapAABB' at a degenerate (zero-size)
+AABB pinned to the point, then refined against each candidate's exact
+geometry; bodies are deduplicated when more than one of their shapes
+contains the point.
+
+Box3D has no direct point-in-shape test, so the refinement step uses
+'B3Shape.getClosestPoint' (the nearest point on a shape to a target)
+instead: it runs a GJK query between the shape and the target treated as
+a degenerate point shape, and for a target that is inside or on the shape
+the query simplex encloses the origin, at which point the returned
+\"closest\" point is a witness point that, worked out in exact arithmetic,
+coincides with the target itself (checked against the
+@b3Shape_GetClosestPoint@\/@b3ShapeDistance@ source: the target is the
+only point in its proxy, so every barycentric blend of it is the target
+unchanged, and the overlap branch solves for the target and the witness
+point differing by exactly the origin). In floating point the simplex
+weights can still land the witness point a small distance off, so
+containment is decided by comparing squared distance against a small
+scale-relative tolerance rather than requiring bit-exact equality.
+-}
+containsPointQuery
+  :: forall w m
+   . (MonadIO m, Has w m Physics)
+  => WVec
+  -> Filter
+  -> SystemT w m [Entity]
+containsPointQuery point@(Vec3 px py pz) fltr = do
+  sp :: B3Space Physics <- getStore
+  liftIO $ do
+    qf <- toQueryFilter fltr
+    found <- newIORef IS.empty
+    let
+      -- scale-relative tolerance: float rounding in the GJK simplex
+      -- weights is roughly proportional to the magnitude of the
+      -- coordinates involved, so a fixed epsilon would be too tight far
+      -- from the origin and too loose near it
+      tolerance = 1e-9 * (1 + px * px + py * py + pz * pz)
+      visit s = do
+        hit <- shapeEntities sp s
+        forM_ hit $ \(_, Entity bodyIx) -> do
+          Vec3 cx cy cz <- B3Shape.getClosestPoint s point
+          let
+            dx = cx - px
+            dy = cy - py
+            dz = cz - pz
+            distSq = dx * dx + dy * dy + dz * dz
+          when (distSq <= tolerance) $ modifyIORef' found (IS.insert bodyIx)
+        pure True
+    _ <- withOverlapResultFcn visit $ \fp ctx ->
+      B3World.overlapAABB (spWorld sp) (AABB point point) qf fp ctx
+    map Entity . IS.toList <$> readIORef found
 
 -- * Collisions
 

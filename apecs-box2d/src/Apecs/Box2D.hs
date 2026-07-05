@@ -81,8 +81,10 @@ module Apecs.Box2D
     -- * Queries
   , RayHit (..)
   , segmentQuery
+  , segmentQueryAll
   , aabbQuery
   , pointQuery
+  , containsPointQuery
 
     -- * Collisions
   , Collision (..)
@@ -108,13 +110,14 @@ import Data.IORef
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
 import Data.IntSet qualified as IS
+import Data.List (sortOn)
 import Data.Maybe (catMaybes)
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
 import Foreign.Marshal.Utils (fromBool, toBool)
 
 import Box2D.Body qualified as B2Body
-import Box2D.Callbacks (withOverlapResultFcn)
+import Box2D.Callbacks (withCastResultFcn, withOverlapResultFcn)
 import Box2D.Collision qualified as B2Collision
 import Box2D.DistanceJoint qualified as B2DistanceJoint
 import Box2D.Events qualified as B2Events
@@ -1654,6 +1657,51 @@ segmentQuery start end fltr = do
         )
         <$> shapeEntities sp (B2T.rayResultShapeId res)
 
+{- | Every shape along a world-space segment, sorted nearest-first by
+'rayHitFraction'. Filter semantics match 'segmentQuery'. Unlike
+'segmentQuery', which goes through the engine's @b2World_CastRayClosest@
+convenience path, this drives the general @b2World_CastRay@ callback
+directly — and that path does /not/ ignore initial overlaps itself (the
+"ignore initial overlap" behaviour lives in the closest-hit callback, which
+skips fraction-0 hits before they reach the caller). So a segment starting
+inside a shape here reports that shape too, with 'rayHitFraction' 0. Hits
+whose shapes were destroyed since the last 'stepPhysics' are dropped, same
+as 'segmentQuery'.
+-}
+segmentQueryAll
+  :: forall w m
+   . (MonadIO m, Has w m Physics)
+  => WVec
+  -> WVec
+  -> Filter
+  -> SystemT w m [RayHit]
+segmentQueryAll start end fltr = do
+  sp :: B2Space Physics <- getStore
+  liftIO $ do
+    qf <- toQueryFilter fltr
+    found <- newIORef []
+    let
+      Vec2 sx sy = start
+      Vec2 ex ey = end
+      visit s point normal frac = do
+        hit <- shapeEntities sp s
+        forM_ hit $ \(shapeEty, bodyEty) ->
+          modifyIORef'
+            found
+            ( RayHit
+                { rayHitShape = shapeEty
+                , rayHitBody = bodyEty
+                , rayHitPoint = point
+                , rayHitNormal = normal
+                , rayHitFraction = frac
+                }
+                :
+            )
+        pure 1
+    _ <- withCastResultFcn visit $ \fp ctx ->
+      B2World.castRay (spWorld sp) start (Vec2 (ex - sx) (ey - sy)) qf fp ctx
+    sortOn rayHitFraction <$> readIORef found
+
 {- | The body entities whose shapes' broad-phase bounding boxes overlap
 the world-space box spanned by two corners (any order). Broad-phase:
 the test is against shape AABBs, not exact geometry.
@@ -1683,11 +1731,45 @@ aabbQuery cornerA cornerB fltr = do
     box = AABB (Vec2 (min ax bx) (min ay by)) (Vec2 (max ax bx) (max ay by))
 
 {- | 'aabbQuery' of the square reaching @r@ along each axis from a
-point: the body entities with shapes broad-phase within reach.
+point: the body entities with shapes broad-phase within reach. This is
+broad-phase AABB reach, /not/ exact containment — a shape's AABB is
+larger than the shape itself, so this can return bodies whose shape
+doesn't actually contain the point. See 'containsPointQuery' for the
+exact test.
 -}
 pointQuery :: (MonadIO m, Has w m Physics) => WVec -> Float -> Filter -> SystemT w m [Entity]
 pointQuery (Vec2 x y) r =
   aabbQuery (Vec2 (x - r) (y - r)) (Vec2 (x + r) (y + r))
+
+{- | The body entities with a shape that actually contains a world point:
+an exact geometry test, unlike the broad-phase 'pointQuery'. Candidates
+come from a broad-phase 'B2World.overlapAABB' at a degenerate (zero-size)
+AABB pinned to the point — the engine's AABB validity check only requires
+@upper - lower >= 0@, so a point AABB is accepted — and each candidate
+shape is then refined with 'B2Shape.testPoint', an exact point-in-shape
+test; bodies are deduplicated when more than one of their shapes contains
+the point.
+-}
+containsPointQuery
+  :: forall w m
+   . (MonadIO m, Has w m Physics)
+  => WVec
+  -> Filter
+  -> SystemT w m [Entity]
+containsPointQuery point fltr = do
+  sp :: B2Space Physics <- getStore
+  liftIO $ do
+    qf <- toQueryFilter fltr
+    found <- newIORef IS.empty
+    let visit s = do
+          hit <- shapeEntities sp s
+          forM_ hit $ \(_, Entity bodyIx) -> do
+            inside <- B2Shape.testPoint s point
+            when inside $ modifyIORef' found (IS.insert bodyIx)
+          pure True
+    _ <- withOverlapResultFcn visit $ \fp ctx ->
+      B2World.overlapAABB (spWorld sp) vec2Zero (AABB point point) qf fp ctx
+    map Entity . IS.toList <$> readIORef found
 
 -- * Collisions
 

@@ -80,12 +80,16 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
   `MotorJoint`) to `JointSpec`.** Wheel joint is the vehicle staple; the
   current `MotorJoint` name is a motorised revolute — consider renaming to
   `RotaryMotorJoint` when the real motor joint lands to avoid a trap. (M)
-- [ ] **Exact-geometry queries.** Today `aabbQuery`/`pointQuery` are
+- [x] **Exact-geometry queries.** Today `aabbQuery`/`pointQuery` are
   broad-phase only — a *semantic trap* for apecs-physics users whose
   `pointQuery` was exact. Add: exact point test (`Shape.testPoint` [2D] /
   `Body.getClosestPoint`), `overlapShape` world query, all-hits
   `castRay` (list of `RayHit`), and `castShape` sweeps. Callback plumbing
   (`withCastResultFcn`, `withOverlapResultFcn`) is already available. (M)
+  *Done as `containsPointQuery` + `segmentQueryAll`. `overlapShape` and
+  `castShape` remain deferred: the box-nd Haskell API has no way to build
+  a `ShapeProxy` (opaque tag, no constructor/size exported), so they need
+  an upstream `makeProxy`-with-allocation helper first.*
 - [ ] **Joint tuning sub-components on the joint entity: `MotorSpeed`,
   `MotorMaxTorque`/`MaxForce`, `JointLimits`, `CollideConnected`,
   read-only `JointForce`/`JointTorque`.** Re-setting `Joint` recreates the
