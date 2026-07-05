@@ -111,7 +111,7 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
   ForeignPtr alive while any shape uses it) plus all procedural generators.
   `GeoCompound` deferred: `CompoundDef` is an opaque tag in box-nd with no
   Haskell constructor, same upstream gap as `ShapeProxy`.*
-- [ ] **Character mover support: `castMover`/`collideMover`/`solvePlanes`.**
+- [x] **Character mover support: `castMover`/`collideMover`/`solvePlanes`.**
   The engine-blessed kinematic character controller; platformers and
   first-person demos need it and hand-rolling it via rays is much worse.
   Could be a `moveCharacter` system function rather than components. (M/L)

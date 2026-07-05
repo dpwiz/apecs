@@ -93,6 +93,10 @@ module Apecs.Box2D
   , pointQuery
   , containsPointQuery
 
+    -- * Character mover
+  , MoverResult (..)
+  , moveCharacter
+
     -- * Collisions
   , Collision (..)
   , Collisions (..)
@@ -124,14 +128,14 @@ import Data.Vector.Unboxed qualified as U
 import Foreign.Marshal.Utils (fromBool, toBool)
 
 import Box2D.Body qualified as B2Body
-import Box2D.Callbacks (withCastResultFcn, withOverlapResultFcn)
+import Box2D.Callbacks (withCastResultFcn, withOverlapResultFcn, withPlaneResultFcn)
 import Box2D.Collision qualified as B2Collision
 import Box2D.DistanceJoint qualified as B2DistanceJoint
 import Box2D.Events qualified as B2Events
 import Box2D.Id (BodyId, JointId, ShapeId, WorldId)
 import Box2D.Joint qualified as B2Joint
 import Box2D.MathFunctions (makeRot, rotGetAngle)
-import Box2D.MathTypes (AABB (..), Rot (..), Transform (..), Vec2 (..), vec2Zero)
+import Box2D.MathTypes (AABB (..), Plane (..), Rot (..), Transform (..), Vec2 (..), vec2Zero)
 import Box2D.MotorJoint qualified as B2MotorJoint
 import Box2D.PrismaticJoint qualified as B2PrismaticJoint
 import Box2D.RevoluteJoint qualified as B2RevoluteJoint
@@ -2006,6 +2010,224 @@ containsPointQuery point fltr = do
     _ <- withOverlapResultFcn visit $ \fp ctx ->
       B2World.overlapAABB (spWorld sp) vec2Zero (AABB point point) qf fp ctx
     map Entity . IS.toList <$> readIORef found
+
+-- * Character mover
+
+{- | One collision plane gathered by 'moveCharacter' for a single mover
+step, ported from @mover.c@'s @b2CollisionPlane@: the geometric plane
+plus the solver's per-plane push accumulator. Not exported — the solver
+resets 'mpPush' to 0 at the start of every 'solveMoverPlanes' call, so a
+stale accumulator from a previous step is never visible.
+-}
+data MoverPlane = MoverPlane
+  { mpPlane :: !Plane
+  , mpPushLimit :: !Float
+  , mpPush :: !Float
+  , mpClipVelocity :: !Bool
+  }
+
+{- | @mover.c@'s @b2PlaneSeparation@: signed distance of a point from a
+plane, using the engine's @dot(normal, point) - offset@ convention (see
+'Plane').
+-}
+planeSeparation :: Plane -> Vec2 -> Float
+planeSeparation (Plane n o) p = vecDot n p - o
+
+{- | @B2_LINEAR_SLOP@ at the engine's default length-units-per-meter (1).
+Box2D lets a world rescale its length units, which would rescale this
+too, but that isn't exposed to query; this layer assumes the default.
+-}
+linearSlop :: Float
+linearSlop = 0.005
+
+-- | @sample_character.cpp@'s @Mover::m_planeCapacity@: at most this many planes are kept per step.
+planeCapacity :: Int
+planeCapacity = 8
+
+-- | @sample_character.cpp@'s outer collide\/solve\/cast loop count.
+moverStepIterations :: Int
+moverStepIterations = 5
+
+-- | @sample_character.cpp@'s per-iteration break tolerance on the swept translation.
+moverStepTolerance :: Float
+moverStepTolerance = 0.01
+
+-- | @b2SolvePlanes@'s inner accumulated-push iteration cap.
+solverIterations :: Int
+solverIterations = 20
+
+vecAdd :: Vec2 -> Vec2 -> Vec2
+vecAdd (Vec2 ax ay) (Vec2 bx by) = Vec2 (ax + bx) (ay + by)
+
+vecSub :: Vec2 -> Vec2 -> Vec2
+vecSub (Vec2 ax ay) (Vec2 bx by) = Vec2 (ax - bx) (ay - by)
+
+vecScale :: Float -> Vec2 -> Vec2
+vecScale s (Vec2 x y) = Vec2 (s * x) (s * y)
+
+vecDot :: Vec2 -> Vec2 -> Float
+vecDot (Vec2 ax ay) (Vec2 bx by) = ax * bx + ay * by
+
+vecLenSq :: Vec2 -> Float
+vecLenSq v = vecDot v v
+
+-- | @b2MulAdd@: @a + s*b@.
+vecMulAdd :: Vec2 -> Float -> Vec2 -> Vec2
+vecMulAdd a s b = vecAdd a (vecScale s b)
+
+-- | @b2MulSub@: @a - s*b@.
+vecMulSub :: Vec2 -> Float -> Vec2 -> Vec2
+vecMulSub a s b = vecSub a (vecScale s b)
+
+clampFloat :: Float -> Float -> Float -> Float
+clampFloat x lo hi = max lo (min hi x)
+
+-- | A 'B2T.PlaneResult' as a fresh 'MoverPlane': no push limit (the sample's per-shape @maxPush@ user data isn't exposed here) and velocity always clipped.
+mkMoverPlane :: B2T.PlaneResult -> MoverPlane
+mkMoverPlane pr =
+  MoverPlane
+    { mpPlane = B2T.planeResultPlane pr
+    , mpPushLimit = 1 / 0
+    , mpPush = 0
+    , mpClipVelocity = True
+    }
+
+-- | One sweep of @b2SolvePlanes@'s inner loop over every plane, threading the resolved delta and each plane's updated push accumulator.
+solvePlanesStep :: Vec2 -> [MoverPlane] -> (Vec2, [MoverPlane], Float)
+solvePlanesStep = go [] 0
+  where
+    go acc total delta [] = (delta, reverse acc, total)
+    go acc total delta (p : ps) =
+      let
+        -- Add slop to prevent jitter.
+        separation = planeSeparation (mpPlane p) delta + linearSlop
+        push = negate separation
+        accumulated = mpPush p
+        newPush = clampFloat (accumulated + push) 0 (mpPushLimit p)
+        pushDelta = newPush - accumulated
+        Plane n _ = mpPlane p
+        delta' = vecMulAdd delta pushDelta n
+      in
+        go (p{mpPush = newPush} : acc) (total + abs pushDelta) delta' ps
+
+{- | Port of @mover.c@'s @b2SolvePlanes@: resolve a desired translation
+against a set of collision planes by accumulating a clamped push along
+each plane's normal, iterated until the total push converges below
+'linearSlop' or 'solverIterations' is reached. Returns the resolved
+translation and the planes with their final push accumulators (used
+afterwards by 'clipMoverVector').
+-}
+solveMoverPlanes :: Vec2 -> [MoverPlane] -> (Vec2, [MoverPlane])
+solveMoverPlanes targetDelta planes0 = go (0 :: Int) [p{mpPush = 0} | p <- planes0] targetDelta
+  where
+    go iteration planes delta
+      | iteration >= solverIterations = (delta, planes)
+      | otherwise =
+          let (delta', planes', totalPush) = solvePlanesStep delta planes
+          in if totalPush < linearSlop then
+               (delta', planes')
+             else
+               go (iteration + 1) planes' delta'
+
+{- | Port of @mover.c@'s @b2ClipVector@: kill the into-the-plane component
+of a vector for every plane that pushed (nonzero 'mpPush') and asked for
+clipping ('mpClipVelocity'), leaving components along or away from the
+plane untouched.
+-}
+clipMoverVector :: Vec2 -> [MoverPlane] -> Vec2
+clipMoverVector = foldl' step
+  where
+    step v p
+      | mpPush p == 0 || not (mpClipVelocity p) = v
+      | otherwise =
+          let Plane n _ = mpPlane p
+          in vecMulSub v (min 0 (vecDot v n)) n
+
+{- | What 'moveCharacter' produced: where the mover ended up and its
+velocity clipped against every surface it touched (kill the
+into-the-wall component so speed doesn't build up against obstacles).
+-}
+data MoverResult = MoverResult
+  { moverPosition :: !WVec
+  , moverVelocity :: !WVec
+  }
+  deriving (Eq, Show)
+
+{- | Move a character capsule from its current position toward a target,
+sliding along whatever it hits — the engine-blessed kinematic character
+controller (collide → solve planes → sweep, iterated). The capsule is
+given in local space like 'GeoCapsule' (two centers and a radius) and
+does not need any 'Body' or 'Shape' — the mover is pure query, it does
+not push bodies around. Pass the current velocity to get it clipped
+against the surfaces touched this step; integrate gravity/input into it
+yourself before calling. Filter semantics match the other queries (see
+'toQueryFilter').
+
+Mirrors @sample_character.cpp@'s @Mover@ faithfully: up to 5
+collide\/solve\/cast iterations, breaking early once a step's swept
+translation is shorter than 0.01 units; each iteration gathers up to 8
+collision planes fresh via 'B2World.collideMover', resolves the target
+delta against them with 'solveMoverPlanes' (a direct port of @mover.c@'s
+@b2SolvePlanes@), and sweeps the resolved translation with
+'B2World.castMover'. The final velocity is clipped ('clipMoverVector'\/
+@b2ClipVector@) against the planes gathered in whichever iteration ran
+last — same as the sample, which never clears its plane buffer after the
+loop exits. Every plane is treated as unlimited push with clipping on;
+the sample's per-shape @maxPush@\/@clipVelocity@ come from shape user
+data, which this layer doesn't expose.
+-}
+moveCharacter
+  :: forall w m
+   . (MonadIO m, Has w m Physics)
+  => BVec
+  -- ^ mover capsule center 1, local
+  -> BVec
+  -- ^ mover capsule center 2, local
+  -> Float
+  -- ^ mover capsule radius
+  -> WVec
+  -- ^ current position (world origin of the capsule frame)
+  -> WVec
+  -- ^ target position for this step
+  -> WVec
+  -- ^ current velocity
+  -> Filter
+  -> SystemT w m MoverResult
+moveCharacter c1 c2 radius pos0 target vel0 fltr = do
+  sp :: B2Space Physics <- getStore
+  liftIO $ do
+    qf <- toQueryFilter fltr
+    let
+      capsule = B2T.Capsule c1 c2 radius
+
+      gatherPlanes pos = do
+        planesRef <- newIORef []
+        let visit _shapeId pr = do
+              when (toBool (B2T.planeResultHit pr)) $
+                modifyIORef' planesRef $ \ps ->
+                  if length ps >= planeCapacity then ps else mkMoverPlane pr : ps
+              pure True
+        _ <-
+          withPlaneResultFcn visit $ \fp ctx ->
+            B2World.collideMover (spWorld sp) pos capsule qf fp ctx
+        reverse <$> readIORef planesRef
+
+      step i pos lastPlanes
+        | i >= moverStepIterations = pure (pos, lastPlanes)
+        | otherwise = do
+            planes <- gatherPlanes pos
+            let (translation, planes') = solveMoverPlanes (vecSub target pos) planes
+            fraction <- B2World.castMover (spWorld sp) pos capsule translation qf
+            let
+              delta = vecScale fraction translation
+              pos' = vecAdd pos delta
+            if vecLenSq delta < moverStepTolerance * moverStepTolerance then
+              pure (pos', planes')
+            else
+              step (i + 1) pos' planes'
+
+    (finalPos, finalPlanes) <- step (0 :: Int) pos0 []
+    pure (MoverResult finalPos (clipMoverVector vel0 finalPlanes))
 
 -- * Collisions
 
