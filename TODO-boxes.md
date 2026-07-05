@@ -70,7 +70,7 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
 
 ## P2 — Big bets (high impact, real effort)
 
-- [ ] **[3D] Fill out `JointSpec`: hinge (revolute), slider (prismatic),
+- [x] **[3D] Fill out `JointSpec`: hinge (revolute), slider (prismatic),
   wheel.** 3D has only pivot/distance/weld — no doors, no vehicles, no
   pistons. Upstream modules `RevoluteJoint`, `PrismaticJoint`, `WheelJoint`
   are fully bound with defaults; follows the existing `createJoint` pattern.

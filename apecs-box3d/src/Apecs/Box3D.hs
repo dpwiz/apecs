@@ -122,13 +122,17 @@ import Box3D.Events qualified as B3Events
 import Box3D.Hull qualified as B3Hull
 import Box3D.Id (BodyId, JointId, ShapeId, WorldId)
 import Box3D.Joint qualified as B3Joint
+import Box3D.MathFunctions (computeQuatBetweenUnitVectors)
 import Box3D.MathTypes (AABB (..), Quat (..), Transform (..), Vec3 (..), quatIdentity, vec3Zero)
+import Box3D.PrismaticJoint qualified as B3PrismaticJoint
+import Box3D.RevoluteJoint qualified as B3RevoluteJoint
 import Box3D.Shape qualified as B3Shape
 import Box3D.SphericalJoint qualified as B3SphericalJoint
 import Box3D.Types (Filter (..))
 import Box3D.Types qualified as B3T
 import Box3D.UserData (getUserIndex, setUserIndex)
 import Box3D.WeldJoint qualified as B3WeldJoint
+import Box3D.WheelJoint qualified as B3WheelJoint
 import Box3D.World qualified as B3World
 
 -- | A vector in body-space coordinates.
@@ -1288,7 +1292,8 @@ instance (MonadIO m) => ExplMembers m (B3Space Sensor) where
 
 {- | A joint between two bodies, specified in world space at creation
 time. Joint frames are derived from the given world points with zero
-reference rotation.
+reference rotation, except for the hinge, slider and wheel variants,
+whose frames are additionally aligned to the given world axis or axes.
 -}
 data JointSpec
   = {- | A spherical (ball-socket) joint: the bodies pivot around a
@@ -1299,6 +1304,42 @@ data JointSpec
     DistanceJoint WVec WVec
   | -- | Rigidly welds the bodies together at a world point.
     WeldJoint WVec
+  | {- | A revolute (hinge) joint: the bodies rotate relative to each
+    other about a shared world point, constrained to a world-space
+    axis.
+    -}
+    HingeJoint WVec WVec
+  | {- | A hinge with an angular spring back to the creation orientation:
+    stiffness in Hertz and a damping ratio.
+    -}
+    HingeSpringJoint WVec WVec Float Float
+  | -- | A hinge with the relative angle limited to (lower, upper) radians.
+    HingeLimitJoint WVec WVec Float Float
+  | {- | A motorised hinge driving the relative angle at a speed (radians
+    per second) with a maximum torque.
+    -}
+    HingeMotorJoint WVec WVec Float Float
+  | {- | A prismatic (slider) joint: the bodies translate relative to
+    each other along a world-space axis through the anchor, free
+    between (lower, upper) meters.
+    -}
+    SliderJoint WVec WVec Float Float
+  | {- | A slider with a damped spring back to the creation translation:
+    stiffness in Hertz and a damping ratio.
+    -}
+    SliderSpringJoint WVec WVec Float Float
+  | {- | A motorised slider driving the translation at a speed (meters
+    per second) with a maximum force.
+    -}
+    SliderMotorJoint WVec WVec Float Float
+  | {- | A wheel joint: entity A is the chassis and entity B the wheel.
+    The wheel spins about the axle axis and the suspension lets it
+    translate along the suspension axis through the anchor; the
+    suspension spring is enabled with the given stiffness (Hertz) and
+    damping ratio, and the spin motor and steering are left at engine
+    defaults.
+    -}
+    WheelJoint WVec WVec WVec Float Float
   deriving (Eq, Show)
 
 {- | Gives an entity a joint connecting the 'Body's of the two given
@@ -1337,6 +1378,109 @@ baseAt jd a b pA pB = do
       , B3T.jointDefLocalFrameB = fb
       }
 
+-- | Conjugate (inverse for unit quaternions).
+qConj :: Quat -> Quat
+qConj (Quat (Vec3 x y z) w) = Quat (Vec3 (-x) (-y) (-z)) w
+
+-- | Hamilton product; composes rotations (apply the right one first).
+qMul :: Quat -> Quat -> Quat
+qMul (Quat (Vec3 x1 y1 z1) w1) (Quat (Vec3 x2 y2 z2) w2) =
+  Quat
+    ( Vec3
+        (w1 * x2 + x1 * w2 + y1 * z2 - z1 * y2)
+        (w1 * y2 - x1 * z2 + y1 * w2 + z1 * x2)
+        (w1 * z2 + x1 * y2 - y1 * x2 + z1 * w2)
+    )
+    (w1 * w2 - x1 * x2 - y1 * y2 - z1 * z2)
+
+-- | Normalize a vector; errors on a zero (or NaN) length, which has no direction.
+vNormalize :: Vec3 -> Vec3
+vNormalize (Vec3 x y z)
+  | m > 0 = Vec3 (x / m) (y / m) (z / m)
+  | otherwise = error "vNormalize: zero-length vector"
+  where
+    m = sqrt (x * x + y * y + z * z)
+
+{- | A joint frame at a world point whose canonical axis points along a
+world axis. World orientation of a joint frame is @q_body * q_local@;
+cancelling the body rotation and then composing with the aligning
+rotation from the canonical axis to the world axis gives a frame whose
+canonical axis is that world axis, independent of the body's own
+orientation.
+-}
+axisFrameAt :: Vec3 -> BodyId -> WVec -> WVec -> IO Transform
+axisFrameAt canonical b p axis = do
+  local <- B3Body.getLocalPoint b p
+  qb <- B3Body.getRotation b
+  qa <- computeQuatBetweenUnitVectors canonical (vNormalize axis)
+  pure (Transform local (qMul (qConj qb) qa))
+
+{- | Fill a joint def's base with the two bodies and frames at a shared
+world anchor, both oriented so the frame's canonical axis points along
+a world axis.
+-}
+axisBaseAt :: B3T.JointDef -> BodyId -> BodyId -> Vec3 -> Vec3 -> Vec3 -> IO B3T.JointDef
+axisBaseAt jd a b canonical p axis = do
+  fa <- axisFrameAt canonical a p axis
+  fb <- axisFrameAt canonical b p axis
+  pure
+    jd
+      { B3T.jointDefBodyIdA = a
+      , B3T.jointDefBodyIdB = b
+      , B3T.jointDefLocalFrameA = fa
+      , B3T.jointDefLocalFrameB = fb
+      }
+
+{- | The quaternion rotating the world axes onto an orthonormal
+right-handed basis given as the columns (x, y, z) of a rotation matrix.
+Shepperd's method: picks the numerically stable branch by the sign of
+the trace and the largest diagonal element.
+-}
+quatFromBasis :: Vec3 -> Vec3 -> Vec3 -> Quat
+quatFromBasis (Vec3 m00 m10 m20) (Vec3 m01 m11 m21) (Vec3 m02 m12 m22)
+  | trace > 0 =
+      let s = sqrt (trace + 1) * 2
+      in mk ((m21 - m12) / s) ((m02 - m20) / s) ((m10 - m01) / s) (0.25 * s)
+  | m00 > m11 && m00 > m22 =
+      let s = sqrt (1 + m00 - m11 - m22) * 2
+      in mk (0.25 * s) ((m01 + m10) / s) ((m02 + m20) / s) ((m21 - m12) / s)
+  | m11 > m22 =
+      let s = sqrt (1 + m11 - m00 - m22) * 2
+      in mk ((m01 + m10) / s) (0.25 * s) ((m12 + m21) / s) ((m02 - m20) / s)
+  | otherwise =
+      let s = sqrt (1 + m22 - m00 - m11) * 2
+      in mk ((m02 + m20) / s) ((m12 + m21) / s) (0.25 * s) ((m10 - m01) / s)
+  where
+    trace = m00 + m11 + m22
+    mk x y z w = Quat (Vec3 x y z) w
+
+{- | Fill a wheel joint def's base: both bodies get a frame at the
+shared world anchor built from an orthonormal basis whose x-axis is the
+suspension direction and whose z-axis is the axle direction, obtained
+by Gram-Schmidt against the suspension axis (erroring if the axle is
+parallel to the suspension axis, since no such basis exists then).
+-}
+wheelBaseAt :: B3T.JointDef -> BodyId -> BodyId -> WVec -> WVec -> WVec -> IO B3T.JointDef
+wheelBaseAt jd a b p suspension axle = do
+  la <- B3Body.getLocalPoint a p
+  lb <- B3Body.getLocalPoint b p
+  qa <- B3Body.getRotation a
+  qb <- B3Body.getRotation b
+  let
+    xAxis@(Vec3 xx xy xz) = vNormalize suspension
+    Vec3 ax ay az = axle
+    onto = ax * xx + ay * xy + az * xz
+    zAxis@(Vec3 zx zy zz) = vNormalize (Vec3 (ax - onto * xx) (ay - onto * xy) (az - onto * xz))
+    yAxis = Vec3 (zy * xz - zz * xy) (zz * xx - zx * xz) (zx * xy - zy * xx)
+    qAlign = quatFromBasis xAxis yAxis zAxis
+  pure
+    jd
+      { B3T.jointDefBodyIdA = a
+      , B3T.jointDefBodyIdB = b
+      , B3T.jointDefLocalFrameA = Transform la (qMul (qConj qa) qAlign)
+      , B3T.jointDefLocalFrameB = Transform lb (qMul (qConj qb) qAlign)
+      }
+
 createJoint :: WorldId -> BodyId -> BodyId -> JointSpec -> IO JointId
 createJoint w a b spec = case spec of
   PivotJoint p -> do
@@ -1356,6 +1500,71 @@ createJoint w a b spec = case spec of
     jd <- B3T.defaultWeldJointDef
     base <- baseAt (B3T.weldJointDefBase jd) a b p p
     B3WeldJoint.create w jd{B3T.weldJointDefBase = base}
+  HingeJoint p axis -> hingeAt p axis id
+  HingeSpringJoint p axis hertz damping ->
+    hingeAt p axis $ \jd ->
+      jd
+        { B3T.revoluteJointDefEnableSpring = 1
+        , B3T.revoluteJointDefHertz = hertz
+        , B3T.revoluteJointDefDampingRatio = damping
+        }
+  HingeLimitJoint p axis lower upper ->
+    hingeAt p axis $ \jd ->
+      jd
+        { B3T.revoluteJointDefEnableLimit = 1
+        , B3T.revoluteJointDefLowerAngle = lower
+        , B3T.revoluteJointDefUpperAngle = upper
+        }
+  HingeMotorJoint p axis speed maxTorque ->
+    hingeAt p axis $ \jd ->
+      jd
+        { B3T.revoluteJointDefEnableMotor = 1
+        , B3T.revoluteJointDefMotorSpeed = speed
+        , B3T.revoluteJointDefMaxMotorTorque = maxTorque
+        }
+  SliderJoint p axis lower upper ->
+    -- prismatic joints already forbid relative rotation, so the limit
+    -- alone is enough to keep the translation free within it
+    sliderAt p axis $ \jd ->
+      jd
+        { B3T.prismaticJointDefEnableLimit = 1
+        , B3T.prismaticJointDefLowerTranslation = lower
+        , B3T.prismaticJointDefUpperTranslation = upper
+        }
+  SliderSpringJoint p axis hertz damping ->
+    sliderAt p axis $ \jd ->
+      jd
+        { B3T.prismaticJointDefEnableSpring = 1
+        , B3T.prismaticJointDefHertz = hertz
+        , B3T.prismaticJointDefDampingRatio = damping
+        }
+  SliderMotorJoint p axis speed maxForce ->
+    sliderAt p axis $ \jd ->
+      jd
+        { B3T.prismaticJointDefEnableMotor = 1
+        , B3T.prismaticJointDefMotorSpeed = speed
+        , B3T.prismaticJointDefMaxMotorForce = maxForce
+        }
+  WheelJoint p suspension axle hertz damping -> do
+    jd <- B3T.defaultWheelJointDef
+    base <- wheelBaseAt (B3T.wheelJointDefBase jd) a b p suspension axle
+    B3WheelJoint.create
+      w
+      jd
+        { B3T.wheelJointDefBase = base
+        , B3T.wheelJointDefEnableSuspensionSpring = 1
+        , B3T.wheelJointDefSuspensionHertz = hertz
+        , B3T.wheelJointDefSuspensionDampingRatio = damping
+        }
+  where
+    hingeAt p axis f = do
+      jd <- B3T.defaultRevoluteJointDef
+      base <- axisBaseAt (B3T.revoluteJointDefBase jd) a b (Vec3 0 0 1) p axis
+      B3RevoluteJoint.create w (f jd){B3T.revoluteJointDefBase = base}
+    sliderAt p axis f = do
+      jd <- B3T.defaultPrismaticJointDef
+      base <- axisBaseAt (B3T.prismaticJointDefBase jd) a b (Vec3 1 0 0) p axis
+      B3PrismaticJoint.create w (f jd){B3T.prismaticJointDefBase = base}
 
 instance (MonadIO m) => ExplSet m (B3Space Joint) where
   explSet sp ety joint@(Joint (Entity aEty) (Entity bEty) spec) = liftIO $ when (aEty /= bEty) $ do
