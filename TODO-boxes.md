@@ -160,6 +160,107 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
   (read, apecs-physics `Moment`), `BodyName`, per-body `ShapeList`/`JointList`
   (derivable from the registries, no FFI needed). (S each)
 
+## Review follow-ups (2026-07-06)
+
+Deferred findings from the whole-branch code review. The review's direct
+fixes are already in (kind-filtered joint-tuning members, sensor flag
+carried across `Shape` recreate, 3D destroy-before-unregister ordering,
+3D sphere/capsule containment, `containsPointQuery` test-before-resolve,
+doc warnings on `Chain` and `Sensor`). Triaged 2026-07-06 into the next
+apecs batch vs. items blocked on (or better fixed in) box-nd first — the
+upstream side is spelled out in `NOTES-upstream.md`.
+
+### Next batch (apecs-side, nothing upstream in the way)
+
+- [ ] **Joint tuning does not survive `Joint` re-set.** `MotorSpeed`,
+  `MotorMaxTorque`, `MotorMaxForce` and `JointLimits` mutate the live
+  engine joint only, so re-setting `Joint` (recreate-on-set) silently
+  resets motors and limits — the joint-side analogue of the sensor-flag
+  bug fixed in `carryMaterial`. Either read the tuning back from the old
+  joint per kind and carry it over the recreate, or store it in
+  `JointRecord`. See cross-cutting note 2. (M)
+- [ ] **Derive joint kind without FFI.** `jointIsKind` and
+  `jointKindMembers` do a `Joint.getType` round-trip per joint, and every
+  tuning component get/set does another to dispatch — but the stored
+  `JointSpec` constructor already determines the engine type. A pure
+  spec → kind mapping (or a `JointType` cached in `JointRecord` at
+  creation) makes exists/members/dispatch FFI-free. (S)
+- [ ] **Chain segment resolution.** Chain segments stay invisible to
+  `Collisions`/`Impacts` *and* the queries; `segmentQuery` returns
+  `Nothing` outright when a chain segment is the closest hit — the chain
+  occludes whatever lies behind it. Documented on `Chain` now, but the
+  real fix is a resolution mechanism: stamp the segment `ShapeId`s
+  (`Chain.getSegmentCount`/`getSegments` are bound) with the entity index,
+  keep them in `ChainRecord`, and give `shapeEntities` a chain-aware
+  fallback. Contact events additionally need per-segment
+  `Shape.enableContactEvents`/`enableHitEvents` (bound; the engine
+  hard-codes both off in `b2CreateChain`, so registry stamping alone
+  won't surface them). Doable today with N per-segment calls; a
+  chain-level flag upstream would shrink it (NOTES-upstream §7). (M)
+- [ ] **`moveCharacter` per-iteration overhead.** Each of the up-to-5
+  step iterations re-wraps the plane-visit `FunPtr` and allocates a fresh
+  planes `IORef`, and the gather runs an O(n) `length` per plane result
+  to enforce `planeCapacity` (a counter, or one `take planeCapacity` at
+  the end, suffices). Hoist a single wrapper around the step loop. (S)
+- [ ] **Event reader allocation.** The per-frame event globals
+  (`Collisions`, `CollisionsEnd`, `SensorEvents`, `JointEvents`, `Moved`)
+  build `VS.toList` + `[Maybe a]` + `catMaybes` intermediates and re-read
+  the shape-registry `IORef` per event; snapshot the registry once per
+  read and fold the storable vector directly. While there: consider
+  splitting `SensorEvents` into begin/end globals mirroring
+  `Collisions`/`CollisionsEnd`, so a reader pays only for the buffer it
+  consumes. (S/M)
+- [ ] **Registry scans on body destroy.** `Body`'s `explDestroy` rebuilds
+  the whole shape/joint/chain maps with `IM.filter` per destroyed body,
+  making a despawn wave O(bodies × records). A per-body reverse index —
+  or at least skipping the rebuild when nothing matches — fixes the
+  shape. (M)
+- [ ] **Dedup the user-index resolvers.** `shapeEntities`, `jointEntity`
+  and `bodyEntity` repeat the same validate/getUserIndex/registry/identity
+  check (and its raw-API-user-index caveat comment) six times across the
+  two packages; one generic resolver over `IORef (IntMap r)` with an id
+  projection keeps the subtle index-0 guard in one place. Same direction:
+  `toSensorEvent` duplicates `toCollision`'s two-shape resolution, and
+  `axisBaseAt`/`wheelBaseAt` re-fill the four jointDef base fields
+  `baseAt` owns. (S each)
+- [ ] **`initPhysicsWith` store bootstrap.** The WorldDef-at-creation
+  remainder of the P3 world-init item: a path to build the `Physics`
+  store around a caller-supplied `WorldDef` (task system, capacities,
+  bounds) — or a caller-supplied `WorldId`, which is what wrapping 2D
+  `createFromSnapshot` needs too. All types are bound; this is wrapper
+  design work, not FFI. (M)
+- [ ] **Pre-solve callback (one-way platforms).** Carried from P3;
+  `withPreSolveFcn` is bound, the work is FunPtr lifetime tied to the
+  space. Still gated on a concrete demo driving it. (M)
+
+### Blocked on upstream — do the box-nd side first (see NOTES-upstream.md)
+
+- [ ] **`overlapShape` + `castShape` queries.** No way to build a
+  `ShapeProxy` from Haskell (opaque tag, no constructor or size).
+  NOTES-upstream §1. (S here once unblocked)
+- [ ] **Manifold/contact data on `Collisions`.** `ContactBeginTouchEvent`
+  carries only ids + a `ContactId`, and `Contact.getData` writes into an
+  opaque `ContactData`. NOTES-upstream §2. (S–M here once unblocked)
+- [ ] **[3D] User-authored meshes and height fields.** `GeoMesh`/
+  `GeoHeightField` currently only accept the procedural generators;
+  loading real level geometry needs constructible `MeshDef`/
+  `HeightFieldDef`. NOTES-upstream §3. (S here once unblocked)
+- [ ] **[3D] `GeoCompound`.** `CompoundDef` and its child defs are opaque.
+  NOTES-upstream §4. (M here once unblocked)
+- [ ] **[3D] Exact containment via the engine.** `containsPointQuery`
+  special-cases spheres and capsules analytically because
+  `getClosestPoint`'s `useRadii` mode keeps witness points on the
+  perimeter even when overlapped; an `hsg_b3Shape_TestPoint` shim gives
+  the engine's own answer and deletes the dispatch. NOTES-upstream §5.
+  (S here once unblocked)
+- [ ] **Delete the hand-ported mover solver.** `solveMoverPlanes`/
+  `clipMoverVector` + vec helpers are duplicated verbatim across the two
+  packages only because `CollisionPlane`/`PlaneSolverResult` are opaque,
+  making the engine's `solvePlanes`/`clipVector` uncallable. Binding them
+  (NOTES-upstream §6) lets both ports be deleted — strictly better than
+  the review's shared-module suggestion, which remains the fallback if
+  upstream stalls. (S here once unblocked; M for the fallback)
+
 ## P4 — Deliberately not wrapping (escape hatch is the API)
 
 - **Debug draw** (`World.draw` + DebugDraw struct): apecs-gloss/-3d already
@@ -181,5 +282,9 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
 2. The wrapper's "reads return the exact value written" convention for
    `Shape`/`Joint` means engine-side mutation (via the P2 tuning components)
    must either update the stored record or document the divergence.
+   *2026-07-06: this bit — the tuning components mutate the engine only,
+   so a `Joint` re-set silently discards motor/limit settings. Registered
+   as a review follow-up above. The matching `Shape`-side hole (sensor
+   flag lost on recreate) is fixed in `carryMaterial`.*
 3. [3D] default filter category is all-bits vs [2D] category 1 — already
    documented in `toQueryFilter`; keep that note when adding query APIs.
