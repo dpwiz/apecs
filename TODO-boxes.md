@@ -148,7 +148,7 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
   steps). Full WorldDef-at-creation config (task system, capacities,
   bounds) still open — needs an `initPhysicsWith` store-bootstrap path,
   which would also unlock wrapping 2D `createFromSnapshot`.*
-- [ ] **[2D] Chain shapes (`GeoChain`).** Terrain outlines without ghost
+- [x] **[2D] Chain shapes (`GeoChain`).** Terrain outlines without ghost
   collisions. Separate `ChainId` lifecycle, so it doesn't fit `ShapeRecord`
   directly. (M)
 - [x] **[2D] Rounded/offset geometry constructors.** `makeRoundedBox`,

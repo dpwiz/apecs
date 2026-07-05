@@ -82,6 +82,8 @@ module Apecs.Box2D
   , Sensor (..)
   , Filter (..)
   , B2ShapeId (..)
+  , Chain (..)
+  , B2ChainId (..)
 
     -- * Joint
   , JointSpec (..)
@@ -164,10 +166,11 @@ import Foreign.Ptr (Ptr, castPtr, nullPtr)
 
 import Box2D.Body qualified as B2Body
 import Box2D.Callbacks (withCastResultFcn, withOverlapResultFcn, withPlaneResultFcn)
+import Box2D.Chain qualified as B2Chain
 import Box2D.Collision qualified as B2Collision
 import Box2D.DistanceJoint qualified as B2DistanceJoint
 import Box2D.Events qualified as B2Events
-import Box2D.Id (BodyId, JointId, ShapeId, WorldId)
+import Box2D.Id (BodyId, ChainId, JointId, ShapeId, WorldId)
 import Box2D.Joint qualified as B2Joint
 import Box2D.MathFunctions (makeRot, rotGetAngle)
 import Box2D.MathTypes (AABB (..), Plane (..), Rot (..), Transform (..), Vec2 (..), vec2Zero)
@@ -199,8 +202,11 @@ data ShapeRecord = ShapeRecord !ShapeId !Shape
 -- | The engine joint plus the exact 'Joint' value that created it.
 data JointRecord = JointRecord !JointId !Joint
 
+-- | The engine chain plus the exact 'Chain' value that created it.
+data ChainRecord = ChainRecord !ChainId !Chain
+
 {- | The store shared by 'Physics' and all its sub-components: the engine
-world plus entity registries for bodies, shapes and joints.
+world plus entity registries for bodies, shapes, joints and chains.
 -}
 data B2Space c = B2Space
   { spWorld :: !WorldId
@@ -209,11 +215,12 @@ data B2Space c = B2Space
   , spBodies :: !(IORef (IntMap BodyId))
   , spShapes :: !(IORef (IntMap ShapeRecord))
   , spJoints :: !(IORef (IntMap JointRecord))
+  , spChains :: !(IORef (IntMap ChainRecord))
   , spSubsteps :: !(IORef Int)
   }
 
 cast :: B2Space a -> B2Space b
-cast (B2Space w bd sd b s j i) = B2Space w bd sd b s j i
+cast (B2Space w bd sd b s j c i) = B2Space w bd sd b s j c i
 
 type instance Elem (B2Space c) = c
 
@@ -238,6 +245,7 @@ instance (MonadIO m) => ExplInit m (B2Space Physics) where
           , B2T.shapeDefEnableHitEvents = 1
           , B2T.shapeDefEnableSensorEvents = 1
           }
+      <*> newIORef mempty
       <*> newIORef mempty
       <*> newIORef mempty
       <*> newIORef mempty
@@ -271,6 +279,7 @@ destroyPhysics = do
     writeIORef (spBodies sp) mempty
     writeIORef (spShapes sp) mempty
     writeIORef (spJoints sp) mempty
+    writeIORef (spChains sp) mempty
 
 {- | Apply a radial impulse to every dynamic body within a radius of a
 world point, as if from an explosion: each affected shape is pushed
@@ -367,6 +376,15 @@ jointExists sp = regExists (spJoints sp)
 
 jointMembers :: (MonadIO m) => B2Space c -> m (U.Vector Int)
 jointMembers sp = regMembers (spJoints sp)
+
+withChain :: B2Space c -> Int -> (ChainId -> IO a) -> IO a
+withChain sp ety f = withReg "Chain" (spChains sp) ety (\(ChainRecord c _) -> f c)
+
+chainExists :: (MonadIO m) => B2Space c -> Int -> m Bool
+chainExists sp = regExists (spChains sp)
+
+chainMembers :: (MonadIO m) => B2Space c -> m (U.Vector Int)
+chainMembers sp = regMembers (spChains sp)
 
 -- | Whether an entity has a 'Joint' whose engine type is one of the given kinds.
 jointIsKind :: B2Space c -> Int -> [B2T.JointType] -> IO Bool
@@ -595,10 +613,11 @@ instance (MonadIO m) => ExplDestroy m (B2Space Body) where
   explDestroy sp ety = liftIO $ do
     bodies <- readIORef (spBodies sp)
     forM_ (IM.lookup ety bodies) $ \b -> do
-      -- the engine destroys attached shapes and joints along with the
-      -- body, so drop their entity records too
+      -- the engine destroys attached shapes, joints and chains along with
+      -- the body, so drop their entity records too
       modifyIORef' (spShapes sp) (IM.filter (\(ShapeRecord _ (Shape (Entity be) _)) -> be /= ety))
       modifyIORef' (spJoints sp) (IM.filter (\(JointRecord _ (Joint (Entity a) (Entity b') _)) -> a /= ety && b' /= ety))
+      modifyIORef' (spChains sp) (IM.filter (\(ChainRecord _ (Chain (Entity be) _ _)) -> be /= ety))
       modifyIORef' (spBodies sp) (IM.delete ety)
       B2Body.destroy b
 
@@ -1336,6 +1355,111 @@ instance (MonadIO m) => ExplGet m (B2Space B2ShapeId) where
 
 instance (MonadIO m) => ExplMembers m (B2Space B2ShapeId) where
   explMembers = shapeMembers
+
+{- | The fewest points the engine accepts for a chain (both open and
+looped), per @b2ChainDef@: it uses the extra points as ghost vertices
+to suppress ghost collisions at internal joints.
+-}
+minChainPoints :: Int
+minChainPoints = 4
+
+{- | Gives an entity a chain of connected line segments attached to the
+'Body' of the given entity — smooth static terrain outlines without the
+ghost collisions of separate 'GeoSegment's. Points are in body-local
+coordinates. Collision is one-sided: the solid face is to the right when
+facing from one point towards the next, so for a loop a
+counter-clockwise winding faces outward and a clockwise winding faces
+inward (the same convention 'GeoPolygon' uses for its CCW hull). When the
+loop flag is set the chain closes by connecting the last point back to
+the first; either way at least 4 points are required, and setting fewer
+raises an error in the style of 'GeoPolygon'. Chains are meant for
+static bodies. Re-setting recreates the engine chain; reads return the
+exact value written. Setting it on an entity whose body entity has no
+'Body' is a silent no-op.
+
+The segments the engine creates for a chain are its own internal
+@b2ChainSegment@ shapes, never registered in this layer's shape registry
+(there is no matching 'Shape' component for them), so contacts against
+them do not currently surface in 'Collisions', 'CollisionsEnd' or
+'Impacts' — those globals resolve engine shapes back to entities through
+the registry and silently drop anything not found there.
+-}
+data Chain = Chain Entity (VS.Vector Vec2) Bool
+  deriving (Eq, Show)
+
+instance Component Chain where
+  type Storage Chain = B2Space Chain
+
+instance (MonadIO m, Has w m Physics) => Has w m Chain where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+{- | Create a fresh engine chain for a 'Chain' value, destroy the chain it
+replaces (if any) only after the new one exists (so a failed create,
+e.g. too few points, leaves everything intact), and update the chain
+registry. Mirrors 'recreateShape'.
+-}
+recreateChain :: B2Space c -> BodyId -> Int -> Chain -> Maybe ChainRecord -> IO ()
+recreateChain sp b ety chain@(Chain _ pts isLoop) old = do
+  let n = VS.length pts
+  when (n < minChainPoints) $
+    error ("chain needs at least " <> show minChainPoints <> " points, got " <> show n)
+  def <- B2T.defaultChainDef
+  c <- VS.unsafeWith pts $ \p ->
+    B2Chain.create
+      b
+      def
+        { B2T.chainDefPoints = p
+        , B2T.chainDefCount = fromIntegral n
+        , B2T.chainDefIsLoop = fromBool isLoop
+        }
+  -- Unlike BodyId/ShapeId/JointId, ChainId has no 'Box2D.UserData.HasUserData'
+  -- instance, so the chain itself cannot be stamped with the entity's user
+  -- index (the chain registry below, keyed by entity, is what
+  -- 'explGet'/'B2ChainId' use instead). Its segment 'ShapeId's could be
+  -- stamped, but that would not help event resolution either: 'shapeEntities'
+  -- only recognises shapes present in the shape registry, and chain segments
+  -- never are (see the haddock above).
+  forM_ old $ \(ChainRecord c' _) -> B2Chain.destroy c'
+  modifyIORef' (spChains sp) (IM.insert ety (ChainRecord c chain))
+
+instance (MonadIO m) => ExplSet m (B2Space Chain) where
+  explSet sp ety chain@(Chain (Entity bEty) _ _) = liftIO $
+    overBody sp bEty $ \b -> do
+      old <- IM.lookup ety <$> readIORef (spChains sp)
+      recreateChain sp b ety chain old
+
+instance (MonadIO m) => ExplGet m (B2Space Chain) where
+  explExists = chainExists
+  explGet sp ety = liftIO $
+    withReg "Chain" (spChains sp) ety $
+      \(ChainRecord _ chain) -> pure chain
+
+instance (MonadIO m) => ExplDestroy m (B2Space Chain) where
+  explDestroy sp ety = liftIO $ do
+    chains <- readIORef (spChains sp)
+    forM_ (IM.lookup ety chains) $ \(ChainRecord c _) -> do
+      modifyIORef' (spChains sp) (IM.delete ety)
+      B2Chain.destroy c
+
+instance (MonadIO m) => ExplMembers m (B2Space Chain) where
+  explMembers = chainMembers
+
+-- | The raw Box2D chain of an entity, for use with "Box2D.Chain" directly.
+newtype B2ChainId = B2ChainId ChainId
+  deriving (Eq, Show)
+
+instance Component B2ChainId where
+  type Storage B2ChainId = B2Space B2ChainId
+
+instance (MonadIO m, Has w m Physics) => Has w m B2ChainId where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space B2ChainId) where
+  explExists = chainExists
+  explGet sp ety = liftIO $ withChain sp ety (pure . B2ChainId)
+
+instance (MonadIO m) => ExplMembers m (B2Space B2ChainId) where
+  explMembers = chainMembers
 
 -- Shape sub-components -----------------------------------------------------
 
