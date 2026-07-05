@@ -197,7 +197,7 @@ upstream side is spelled out in `NOTES-upstream.md`.
   hard-codes both off in `b2CreateChain`, so registry stamping alone
   won't surface them). Doable today with N per-segment calls; a
   chain-level flag upstream would shrink it (NOTES-upstream §7). (M)
-- [ ] **`moveCharacter` per-iteration overhead.** Each of the up-to-5
+- [x] **`moveCharacter` per-iteration overhead.** Each of the up-to-5
   step iterations re-wraps the plane-visit `FunPtr` and allocates a fresh
   planes `IORef`, and the gather runs an O(n) `length` per plane result
   to enforce `planeCapacity` (a counter, or one `take planeCapacity` at
@@ -253,7 +253,7 @@ upstream side is spelled out in `NOTES-upstream.md`.
   perimeter even when overlapped; an `hsg_b3Shape_TestPoint` shim gives
   the engine's own answer and deletes the dispatch. NOTES-upstream §5.
   (S here once unblocked)
-- [ ] **Delete the hand-ported mover solver.** `solveMoverPlanes`/
+- [x] **Delete the hand-ported mover solver.** `solveMoverPlanes`/
   `clipMoverVector` + vec helpers are duplicated verbatim across the two
   packages only because `CollisionPlane`/`PlaneSolverResult` are opaque,
   making the engine's `solvePlanes`/`clipVector` uncallable. Binding them

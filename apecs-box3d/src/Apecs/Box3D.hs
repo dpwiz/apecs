@@ -191,8 +191,9 @@ import Box3D.Hull qualified as B3Hull
 import Box3D.Id (BodyId, JointId, ShapeId, WorldId)
 import Box3D.Joint qualified as B3Joint
 import Box3D.MathFunctions (computeQuatBetweenUnitVectors)
-import Box3D.MathTypes (AABB (..), Matrix3 (..), Plane (..), Quat (..), Transform (..), Vec3 (..), quatIdentity, vec3Zero)
+import Box3D.MathTypes (AABB (..), Matrix3 (..), Quat (..), Transform (..), Vec3 (..), quatIdentity, vec3Zero)
 import Box3D.Mesh qualified as B3Mesh
+import Box3D.Mover qualified as B3Mover
 import Box3D.PlatformMesh qualified as B3PlatformMesh
 import Box3D.PrismaticJoint qualified as B3PrismaticJoint
 import Box3D.Recording qualified as B3Recording
@@ -2579,34 +2580,6 @@ containsPointQuery point@(Vec3 px py pz) fltr = do
 
 -- * Character mover
 
-{- | One collision plane gathered by 'moveCharacter' for a single mover
-step, ported from @mover.c@'s @b3CollisionPlane@: the geometric plane
-plus the solver's per-plane push accumulator. Not exported — the solver
-resets 'mpPush' to 0 at the start of every 'solveMoverPlanes' call, so a
-stale accumulator from a previous step is never visible.
--}
-data MoverPlane = MoverPlane
-  { mpPlane :: !Plane
-  , mpPushLimit :: !Float
-  , mpPush :: !Float
-  , mpClipVelocity :: !Bool
-  }
-
-{- | @mover.c@'s @b3PlaneSeparation@: signed distance of a point from a
-plane, using the engine's @dot(normal, point) - offset@ convention (see
-'Plane').
--}
-planeSeparation :: Plane -> Vec3 -> Float
-planeSeparation (Plane n o) p = vecDot n p - o
-
-{- | @B3_LINEAR_SLOP@ at the engine's default length-units-per-meter (1),
-same value as Box2D's slop. Box3D lets a world rescale its length
-units, which would rescale this too, but that isn't exposed to query;
-this layer assumes the default.
--}
-linearSlop :: Float
-linearSlop = 0.005
-
 -- | @sample.cpp@'s @CharacterMover::m_planeCapacity@: at most this many planes are kept per step. Same value as the 2D sample.
 planeCapacity :: Int
 planeCapacity = 8
@@ -2618,10 +2591,6 @@ moverStepIterations = 5
 -- | @sample.cpp@'s per-iteration break tolerance on the swept translation — identical to the 2D sample.
 moverStepTolerance :: Float
 moverStepTolerance = 0.01
-
--- | @b3SolvePlanes@'s inner accumulated-push iteration cap — identical to the 2D @b2SolvePlanes@.
-solverIterations :: Int
-solverIterations = 20
 
 vecAdd :: Vec3 -> Vec3 -> Vec3
 vecAdd (Vec3 ax ay az) (Vec3 bx by bz) = Vec3 (ax + bx) (ay + by) (az + bz)
@@ -2642,10 +2611,6 @@ vecLenSq v = vecDot v v
 vecMulAdd :: Vec3 -> Float -> Vec3 -> Vec3
 vecMulAdd a s b = vecAdd a (vecScale s b)
 
--- | @b3MulSub@: @a - s*b@.
-vecMulSub :: Vec3 -> Float -> Vec3 -> Vec3
-vecMulSub a s b = vecSub a (vecScale s b)
-
 -- | Squared distance from a point to the segment between two points.
 segmentDistSq :: Vec3 -> Vec3 -> Vec3 -> Float
 segmentDistSq p a b = vecLenSq (vecSub p (vecMulAdd a t ab))
@@ -2654,67 +2619,18 @@ segmentDistSq p a b = vecLenSq (vecSub p (vecMulAdd a t ab))
     t = clamp (0, 1) (if lenSq == 0 then 0 else vecDot (vecSub p a) ab / lenSq)
     lenSq = vecLenSq ab
 
--- | A 'B3T.PlaneResult' as a fresh 'MoverPlane': no push limit (the sample's per-shape @maxPush@ user data isn't exposed here) and velocity always clipped.
-mkMoverPlane :: B3T.PlaneResult -> MoverPlane
-mkMoverPlane pr =
-  MoverPlane
-    { mpPlane = B3T.planeResultPlane pr
-    , mpPushLimit = 1 / 0
-    , mpPush = 0
-    , mpClipVelocity = True
+{- | A 'B3T.PlaneResult' as a fresh 'B3T.CollisionPlane' for
+"Box3D.Mover": no push limit (the sample's per-shape @maxPush@ user
+data isn't exposed here) and velocity always clipped.
+-}
+mkCollisionPlane :: B3T.PlaneResult -> B3T.CollisionPlane
+mkCollisionPlane pr =
+  B3T.CollisionPlane
+    { B3T.collisionPlanePlane = B3T.planeResultPlane pr
+    , B3T.collisionPlanePushLimit = 1 / 0
+    , B3T.collisionPlanePush = 0
+    , B3T.collisionPlaneClipVelocity = fromBool True
     }
-
--- | One sweep of @b3SolvePlanes@'s inner loop over every plane, threading the resolved delta and each plane's updated push accumulator.
-solvePlanesStep :: Vec3 -> [MoverPlane] -> (Vec3, [MoverPlane], Float)
-solvePlanesStep = go [] 0
-  where
-    go acc total delta [] = (delta, reverse acc, total)
-    go acc total delta (p : ps) =
-      let
-        -- Add slop to prevent jitter.
-        separation = planeSeparation (mpPlane p) delta + linearSlop
-        push = negate separation
-        accumulated = mpPush p
-        newPush = clamp (0, mpPushLimit p) (accumulated + push)
-        pushDelta = newPush - accumulated
-        Plane n _ = mpPlane p
-        delta' = vecMulAdd delta pushDelta n
-      in
-        go (p{mpPush = newPush} : acc) (total + abs pushDelta) delta' ps
-
-{- | Port of @mover.c@'s @b3SolvePlanes@: resolve a desired translation
-against a set of collision planes by accumulating a clamped push along
-each plane's normal, iterated until the total push converges below
-'linearSlop' or 'solverIterations' is reached. Returns the resolved
-translation and the planes with their final push accumulators (used
-afterwards by 'clipMoverVector'). Identical in structure to the 2D
-@b2SolvePlanes@ port — same iteration count, same slop tolerance.
--}
-solveMoverPlanes :: Vec3 -> [MoverPlane] -> (Vec3, [MoverPlane])
-solveMoverPlanes targetDelta planes0 = go (0 :: Int) [p{mpPush = 0} | p <- planes0] targetDelta
-  where
-    go iteration planes delta
-      | iteration >= solverIterations = (delta, planes)
-      | otherwise =
-          let (delta', planes', totalPush) = solvePlanesStep delta planes
-          in if totalPush < linearSlop then
-               (delta', planes')
-             else
-               go (iteration + 1) planes' delta'
-
-{- | Port of @mover.c@'s @b3ClipVector@: kill the into-the-plane component
-of a vector for every plane that pushed (nonzero 'mpPush') and asked for
-clipping ('mpClipVelocity'), leaving components along or away from the
-plane untouched.
--}
-clipMoverVector :: Vec3 -> [MoverPlane] -> Vec3
-clipMoverVector = foldl' step
-  where
-    step v p
-      | mpPush p == 0 || not (mpClipVelocity p) = v
-      | otherwise =
-          let Plane n _ = mpPlane p
-          in vecMulSub v (min 0 (vecDot v n)) n
 
 {- | What 'moveCharacter' produced: where the mover ended up and its
 velocity clipped against every surface it touched (kill the
@@ -2740,16 +2656,16 @@ Mirrors @samples/sample.cpp@'s @Player@ character controller faithfully
 — its collide\/solve\/cast loop is structurally identical to the 2D
 @sample_character.cpp@ @Mover@, with the same constants (5 outer
 iterations breaking below a 0.01-unit translation, up to 8 planes per
-step, a 20-iteration inner solver): each iteration gathers fresh
-collision planes via 'B3World.collideMover', resolves the target delta
-against them with 'solveMoverPlanes' (a direct port of @mover.c@'s
-@b3SolvePlanes@), and sweeps the resolved translation with
-'B3World.castMover'. The final velocity is clipped ('clipMoverVector'\/
-@b3ClipVector@) against the planes gathered in whichever iteration ran
-last — same as the sample, which never clears its plane buffer after the
-loop exits. Every plane is treated as unlimited push with clipping on;
-the sample's per-shape @maxPush@\/@clipVelocity@ come from shape user
-data, which this layer doesn't expose.
+step): each iteration gathers fresh collision planes via
+'B3World.collideMover', resolves the target delta against them with
+the engine's own solver ("Box3D.Mover"'s 'B3Mover.solvePlanes'), and
+sweeps the resolved translation with 'B3World.castMover'. The final
+velocity is clipped ('B3Mover.clipVector') against the planes gathered
+in whichever iteration ran last — same as the sample, which never
+clears its plane buffer after the loop exits. Every plane is treated as
+unlimited push with clipping on; the sample's per-shape
+@maxPush@\/@clipVelocity@ come from shape user data, which this layer
+doesn't expose.
 
 'B3World.castMover' takes an optional per-shape mover filter callback;
 this layer passes none (a null function pointer, which the engine
@@ -2778,39 +2694,43 @@ moveCharacter c1 c2 radius pos0 target vel0 fltr = do
   sp :: B3Space Physics <- getStore
   liftIO $ do
     qf <- toQueryFilter fltr
-    let
-      capsule = B3T.Capsule c1 c2 radius
+    let capsule = B3T.Capsule c1 c2 radius
+    -- (count, planes gathered so far this iteration); reset before every
+    -- 'B3World.collideMover' call so the FunPtr below can be wrapped once
+    -- for the whole call instead of once per iteration.
+    gatherRef <- newIORef (0 :: Int, [] :: [B3T.CollisionPlane])
+    let visit _shapeId prs = do
+          modifyIORef' gatherRef $ \(n, ps) ->
+            foldl'
+              (\(n', ps') pr -> if n' >= planeCapacity then (n', ps') else (n' + 1, mkCollisionPlane pr : ps'))
+              (n, ps)
+              (VS.toList prs)
+          pure True
+    withPlaneResultFcn visit $ \fp ctx -> do
+      let
+        gatherPlanes pos = do
+          writeIORef gatherRef (0, [])
+          _ <- B3World.collideMover (spWorld sp) pos capsule qf fp ctx
+          (_, ps) <- readIORef gatherRef
+          pure (VS.fromList (reverse ps))
 
-      gatherPlanes pos = do
-        planesRef <- newIORef []
-        let visit _shapeId prs = do
-              modifyIORef' planesRef $ \ps ->
-                foldl'
-                  (\acc pr -> if length acc >= planeCapacity then acc else mkMoverPlane pr : acc)
-                  ps
-                  (VS.toList prs)
-              pure True
-        _ <-
-          withPlaneResultFcn visit $ \fp ctx ->
-            B3World.collideMover (spWorld sp) pos capsule qf fp ctx
-        reverse <$> readIORef planesRef
+        step i pos lastPlanes
+          | i >= moverStepIterations = pure (pos, lastPlanes)
+          | otherwise = do
+              planes <- gatherPlanes pos
+              (translation, planes', _iters) <- B3Mover.solvePlanes (vecSub target pos) planes
+              fraction <- B3World.castMover (spWorld sp) pos capsule translation qf nullFunPtr nullPtr
+              let
+                delta = vecScale fraction translation
+                pos' = vecAdd pos delta
+              if vecLenSq delta < moverStepTolerance * moverStepTolerance then
+                pure (pos', planes')
+              else
+                step (i + 1) pos' planes'
 
-      step i pos lastPlanes
-        | i >= moverStepIterations = pure (pos, lastPlanes)
-        | otherwise = do
-            planes <- gatherPlanes pos
-            let (translation, planes') = solveMoverPlanes (vecSub target pos) planes
-            fraction <- B3World.castMover (spWorld sp) pos capsule translation qf nullFunPtr nullPtr
-            let
-              delta = vecScale fraction translation
-              pos' = vecAdd pos delta
-            if vecLenSq delta < moverStepTolerance * moverStepTolerance then
-              pure (pos', planes')
-            else
-              step (i + 1) pos' planes'
-
-    (finalPos, finalPlanes) <- step (0 :: Int) pos0 []
-    pure (MoverResult finalPos (clipMoverVector vel0 finalPlanes))
+      (finalPos, finalPlanes) <- step (0 :: Int) pos0 VS.empty
+      finalVel <- B3Mover.clipVector vel0 finalPlanes
+      pure (MoverResult finalPos finalVel)
 
 -- * Recording
 
