@@ -49,6 +49,7 @@ module Apecs.Box3D
   , GravityScale (..)
   , BulletBody (..)
   , Awake (..)
+  , MotionLocks (..)
   , SleepEnabled (..)
   , SleepThreshold (..)
   , B3BodyId (..)
@@ -104,7 +105,7 @@ import Data.IntSet qualified as IS
 import Data.Maybe (catMaybes)
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
-import Foreign.Marshal.Utils (fromBool)
+import Foreign.Marshal.Utils (fromBool, toBool)
 import Foreign.Ptr (nullPtr)
 
 import Box3D.Body qualified as B3Body
@@ -751,6 +752,49 @@ instance (MonadIO m) => ExplSet m (B3Space Awake) where
       B3Body.setAwake b a
 
 instance (MonadIO m) => ExplMembers m (B3Space Awake) where
+  explMembers = bodyMembers
+
+{- | Per-axis motion locks on a 'Body': locking a linear axis prevents
+translation along it, and locking an angular axis prevents rotation
+about it. Locking all three angular axes is the 3D analog of Box2D's
+"fixed rotation" (contacts and off-center forces can't spin the body);
+locking a single linear axis constrains movement to a plane. All axes
+are unlocked by default.
+-}
+data MotionLocks = MotionLocks
+  { lockLinearX :: Bool
+  , lockLinearY :: Bool
+  , lockLinearZ :: Bool
+  , lockAngularX :: Bool
+  , lockAngularY :: Bool
+  , lockAngularZ :: Bool
+  }
+  deriving (Eq, Show)
+
+toB3MotionLocks :: MotionLocks -> B3T.MotionLocks
+toB3MotionLocks (MotionLocks lx ly lz ax ay az) =
+  B3T.MotionLocks (fromBool lx) (fromBool ly) (fromBool lz) (fromBool ax) (fromBool ay) (fromBool az)
+
+fromB3MotionLocks :: B3T.MotionLocks -> MotionLocks
+fromB3MotionLocks (B3T.MotionLocks lx ly lz ax ay az) =
+  MotionLocks (toBool lx) (toBool ly) (toBool lz) (toBool ax) (toBool ay) (toBool az)
+
+instance Component MotionLocks where
+  type Storage MotionLocks = B3Space MotionLocks
+
+instance (MonadIO m, Has w m Physics) => Has w m MotionLocks where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplGet m (B3Space MotionLocks) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap fromB3MotionLocks . B3Body.getMotionLocks
+
+instance (MonadIO m) => ExplSet m (B3Space MotionLocks) where
+  explSet sp ety locks = liftIO $
+    overBody sp ety $ \b ->
+      B3Body.setMotionLocks b (toB3MotionLocks locks)
+
+instance (MonadIO m) => ExplMembers m (B3Space MotionLocks) where
   explMembers = bodyMembers
 
 {- | Whether a 'Body' may fall asleep at all (on by default). Disabling

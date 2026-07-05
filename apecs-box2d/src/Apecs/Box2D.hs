@@ -49,6 +49,8 @@ module Apecs.Box2D
   , GravityScale (..)
   , BulletBody (..)
   , Awake (..)
+  , MotionLocks (..)
+  , FixedRotation (..)
   , SleepEnabled (..)
   , SleepThreshold (..)
   , B2BodyId (..)
@@ -102,7 +104,7 @@ import Data.IntSet qualified as IS
 import Data.Maybe (catMaybes)
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
-import Foreign.Marshal.Utils (fromBool)
+import Foreign.Marshal.Utils (fromBool, toBool)
 
 import Box2D.Body qualified as B2Body
 import Box2D.Callbacks (withOverlapResultFcn)
@@ -738,6 +740,76 @@ instance (MonadIO m) => ExplSet m (B2Space Awake) where
       B2Body.setAwake b a
 
 instance (MonadIO m) => ExplMembers m (B2Space Awake) where
+  explMembers = bodyMembers
+
+{- | Per-axis motion locks on a 'Body': locking a linear axis prevents
+translation along it, and locking the angular axis prevents rotation
+about it. Locked rotation is the classic platformer/top-down "fixed
+rotation" (see 'FixedRotation'); locking a linear axis constrains a
+body to rail-style movement along the other. All axes are unlocked by
+default.
+-}
+data MotionLocks = MotionLocks
+  { lockLinearX :: Bool
+  , lockLinearY :: Bool
+  , lockAngularZ :: Bool
+  }
+  deriving (Eq, Show)
+
+toB2MotionLocks :: MotionLocks -> B2T.MotionLocks
+toB2MotionLocks (MotionLocks lx ly az) =
+  B2T.MotionLocks (fromBool lx) (fromBool ly) (fromBool az)
+
+fromB2MotionLocks :: B2T.MotionLocks -> MotionLocks
+fromB2MotionLocks (B2T.MotionLocks lx ly az) =
+  MotionLocks (toBool lx) (toBool ly) (toBool az)
+
+instance Component MotionLocks where
+  type Storage MotionLocks = B2Space MotionLocks
+
+instance (MonadIO m, Has w m Physics) => Has w m MotionLocks where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space MotionLocks) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap fromB2MotionLocks . B2Body.getMotionLocks
+
+instance (MonadIO m) => ExplSet m (B2Space MotionLocks) where
+  explSet sp ety locks = liftIO $
+    overBody sp ety $ \b ->
+      B2Body.setMotionLocks b (toB2MotionLocks locks)
+
+instance (MonadIO m) => ExplMembers m (B2Space MotionLocks) where
+  explMembers = bodyMembers
+
+{- | Whether a 'Body'\'s rotation is locked: top-down and platformer
+characters lock rotation so contacts and off-center forces can't spin
+them. Sugar over the 'MotionLocks' angular-Z lock; setting it preserves
+the linear locks.
+-}
+newtype FixedRotation = FixedRotation Bool
+  deriving (Eq, Show)
+
+instance Component FixedRotation where
+  type Storage FixedRotation = B2Space FixedRotation
+
+instance (MonadIO m, Has w m Physics) => Has w m FixedRotation where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space FixedRotation) where
+  explExists = bodyExists
+  explGet sp ety =
+    liftIO $
+      withBody sp ety $
+        fmap (FixedRotation . toBool . B2T.motionLocksAngularZ) . B2Body.getMotionLocks
+
+instance (MonadIO m) => ExplSet m (B2Space FixedRotation) where
+  explSet sp ety (FixedRotation fixed) = liftIO $
+    overBody sp ety $ \b -> do
+      locks <- B2Body.getMotionLocks b
+      B2Body.setMotionLocks b locks{B2T.motionLocksAngularZ = fromBool fixed}
+
+instance (MonadIO m) => ExplMembers m (B2Space FixedRotation) where
   explMembers = bodyMembers
 
 {- | Whether a 'Body' may fall asleep at all (on by default). Disabling
