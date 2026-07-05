@@ -18,5 +18,8 @@
 - Body dynamics extras: `LinearImpulse`/`AngularImpulse` appliers and
   `LinearDamping`/`AngularDamping`/`GravityScale`.
 - `CollisionFilter` on shapes, re-exporting `Filter`.
+- World queries: `segmentQuery` (closest hit along a segment as a
+  `RayHit` with the shape and body entities), `aabbQuery` and
+  `pointQuery` (broad-phase box overlap returning body entities).
 - `apecs-box2d-demo`: a tumbler scene driven by Box2D and rendered with
   apecs-gloss.

@@ -215,8 +215,8 @@ randomUnit = do
   if q < 0.08 || q > 1 then randomUnit else pure (u ^/ q)
 
 {- | A tumbling rock: a radially jittered icosahedron, the same points
-feeding the physics hull and the render solid. Keeps clear of the
-corridor the ships spawn into.
+feeding the physics hull and the render solid. Carries category bit 2
+('rockFilter') so the pilots' queries see only rocks.
 -}
 spawnAsteroid :: SystemT World IO ()
 spawnAsteroid = do
@@ -239,7 +239,7 @@ spawnAsteroid = do
       , LookSolid tint (facesSolid faces)
       , Roid r
       )
-  newEntity_ (Shape e (GeoHull (VS.fromList (map vec3 vs))), Density 4)
+  newEntity_ (Shape e (GeoHull (VS.fromList (map vec3 vs))), Density 4, CollisionFilter rockFilter)
 
 spawnShip :: Pilot -> Color -> ([V3 Float], Solid) -> V3 Float -> V3 Float -> SystemT World IO ()
 spawnShip pilotKind tint (pts, solid) pos vel = do
@@ -253,7 +253,7 @@ spawnShip pilotKind tint (pts, solid) pos vel = do
       , pilotKind
       , Gun 1
       )
-  newEntity_ (Shape e (GeoHull (VS.fromList (map vec3 pts))), Density 1, Elasticity 0.35)
+  newEntity_ (Shape e (GeoHull (VS.fromList (map vec3 pts))), Density 1, Elasticity 0.35, CollisionFilter craftFilter)
 
 fireBullet :: V3 Float -> V3 Float -> SystemT World IO ()
 fireBullet pos vel = do
@@ -265,7 +265,7 @@ fireBullet pos vel = do
       , Bullet 2.2
       , LookDot yellow 0.07
       )
-  newEntity_ (Shape b (GeoSphere vec3Zero 0.07), Density 20, Elasticity 0.4)
+  newEntity_ (Shape b (GeoSphere vec3Zero 0.07), Density 20, Elasticity 0.4, CollisionFilter craftFilter)
 
 -- * Autopilots
 
@@ -290,17 +290,63 @@ pilot e desired accel = do
   set e (Torque (vec3 torque), Force (vec3 push))
   pure (fwd, a)
 
--- | Radial repulsion from every asteroid closer than a few clearances.
-avoidRoids :: [(V3 Float, Float)] -> V3 Float -> V3 Float
-avoidRoids roids p =
-  sum
-    [ (30 / (gap * gap + 0.5)) *^ normalize off
-    | (c, r) <- roids
-    , let
-        off = p - c
-        gap = max 0.05 (norm off - r - 6)
-    , gap < 25
-    ]
+{- | Rock shapes carry category bit 2 so queries can single them out.
+Ships and bullets get category 1 explicitly — Box3D's default is all
+bits set, which would match any query mask.
+-}
+rockFilter, craftFilter :: Filter
+rockFilter = Filter 2 maxBound 0
+craftFilter = Filter 1 maxBound 0
+
+-- | Query filter matching only rocks.
+rocksOnly :: Filter
+rocksOnly = Filter 1 2 0
+
+-- | Clear line of sight (no rock between the two points)?
+lineOfSight :: V3 Float -> V3 Float -> SystemT World IO Bool
+lineOfSight a b = do
+  hit <- segmentQuery (vec3 a) (vec3 b) rocksOnly
+  pure (null hit)
+
+{- | Steer around what is actually in the flight path: a ray along the
+velocity finds the rock that matters (if any) and deflects across it,
+harder as it nears; a small 'pointQuery' bubble shoves off rocks
+already alongside. Nothing pushes on a clear path, so pilots cruise
+through the field instead of skirting it.
+-}
+avoidRocks :: V3 Float -> V3 Float -> V3 Float -> SystemT World IO (V3 Float)
+avoidRocks p v fallback = do
+  let
+    speed = norm v
+    dir = if speed > 1 then v ^/ speed else fallback
+    lookahead = 18 + 2.2 * speed
+  hit <- segmentQuery (vec3 p) (vec3 (p + dir ^* lookahead)) rocksOnly
+  let dodge = case hit of
+        Nothing -> V3 0 0 0
+        Just RayHit{rayHitNormal = n', rayHitFraction = f} ->
+          let
+            n = v3 n'
+            lat = n - dot n dir *^ dir
+            latDir = if quadrance lat < 0.002 then perpTo dir else normalize lat
+          in
+            (2.5 * (1 - f)) *^ latDir + (0.8 * (1 - f)) *^ n
+  nears <- pointQuery (vec3 p) 16 rocksOnly
+  bubble <- mapM push nears
+  pure (dodge + sum bubble)
+  where
+    push e = do
+      rock <- get e
+      pure $ case rock of
+        Nothing -> V3 0 0 0
+        Just (Roid r, Position c) ->
+          let
+            off = p - v3 c
+            gap = max 0.1 (norm off - r - 3)
+          in
+            if gap < 6 then
+              (3 / (gap * gap + 0.3)) *^ normalize off
+            else
+              V3 0 0 0
 
 -- | A pull back toward the origin past the arena radius.
 arenaPull :: V3 Float -> V3 Float
@@ -319,43 +365,52 @@ perpTo u
     s = cross u (V3 0 1 0)
 
 {- | Run from the Eagles' midpoint, weave on two incommensurate sine
-waves, dodge rocks, stay in the arena — and pop the tail gun at any
-Eagle sitting in the rear cone.
+waves, dodge what the raycast flags, stay in the arena — and pop the
+tail gun at any Eagle sitting in the rear cone with a clear line.
 -}
-flyCourier :: Float -> [(V3 Float, Float)] -> [(Entity, V3 Float, V3 Float)] -> Entity -> V3 Float -> V3 Float -> SystemT World IO ()
-flyCourier t roids eagles e p v = do
+flyCourier :: Float -> [(Entity, V3 Float, V3 Float)] -> Entity -> V3 Float -> V3 Float -> SystemT World IO ()
+flyCourier t eagles e p v = do
   let
     threat = sum [ep | (_, ep, _) <- eagles] ^/ fromIntegral (max 1 (length eagles))
     away = case eagles of
       [] -> V3 0 0 1
       _ -> normalize (p - threat)
     jink = (0.55 * sin (0.9 * t)) *^ perpTo away + (0.4 * sin (0.6 * t + 1)) *^ V3 0 1 0
-    desired = away + jink + avoidRoids roids p + arenaPull p
-  (fwd, _) <- pilot e desired 11
+  avoid <- avoidRocks p v away
+  (fwd, _) <- pilot e (away + jink + avoid + arenaPull p) 11
   Gun cool <- get e
   let
     rear = negate fwd
-    lined = [() | (_, ep, _) <- eagles, norm (ep - p) < 20, dot (normalize (ep - p)) rear > 0.96]
-  when (cool <= 0 && not (null lined)) $ do
-    set e (Gun 0.7)
-    fireBullet (p + rear ^* 2) (v + bulletSpeed *^ rear)
+    muzzle = p + rear ^* 2
+    lined = [ep | (_, ep, _) <- eagles, norm (ep - p) < 20, dot (normalize (ep - p)) rear > 0.96]
+  case lined of
+    (target : _) | cool <= 0 -> do
+      clear <- lineOfSight muzzle target
+      when clear $ do
+        set e (Gun 0.7)
+        fireBullet muzzle (v + bulletSpeed *^ rear)
+    _ -> pure ()
 
 {- | Lead-pursue the Courier (aim where it will be at slug flight time),
-dodge rocks, stay in the arena — and fire when the nose is on target
-and in range.
+dodge what the raycast flags, stay in the arena — and fire when the
+nose is on target, in range, and no rock blocks the shot.
 -}
-flyEagle :: [(V3 Float, Float)] -> Entity -> V3 Float -> V3 Float -> V3 Float -> V3 Float -> SystemT World IO ()
-flyEagle roids e p v cp cv = do
+flyEagle :: Entity -> V3 Float -> V3 Float -> V3 Float -> V3 Float -> SystemT World IO ()
+flyEagle e p v cp cv = do
   let
     sep = cp - p
     dist = norm sep
     lead = cp + cv ^* (dist / bulletSpeed)
-    desired = normalize (lead - p) + avoidRoids roids p + arenaPull p
-  (fwd, _) <- pilot e desired 13
+    pursue = normalize (lead - p)
+  avoid <- avoidRocks p v pursue
+  (fwd, _) <- pilot e (pursue + avoid + arenaPull p) 13
   Gun cool <- get e
+  let muzzle = p + fwd ^* 1.4
   when (cool <= 0 && dist < 26 && dot fwd (normalize sep) > 0.982) $ do
-    set e (Gun 0.55)
-    fireBullet (p + fwd ^* 1.4) (v + bulletSpeed *^ fwd)
+    clear <- lineOfSight muzzle cp
+    when clear $ do
+      set e (Gun 0.55)
+      fireBullet muzzle (v + bulletSpeed *^ fwd)
 
 -- * Loop
 
@@ -370,14 +425,13 @@ step dT' = do
       destroy e (Proxy @(Body, Bullet, Look))
     else
       set e (Bullet (ttl - dT))
-  roids <- cfold (\acc (Roid r, Position p) -> (v3 p, r) : acc) []
   ships <- cfold (\acc (kind :: Pilot, Position p, Velocity v, e :: Entity) -> (kind, e, v3 p, v3 v) : acc) []
   let
     eagles = [(e, p, v) | (Eagle, e, p, v) <- ships]
     couriers = [(e, p, v) | (Courier, e, p, v) <- ships]
-  forM_ couriers $ \(e, p, v) -> flyCourier t roids eagles e p v
+  forM_ couriers $ \(e, p, v) -> flyCourier t eagles e p v
   forM_ eagles $ \(e, p, v) ->
-    forM_ (take 1 couriers) $ \(_, cp, cv) -> flyEagle roids e p v cp cv
+    forM_ (take 1 couriers) $ \(_, cp, cv) -> flyEagle e p v cp cv
   stepPhysics dT
   forM_ (take 1 couriers) $ \(e, _, _) -> chaseCamera e
 

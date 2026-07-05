@@ -61,6 +61,12 @@ module Apecs.Box3D
   , Joint (..)
   , B3JointId (..)
 
+    -- * Queries
+  , RayHit (..)
+  , segmentQuery
+  , aabbQuery
+  , pointQuery
+
     -- * Vectors
   , Vec3 (..)
   , vec3Zero
@@ -77,21 +83,23 @@ import Control.Monad.IO.Class (MonadIO)
 import Data.IORef
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
+import Data.IntSet qualified as IS
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
 import Foreign.Ptr (nullPtr)
 
 import Box3D.Body qualified as B3Body
+import Box3D.Callbacks (withOverlapResultFcn)
 import Box3D.DistanceJoint qualified as B3DistanceJoint
 import Box3D.Hull qualified as B3Hull
 import Box3D.Id (BodyId, JointId, ShapeId, WorldId)
 import Box3D.Joint qualified as B3Joint
-import Box3D.MathTypes (Quat (..), Transform (..), Vec3 (..), quatIdentity, vec3Zero)
+import Box3D.MathTypes (AABB (..), Quat (..), Transform (..), Vec3 (..), quatIdentity, vec3Zero)
 import Box3D.Shape qualified as B3Shape
 import Box3D.SphericalJoint qualified as B3SphericalJoint
 import Box3D.Types (Filter (..))
 import Box3D.Types qualified as B3T
-import Box3D.UserData (setUserIndex)
+import Box3D.UserData (getUserIndex, setUserIndex)
 import Box3D.WeldJoint qualified as B3WeldJoint
 import Box3D.World qualified as B3World
 
@@ -919,3 +927,113 @@ instance (MonadIO m) => ExplGet m (B3Space B3JointId) where
 
 instance (MonadIO m) => ExplMembers m (B3Space B3JointId) where
   explMembers = jointMembers
+
+-- * Queries
+
+{- | The closest shape a 'segmentQuery' found: the shape entity, the
+body entity it hangs off, the world-space impact point and surface
+normal, and the fraction along the segment (0 at the start, 1 at the
+end).
+-}
+data RayHit = RayHit
+  { rayHitShape :: !Entity
+  , rayHitBody :: !Entity
+  , rayHitPoint :: !WVec
+  , rayHitNormal :: !WVec
+  , rayHitFraction :: !Float
+  }
+  deriving (Eq, Show)
+
+{- | Queries match a 'Filter''s category and mask bits against shape
+filters (see 'CollisionFilter'); 'filterGroupIndex' does not apply.
+@Filter maxBound maxBound 0@ queries everything. Note Box3D's default
+shape category is /all bits set/ (unlike Box2D's category 1), so any
+query mask matches shapes with default filters — give shapes explicit
+'CollisionFilter' categories to partition them for queries.
+-}
+toQueryFilter :: Filter -> IO B3T.QueryFilter
+toQueryFilter f = do
+  qf <- B3T.defaultQueryFilter
+  pure
+    qf
+      { B3T.queryFilterCategoryBits = filterCategoryBits f
+      , B3T.queryFilterMaskBits = filterMaskBits f
+      }
+
+-- | The shape and body entities behind an engine shape, if registered.
+shapeEntities :: B3Space c -> ShapeId -> IO (Maybe (Entity, Entity))
+shapeEntities sp s = do
+  ix <- getUserIndex s
+  shapes <- readIORef (spShapes sp)
+  pure $ case IM.lookup ix shapes of
+    Just (ShapeRecord _ (Shape bodyEty _)) -> Just (Entity ix, bodyEty)
+    Nothing -> Nothing
+
+{- | The closest shape along a world-space segment, if any. Initial
+overlaps are ignored: a segment starting inside a shape does not hit
+it.
+-}
+segmentQuery
+  :: forall w m
+   . (MonadIO m, Has w m Physics)
+  => WVec
+  -> WVec
+  -> Filter
+  -> SystemT w m (Maybe RayHit)
+segmentQuery start end fltr = do
+  sp :: B3Space Physics <- getStore
+  liftIO $ do
+    qf <- toQueryFilter fltr
+    let
+      Vec3 sx sy sz = start
+      Vec3 ex ey ez = end
+    res <- B3World.castRayClosest (spWorld sp) start (Vec3 (ex - sx) (ey - sy) (ez - sz)) qf
+    if B3T.rayResultHit res == 0 then
+      pure Nothing
+    else
+      fmap
+        ( \(shapeEty, bodyEty) ->
+            RayHit
+              { rayHitShape = shapeEty
+              , rayHitBody = bodyEty
+              , rayHitPoint = B3T.rayResultPoint res
+              , rayHitNormal = B3T.rayResultNormal res
+              , rayHitFraction = B3T.rayResultFraction res
+              }
+        )
+        <$> shapeEntities sp (B3T.rayResultShapeId res)
+
+{- | The body entities whose shapes' broad-phase bounding boxes overlap
+the world-space box spanned by two corners (any order). Broad-phase:
+the test is against shape AABBs, not exact geometry.
+-}
+aabbQuery
+  :: forall w m
+   . (MonadIO m, Has w m Physics)
+  => WVec
+  -> WVec
+  -> Filter
+  -> SystemT w m [Entity]
+aabbQuery cornerA cornerB fltr = do
+  sp :: B3Space Physics <- getStore
+  liftIO $ do
+    qf <- toQueryFilter fltr
+    found <- newIORef IS.empty
+    let visit s = do
+          hit <- shapeEntities sp s
+          forM_ hit $ \(_, Entity bodyIx) -> modifyIORef' found (IS.insert bodyIx)
+          pure True
+    _ <- withOverlapResultFcn visit $ \fp ctx ->
+      B3World.overlapAABB (spWorld sp) box qf fp ctx
+    map Entity . IS.toList <$> readIORef found
+  where
+    Vec3 ax ay az = cornerA
+    Vec3 bx by bz = cornerB
+    box = AABB (Vec3 (min ax bx) (min ay by) (min az bz)) (Vec3 (max ax bx) (max ay by) (max az bz))
+
+{- | 'aabbQuery' of the cube reaching @r@ along each axis from a point:
+the body entities with shapes broad-phase within reach.
+-}
+pointQuery :: (MonadIO m, Has w m Physics) => WVec -> Float -> Filter -> SystemT w m [Entity]
+pointQuery (Vec3 x y z) r =
+  aabbQuery (Vec3 (x - r) (y - r) (z - r)) (Vec3 (x + r) (y + r) (z + r))

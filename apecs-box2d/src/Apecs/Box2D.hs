@@ -61,6 +61,12 @@ module Apecs.Box2D
   , Joint (..)
   , B2JointId (..)
 
+    -- * Queries
+  , RayHit (..)
+  , segmentQuery
+  , aabbQuery
+  , pointQuery
+
     -- * Vectors
   , Vec2 (..)
   , vec2Zero
@@ -75,21 +81,23 @@ import Control.Monad.IO.Class (MonadIO)
 import Data.IORef
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
+import Data.IntSet qualified as IS
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
 
 import Box2D.Body qualified as B2Body
+import Box2D.Callbacks (withOverlapResultFcn)
 import Box2D.Collision qualified as B2Collision
 import Box2D.DistanceJoint qualified as B2DistanceJoint
 import Box2D.Id (BodyId, JointId, ShapeId, WorldId)
 import Box2D.Joint qualified as B2Joint
 import Box2D.MathFunctions (makeRot, rotGetAngle)
-import Box2D.MathTypes (Rot (..), Transform (..), Vec2 (..), vec2Zero)
+import Box2D.MathTypes (AABB (..), Rot (..), Transform (..), Vec2 (..), vec2Zero)
 import Box2D.RevoluteJoint qualified as B2RevoluteJoint
 import Box2D.Shape qualified as B2Shape
 import Box2D.Types (Filter (..))
 import Box2D.Types qualified as B2T
-import Box2D.UserData (setUserIndex)
+import Box2D.UserData (getUserIndex, setUserIndex)
 import Box2D.WeldJoint qualified as B2WeldJoint
 import Box2D.World qualified as B2World
 
@@ -962,3 +970,111 @@ instance (MonadIO m) => ExplGet m (B2Space B2JointId) where
 
 instance (MonadIO m) => ExplMembers m (B2Space B2JointId) where
   explMembers = jointMembers
+
+-- * Queries
+
+{- | The closest shape a 'segmentQuery' found: the shape entity, the
+body entity it hangs off, the world-space impact point and surface
+normal, and the fraction along the segment (0 at the start, 1 at the
+end).
+-}
+data RayHit = RayHit
+  { rayHitShape :: !Entity
+  , rayHitBody :: !Entity
+  , rayHitPoint :: !WVec
+  , rayHitNormal :: !WVec
+  , rayHitFraction :: !Float
+  }
+  deriving (Eq, Show)
+
+{- | Queries match a 'Filter''s category and mask bits against shape
+filters (see 'CollisionFilter'); 'filterGroupIndex' does not apply.
+@Filter 1 maxBound 0@ queries everything (the default shape category
+is 1).
+-}
+toQueryFilter :: Filter -> IO B2T.QueryFilter
+toQueryFilter f = do
+  qf <- B2T.defaultQueryFilter
+  pure
+    qf
+      { B2T.queryFilterCategoryBits = filterCategoryBits f
+      , B2T.queryFilterMaskBits = filterMaskBits f
+      }
+
+-- | The shape and body entities behind an engine shape, if registered.
+shapeEntities :: B2Space c -> ShapeId -> IO (Maybe (Entity, Entity))
+shapeEntities sp s = do
+  ix <- getUserIndex s
+  shapes <- readIORef (spShapes sp)
+  pure $ case IM.lookup ix shapes of
+    Just (ShapeRecord _ (Shape bodyEty _)) -> Just (Entity ix, bodyEty)
+    Nothing -> Nothing
+
+{- | The closest shape along a world-space segment, if any. Initial
+overlaps are ignored: a segment starting inside a shape does not hit
+it.
+-}
+segmentQuery
+  :: forall w m
+   . (MonadIO m, Has w m Physics)
+  => WVec
+  -> WVec
+  -> Filter
+  -> SystemT w m (Maybe RayHit)
+segmentQuery start end fltr = do
+  sp :: B2Space Physics <- getStore
+  liftIO $ do
+    qf <- toQueryFilter fltr
+    let
+      Vec2 sx sy = start
+      Vec2 ex ey = end
+    res <- B2World.castRayClosest (spWorld sp) start (Vec2 (ex - sx) (ey - sy)) qf
+    if B2T.rayResultHit res == 0 then
+      pure Nothing
+    else
+      fmap
+        ( \(shapeEty, bodyEty) ->
+            RayHit
+              { rayHitShape = shapeEty
+              , rayHitBody = bodyEty
+              , rayHitPoint = B2T.rayResultPoint res
+              , rayHitNormal = B2T.rayResultNormal res
+              , rayHitFraction = B2T.rayResultFraction res
+              }
+        )
+        <$> shapeEntities sp (B2T.rayResultShapeId res)
+
+{- | The body entities whose shapes' broad-phase bounding boxes overlap
+the world-space box spanned by two corners (any order). Broad-phase:
+the test is against shape AABBs, not exact geometry.
+-}
+aabbQuery
+  :: forall w m
+   . (MonadIO m, Has w m Physics)
+  => WVec
+  -> WVec
+  -> Filter
+  -> SystemT w m [Entity]
+aabbQuery cornerA cornerB fltr = do
+  sp :: B2Space Physics <- getStore
+  liftIO $ do
+    qf <- toQueryFilter fltr
+    found <- newIORef IS.empty
+    let visit s = do
+          hit <- shapeEntities sp s
+          forM_ hit $ \(_, Entity bodyIx) -> modifyIORef' found (IS.insert bodyIx)
+          pure True
+    _ <- withOverlapResultFcn visit $ \fp ctx ->
+      B2World.overlapAABB (spWorld sp) vec2Zero box qf fp ctx
+    map Entity . IS.toList <$> readIORef found
+  where
+    Vec2 ax ay = cornerA
+    Vec2 bx by = cornerB
+    box = AABB (Vec2 (min ax bx) (min ay by)) (Vec2 (max ax bx) (max ay by))
+
+{- | 'aabbQuery' of the square reaching @r@ along each axis from a
+point: the body entities with shapes broad-phase within reach.
+-}
+pointQuery :: (MonadIO m, Has w m Physics) => WVec -> Float -> Filter -> SystemT w m [Entity]
+pointQuery (Vec2 x y) r =
+  aabbQuery (Vec2 (x - r) (y - r)) (Vec2 (x + r) (y + r))
