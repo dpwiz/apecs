@@ -59,6 +59,9 @@ module Apecs.Box3D
   , MotionLocks (..)
   , SleepEnabled (..)
   , SleepThreshold (..)
+  , CenterOfMass (..)
+  , RotationalInertia (..)
+  , BodyName (..)
   , B3BodyId (..)
 
     -- * Shape
@@ -131,6 +134,7 @@ module Apecs.Box3D
   , vec3Zero
   , Quat (..)
   , quatIdentity
+  , Matrix3 (..)
   , BVec
   , WVec
   ) where
@@ -147,6 +151,7 @@ import Data.List (sortOn)
 import Data.Maybe (catMaybes)
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
+import Foreign.C.String (peekCString, withCString)
 import Foreign.Concurrent qualified as Concurrent
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (fromBool, toBool)
@@ -167,7 +172,7 @@ import Box3D.Hull qualified as B3Hull
 import Box3D.Id (BodyId, JointId, ShapeId, WorldId)
 import Box3D.Joint qualified as B3Joint
 import Box3D.MathFunctions (computeQuatBetweenUnitVectors)
-import Box3D.MathTypes (AABB (..), Plane (..), Quat (..), Transform (..), Vec3 (..), quatIdentity, vec3Zero)
+import Box3D.MathTypes (AABB (..), Matrix3 (..), Plane (..), Quat (..), Transform (..), Vec3 (..), quatIdentity, vec3Zero)
 import Box3D.Mesh qualified as B3Mesh
 import Box3D.PlatformMesh qualified as B3PlatformMesh
 import Box3D.PrismaticJoint qualified as B3PrismaticJoint
@@ -1085,6 +1090,75 @@ instance (MonadIO m) => ExplSet m (B3Space SleepThreshold) where
       B3Body.setSleepThreshold b t
 
 instance (MonadIO m) => ExplMembers m (B3Space SleepThreshold) where
+  explMembers = bodyMembers
+
+{- | The center of mass of a 'Body' in local (body) space. Read-only:
+Box3D computes it from the attached shapes' densities. The
+apecs-physics analog is @CenterOfGravity@.
+-}
+newtype CenterOfMass = CenterOfMass BVec
+  deriving (Eq, Show)
+
+instance Component CenterOfMass where
+  type Storage CenterOfMass = B3Space CenterOfMass
+
+instance (MonadIO m, Has w m Physics) => Has w m CenterOfMass where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplGet m (B3Space CenterOfMass) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap CenterOfMass . B3Body.getLocalCenterOfMass
+
+instance (MonadIO m) => ExplMembers m (B3Space CenterOfMass) where
+  explMembers = bodyMembers
+
+{- | The rotational inertia tensor of a 'Body' about its center of mass,
+in local (body) space, usually in kg*m^2. 'Matrix3' stores it as three
+columns @cx@, @cy@, @cz@. Read-only: Box3D computes it from the attached
+shapes' densities. The apecs-physics analog is @Moment@, which is a
+scalar because apecs-physics is 2D.
+-}
+newtype RotationalInertia = RotationalInertia Matrix3
+  deriving (Eq, Show)
+
+instance Component RotationalInertia where
+  type Storage RotationalInertia = B3Space RotationalInertia
+
+instance (MonadIO m, Has w m Physics) => Has w m RotationalInertia where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplGet m (B3Space RotationalInertia) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap RotationalInertia . B3Body.getLocalRotationalInertia
+
+instance (MonadIO m) => ExplMembers m (B3Space RotationalInertia) where
+  explMembers = bodyMembers
+
+{- | An optional name for a 'Body', for debugging\/tooling. The engine
+stores names in a fixed 18-byte buffer (@B3_BODY_NAME_LENGTH@); longer
+names are silently truncated to 18 bytes on write, excluding the
+terminating null.
+-}
+newtype BodyName = BodyName String
+  deriving (Eq, Show)
+
+instance Component BodyName where
+  type Storage BodyName = B3Space BodyName
+
+instance (MonadIO m, Has w m Physics) => Has w m BodyName where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplGet m (B3Space BodyName) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ \b ->
+    BodyName <$> (B3Body.getName b >>= peekCString)
+
+instance (MonadIO m) => ExplSet m (B3Space BodyName) where
+  explSet sp ety (BodyName name) = liftIO $
+    overBody sp ety $ \b ->
+      withCString name (B3Body.setName b)
+
+instance (MonadIO m) => ExplMembers m (B3Space BodyName) where
   explMembers = bodyMembers
 
 -- Shape ---------------------------------------------------------------------

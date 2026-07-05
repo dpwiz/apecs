@@ -60,6 +60,9 @@ module Apecs.Box2D
   , FixedRotation (..)
   , SleepEnabled (..)
   , SleepThreshold (..)
+  , CenterOfMass (..)
+  , RotationalInertia (..)
+  , BodyName (..)
   , B2BodyId (..)
 
     -- * Shape
@@ -130,6 +133,7 @@ import Data.List (sortOn)
 import Data.Maybe (catMaybes)
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
+import Foreign.C.String (peekCString, withCString)
 import Foreign.Marshal.Utils (fromBool, toBool)
 
 import Box2D.Body qualified as B2Body
@@ -1069,6 +1073,73 @@ instance (MonadIO m) => ExplSet m (B2Space SleepThreshold) where
 instance (MonadIO m) => ExplMembers m (B2Space SleepThreshold) where
   explMembers = bodyMembers
 
+{- | The center of mass of a 'Body' in local (body) space. Read-only:
+Box2D computes it from the attached shapes' densities. The
+apecs-physics analog is @CenterOfGravity@.
+-}
+newtype CenterOfMass = CenterOfMass BVec
+  deriving (Eq, Show)
+
+instance Component CenterOfMass where
+  type Storage CenterOfMass = B2Space CenterOfMass
+
+instance (MonadIO m, Has w m Physics) => Has w m CenterOfMass where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space CenterOfMass) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap CenterOfMass . B2Body.getLocalCenter
+
+instance (MonadIO m) => ExplMembers m (B2Space CenterOfMass) where
+  explMembers = bodyMembers
+
+{- | The rotational inertia of a 'Body', usually in kg*m^2. Read-only:
+Box2D computes it from the attached shapes' densities. The
+apecs-physics analog is @Moment@.
+-}
+newtype RotationalInertia = RotationalInertia Float
+  deriving (Eq, Show)
+
+instance Component RotationalInertia where
+  type Storage RotationalInertia = B2Space RotationalInertia
+
+instance (MonadIO m, Has w m Physics) => Has w m RotationalInertia where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space RotationalInertia) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap RotationalInertia . B2Body.getRotationalInertia
+
+instance (MonadIO m) => ExplMembers m (B2Space RotationalInertia) where
+  explMembers = bodyMembers
+
+{- | An optional name for a 'Body', for debugging\/tooling. The engine
+stores names in a fixed 10-byte buffer (@B2_NAME_LENGTH@); longer names
+are silently truncated to 10 bytes on write, excluding the terminating
+null.
+-}
+newtype BodyName = BodyName String
+  deriving (Eq, Show)
+
+instance Component BodyName where
+  type Storage BodyName = B2Space BodyName
+
+instance (MonadIO m, Has w m Physics) => Has w m BodyName where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space BodyName) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ \b ->
+    BodyName <$> (B2Body.getName b >>= peekCString)
+
+instance (MonadIO m) => ExplSet m (B2Space BodyName) where
+  explSet sp ety (BodyName name) = liftIO $
+    overBody sp ety $ \b ->
+      withCString name (B2Body.setName b)
+
+instance (MonadIO m) => ExplMembers m (B2Space BodyName) where
+  explMembers = bodyMembers
+
 -- Shape ---------------------------------------------------------------------
 
 -- | Shape geometry in body-local coordinates.
@@ -1081,10 +1152,22 @@ data Geometry
     GeoSegment BVec BVec
   | -- | An axis-aligned box from half-width and half-height.
     GeoBox Float Float
+  | -- | Half-width, half-height, corner radius: a box with rounded corners.
+    GeoRoundedBox Float Float Float
+  | {- | Half-width, half-height, local center, local rotation angle
+    (radians): a box placed off the body origin.
+    -}
+    GeoOffsetBox Float Float BVec Float
   | {- | The convex hull of 3 to 'B2T.maxPolygonVertices' points. Setting
     an out-of-range or degenerate (collinear) point set raises an error.
     -}
     GeoPolygon (VS.Vector Vec2)
+  | {- | The convex hull of 3 to 'B2T.maxPolygonVertices' points, placed
+    off the body origin at a local center and rotation angle (radians)
+    and rounded by the given corner radius. Setting an out-of-range or
+    degenerate (collinear) point set raises an error.
+    -}
+    GeoOffsetRoundedPolygon (VS.Vector Vec2) BVec Float Float
   deriving (Eq, Show)
 
 {- | Gives an entity a collision shape attached to the 'Body' of the given
@@ -1102,6 +1185,19 @@ instance Component Shape where
 instance (MonadIO m, Has w m Physics) => Has w m Shape where
   getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
 
+{- | Compute a validated convex hull for a polygon-shaped 'Geometry',
+shared by 'GeoPolygon' and 'GeoOffsetRoundedPolygon'.
+-}
+computeValidHull :: VS.Vector Vec2 -> IO B2T.Hull
+computeValidHull pts = do
+  let n = VS.length pts
+  when (n < 3 || n > B2T.maxPolygonVertices) $
+    error ("polygon needs 3 to " <> show B2T.maxPolygonVertices <> " points, got " <> show n)
+  hull <- VS.unsafeWith pts $ \p -> B2Collision.computeHull p n
+  when (VS.length (B2T.hullPoints hull) < 3) $
+    error "polygon points are degenerate (collinear or coincident)"
+  pure hull
+
 -- | Create the engine geometry for a 'Geometry' value on a body.
 createGeometry :: BodyId -> B2T.ShapeDef -> Geometry -> IO ShapeId
 createGeometry b sd geo = case geo of
@@ -1109,14 +1205,17 @@ createGeometry b sd geo = case geo of
   GeoCapsule c1 c2 r -> B2Shape.createCapsule b sd (B2T.Capsule c1 c2 r)
   GeoSegment p1 p2 -> B2Shape.createSegment b sd (B2T.Segment p1 p2)
   GeoBox hw hh -> B2Collision.makeBox hw hh >>= B2Shape.createPolygon b sd
+  GeoRoundedBox hw hh r -> B2Collision.makeRoundedBox hw hh r >>= B2Shape.createPolygon b sd
+  GeoOffsetBox hw hh center angle -> do
+    rot <- makeRot angle
+    B2Collision.makeOffsetBox hw hh center rot >>= B2Shape.createPolygon b sd
   GeoPolygon pts -> do
-    let n = VS.length pts
-    when (n < 3 || n > B2T.maxPolygonVertices) $
-      error ("GeoPolygon needs 3 to " <> show B2T.maxPolygonVertices <> " points, got " <> show n)
-    hull <- VS.unsafeWith pts $ \p -> B2Collision.computeHull p n
-    when (VS.length (B2T.hullPoints hull) < 3) $
-      error "GeoPolygon points are degenerate (collinear or coincident)"
+    hull <- computeValidHull pts
     B2Collision.makePolygon hull 0 >>= B2Shape.createPolygon b sd
+  GeoOffsetRoundedPolygon pts center angle r -> do
+    hull <- computeValidHull pts
+    rot <- makeRot angle
+    B2Collision.makeOffsetRoundedPolygon hull center rot r >>= B2Shape.createPolygon b sd
 
 {- | A shape def with the surface material, density and filter carried
 over from the shape being replaced, if any.

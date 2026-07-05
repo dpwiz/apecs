@@ -125,6 +125,10 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
 - [ ] **Manifold/contact data on `Collisions`.** Begin-touch events carry
   contact data upstream; exposing point/normal would save a follow-up query.
   Check what `ContactBeginTouchEvent` actually carries before promising. (M)
+  *Checked 2026-07-05: the event carries only shape ids + a `ContactId`,
+  and `Contact.getData` writes into a `Ptr ContactData` that is an opaque
+  tag in box-nd (no Storable, no allocator) — blocked on upstream exposing
+  `ContactData`/`Manifold` as peekable structs.*
 - [x] **Body-move events global (`Moved`).** Efficient render-sync (only
   bodies that actually moved, with sleep flag) instead of iterating every
   `Position`. Upstream: `Events.bodyMoveEvents`. (S)
@@ -143,12 +147,12 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
 - [ ] **[2D] Chain shapes (`GeoChain`).** Terrain outlines without ghost
   collisions. Separate `ChainId` lifecycle, so it doesn't fit `ShapeRecord`
   directly. (M)
-- [ ] **[2D] Rounded/offset geometry constructors.** `makeRoundedBox`,
+- [x] **[2D] Rounded/offset geometry constructors.** `makeRoundedBox`,
   `makeOffsetBox`, `makeOffsetRoundedPolygon` — cheap `Geometry` additions. (S)
 - [ ] **Pre-solve callback (one-way platforms).** apecs-physics exposes
   pre-solve; here it needs FunPtr lifetime management tied to the space.
   Only worth it with a concrete demo driving it. (M)
-- [ ] **Small parity reads:** `CenterOfMass` (read), `RotationalInertia`
+- [x] **Small parity reads:** `CenterOfMass` (read), `RotationalInertia`
   (read, apecs-physics `Moment`), `BodyName`, per-body `ShapeList`/`JointList`
   (derivable from the registries, no FFI needed). (S each)
 
