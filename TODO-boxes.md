@@ -59,7 +59,7 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
 - [x] **Kinematic target transform: `TargetTransform`/`TargetPosition`
   write-only component.** Moving platforms via `setTransform` teleport and
   don't impart velocity; `setTargetTransform` is the correct engine path. (S)
-- [ ] **`BodyEnabled` component.** Cheap despawn/pooling without destroying
+- [x] **`BodyEnabled` component.** Cheap despawn/pooling without destroying
   bodies. Upstream: `Body.enable/disable/isEnabled`. (S)
 - [ ] **`explode` system function.** One world call (`World.explode`,
   `ExplosionDef` exists with defaults); disproportionate fun-per-line. (S)

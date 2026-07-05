@@ -49,6 +49,7 @@ module Apecs.Box2D
   , AngularDamping (..)
   , GravityScale (..)
   , BulletBody (..)
+  , BodyEnabled (..)
   , Awake (..)
   , MotionLocks (..)
   , FixedRotation (..)
@@ -737,6 +738,32 @@ instance (MonadIO m) => ExplSet m (B2Space BulletBody) where
       B2Body.setBullet bd b
 
 instance (MonadIO m) => ExplMembers m (B2Space BulletBody) where
+  explMembers = bodyMembers
+
+{- | Whether a 'Body' participates in the simulation at all (on by
+default). Disabling removes the body and its shapes from the world
+without destroying them — cheap despawn/pooling; enabling puts them
+back.
+-}
+newtype BodyEnabled = BodyEnabled Bool
+  deriving (Eq, Show)
+
+instance Component BodyEnabled where
+  type Storage BodyEnabled = B2Space BodyEnabled
+
+instance (MonadIO m, Has w m Physics) => Has w m BodyEnabled where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space BodyEnabled) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap BodyEnabled . B2Body.isEnabled
+
+instance (MonadIO m) => ExplSet m (B2Space BodyEnabled) where
+  explSet sp ety (BodyEnabled e) = liftIO $
+    overBody sp ety $ \b ->
+      if e then B2Body.enable b else B2Body.disable b
+
+instance (MonadIO m) => ExplMembers m (B2Space BodyEnabled) where
   explMembers = bodyMembers
 
 {- | Whether a 'Body' is currently awake and simulating. Set it to wake

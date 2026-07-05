@@ -49,6 +49,7 @@ module Apecs.Box3D
   , AngularDamping (..)
   , GravityScale (..)
   , BulletBody (..)
+  , BodyEnabled (..)
   , Awake (..)
   , MotionLocks (..)
   , SleepEnabled (..)
@@ -749,6 +750,32 @@ instance (MonadIO m) => ExplSet m (B3Space BulletBody) where
       B3Body.setBullet bd b
 
 instance (MonadIO m) => ExplMembers m (B3Space BulletBody) where
+  explMembers = bodyMembers
+
+{- | Whether a 'Body' participates in the simulation at all (on by
+default). Disabling removes the body and its shapes from the world
+without destroying them — cheap despawn/pooling; enabling puts them
+back.
+-}
+newtype BodyEnabled = BodyEnabled Bool
+  deriving (Eq, Show)
+
+instance Component BodyEnabled where
+  type Storage BodyEnabled = B3Space BodyEnabled
+
+instance (MonadIO m, Has w m Physics) => Has w m BodyEnabled where
+  getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
+
+instance (MonadIO m) => ExplGet m (B3Space BodyEnabled) where
+  explExists = bodyExists
+  explGet sp ety = liftIO $ withBody sp ety $ fmap BodyEnabled . B3Body.isEnabled
+
+instance (MonadIO m) => ExplSet m (B3Space BodyEnabled) where
+  explSet sp ety (BodyEnabled e) = liftIO $
+    overBody sp ety $ \b ->
+      if e then B3Body.enable b else B3Body.disable b
+
+instance (MonadIO m) => ExplMembers m (B3Space BodyEnabled) where
   explMembers = bodyMembers
 
 {- | Whether a 'Body' is currently awake and simulating. Set it to wake
