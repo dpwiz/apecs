@@ -72,6 +72,7 @@ module Apecs.Box2D
     -- * Collisions
   , Collision (..)
   , Collisions (..)
+  , CollisionsEnd (..)
   , Impact (..)
   , Impacts (..)
   , SensorEvent (..)
@@ -1196,6 +1197,16 @@ data Collision = Collision
   }
   deriving (Eq, Show)
 
+-- | The shape/body entities behind a contact's two shape ids, if both are still alive and registered.
+toCollision :: B2Space c -> ShapeId -> ShapeId -> IO (Maybe Collision)
+toCollision sp sA sB = do
+  ma <- shapeEntities sp sA
+  mb <- shapeEntities sp sB
+  pure $ do
+    (sa, ba) <- ma
+    (sb, bb) <- mb
+    Just (Collision ba sa bb sb)
+
 {- | The begin-touch contacts of the last 'stepPhysics', a read-only
 global: @Collisions touches <- get global@ after stepping. Shapes
 created by this layer opt into contact events; events whose shapes
@@ -1214,13 +1225,32 @@ instance (MonadIO m) => ExplGet m (B2Space Collisions) where
   explExists _ _ = pure True
   explGet sp _ = liftIO $ do
     evs <- B2Events.contactBeginTouchEvents (spWorld sp)
-    fmap (Collisions . catMaybes) . forM (VS.toList evs) $ \ev -> do
-      ma <- shapeEntities sp (B2T.contactBeginTouchEventShapeIdA ev)
-      mb <- shapeEntities sp (B2T.contactBeginTouchEventShapeIdB ev)
-      pure $ do
-        (sa, ba) <- ma
-        (sb, bb) <- mb
-        Just (Collision ba sa bb sb)
+    fmap (Collisions . catMaybes) . forM (VS.toList evs) $ \ev ->
+      toCollision sp (B2T.contactBeginTouchEventShapeIdA ev) (B2T.contactBeginTouchEventShapeIdB ev)
+
+{- | The end-touch contacts of the last 'stepPhysics', a read-only
+global: @CollisionsEnd separations <- get global@ after stepping — the
+counterpart of 'Collisions' for contacts that stopped touching. Events
+whose shapes were destroyed since the step are dropped; this bites
+harder here than for begin-touch, since destroying a shape mid-contact
+drops its end event — clean up any per-contact bookkeeping when
+destroying shapes.
+-}
+newtype CollisionsEnd = CollisionsEnd [Collision]
+  deriving (Show)
+
+instance Component CollisionsEnd where
+  type Storage CollisionsEnd = B2Space CollisionsEnd
+
+instance (MonadIO m, Has w m Physics) => Has w m CollisionsEnd where
+  getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+instance (MonadIO m) => ExplGet m (B2Space CollisionsEnd) where
+  explExists _ _ = pure True
+  explGet sp _ = liftIO $ do
+    evs <- B2Events.contactEndTouchEvents (spWorld sp)
+    fmap (CollisionsEnd . catMaybes) . forM (VS.toList evs) $ \ev ->
+      toCollision sp (B2T.contactEndTouchEventShapeIdA ev) (B2T.contactEndTouchEventShapeIdB ev)
 
 {- | An above-threshold impact from the last 'stepPhysics': the entities
 involved, the world-space contact point, the contact normal (pointing
