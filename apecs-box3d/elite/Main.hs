@@ -502,12 +502,10 @@ chaseCamera e = do
     wantTgt = cp + dir ^* 3
   ChaseCam eye0 tgt0 <- get global
   let
-    eye = mix 0.06 eye0 wantEye
-    tgt = mix 0.18 tgt0 wantTgt
+    eye = Linear.lerp 0.06 eye0 wantEye
+    tgt = Linear.lerp 0.18 tgt0 wantTgt
   set global (ChaseCam eye tgt)
   set global (Camera3 eye tgt (V3 0 1 0) 440)
-  where
-    mix k a b = a + (b - a) ^* k
 
 -- | Contacts beyond this distance fall off the scanner.
 radarRange :: Float

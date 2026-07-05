@@ -14,6 +14,7 @@ module Main (main) where
 import Apecs
 import Apecs.Gloss
 import Control.Monad (forM_)
+import Graphics.Gloss.Geometry.Angle (radToDeg)
 import Linear (V2 (..))
 
 import Apecs.Box2D
@@ -137,7 +138,7 @@ draw :: SystemT World IO Picture
 draw = do
   joints <- drawJoints
   bodies <- foldDraw $ \(Position (Vec2 x y), Angle theta, Look pic) ->
-    Translate x y (Rotate (-theta * 180 / pi) pic)
+    Translate x y (Rotate (negate (radToDeg theta)) pic)
   pure (joints <> bodies)
 
 {- | Keep spawn points clear of the grid lines: a box born overlapping a

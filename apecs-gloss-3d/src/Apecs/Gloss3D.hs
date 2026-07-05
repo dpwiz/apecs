@@ -56,7 +56,7 @@ module Apecs.Gloss3D
   ) where
 
 import Apecs
-import Data.List (sortOn)
+import Data.List (nub, sortOn)
 import Graphics.Gloss hiding (rotate, scale)
 import Linear
 
@@ -171,12 +171,15 @@ projectPoint sc (V3 x y z) = (scFocal sc * x / z, scFocal sc * y / z)
 nearPlane :: Float
 nearPlane = 0.2
 
--- | Distance-haze brightness for a view depth.
+{- | Distance-haze brightness for a view depth. The denominator is
+clamped so a degenerate span (fogNear == fogFar) gives a hard step at
+that depth instead of NaN colors.
+-}
 fogK :: Scene3 -> Float -> Float
 fogK sc z = max (e3FogFloor env) (min 1 (1 - k * (1 - e3FogFloor env)))
   where
     env = scEnv sc
-    k = (z - e3FogNear env) / (e3FogFar env - e3FogNear env)
+    k = (z - e3FogNear env) / max 1e-6 (e3FogFar env - e3FogNear env)
 
 -- | Scale a color's brightness.
 shade :: Float -> Color -> Color
@@ -217,19 +220,22 @@ Outward unit normals are computed from each face's winding (Newell's
 method) and flipped to point away from the solid's centroid, so the
 winding direction need not be consistent across faces. Faces should
 be planar and the solid convex; degenerate faces (fewer than three
-corners) are dropped.
+corners, or collinear/coincident ones with no area) are dropped.
 -}
 facesSolid :: [[V3 Float]] -> Solid
-facesSolid faces = Solid [orient cs | cs <- faces, length cs >= 3]
+facesSolid faces = Solid [face | cs <- faces, length cs >= 3, face <- orient cs]
   where
     corners = concat faces
     centroid = sum corners ^/ fromIntegral (length corners)
-    orient cs =
-      let
-        n = normalize (newell cs)
+    orient cs
+      -- a zero Newell normal has no direction to normalize; keeping it
+      -- would NaN-poison the lighting and culling dot products
+      | quadrance nw > 1e-12 = [(if dot n (c - centroid) < 0 then negate n else n, cs)]
+      | otherwise = []
+      where
+        nw = newell cs
+        n = normalize nw
         c = sum cs ^/ fromIntegral (length cs)
-      in
-        (if dot n (c - centroid) < 0 then negate n else n, cs)
     newell cs = sum [cross a b | (a, b) <- zip cs (drop 1 cs <> take 1 cs)]
 
 -- | An axis-aligned box from half-extents.
@@ -257,25 +263,13 @@ cubeSolid h = boxSolid (V3 h h h)
 faces (or bounding a lone face) appear once.
 -}
 solidEdges :: Solid -> [(V3 Float, V3 Float)]
-solidEdges (Solid faces) = dedup [ordered a b | (_, cs) <- faces, (a, b) <- zip cs (drop 1 cs <> take 1 cs)]
+solidEdges (Solid faces) = nub [ordered a b | (_, cs) <- faces, (a, b) <- zip cs (drop 1 cs <> take 1 cs)]
   where
-    ordered a b = if key a <= key b then (a, b) else (b, a)
-    key (V3 x y z) = (x, y, z)
-    dedup [] = []
-    dedup (e : es) = e : dedup (filter (/= e) es)
+    ordered a b = if a <= b then (a, b) else (b, a)
 
 -- | The 12 edges of an axis-aligned box, for 'wire3'.
 boxEdges :: V3 Float -> [(V3 Float, V3 Float)]
-boxEdges half =
-  [ (a * half, b * half)
-  | (i, a) <- zip [0 :: Int ..] corners
-  , (j, b) <- zip [0 ..] corners
-  , i < j
-  , sameAxes a b == 2
-  ]
-  where
-    corners = [V3 sx sy sz | sx <- [-1, 1], sy <- [-1, 1], sz <- [-1, 1]]
-    sameAxes (V3 a b c) (V3 x y z) = length (filter id [a == x, b == y, c == z])
+boxEdges = solidEdges . boxSolid
 
 {- | A sphere impostor: a projected disc with an offset highlight,
 lit by how squarely the surface patch facing the camera meets the
@@ -283,7 +277,9 @@ light.
 -}
 sphere3 :: Scene3 -> Color -> Float -> V3 Float -> [Piece]
 sphere3 sc col r pos =
-  [ (z, Translate px py (Pictures [body, glint]))
+  -- depth-keyed by the nearest point, not the center, so a big near
+  -- sphere sorts in front of the small far pieces it occludes
+  [ (z - r, Translate px py (Pictures [body, glint]))
   | let v@(V3 _ _ z) = viewPoint sc pos
   , z > nearPlane
   , let
@@ -345,18 +341,15 @@ wire3 sc col segs pos q =
   , let
       w1 = pos + rotate q c1
       w2 = pos + rotate q c2
-  , i <- [0 .. subdivs - 1]
-  , let
-      a = viewPoint sc (along (fromIntegral i / n) w1 w2)
-      b = viewPoint sc (along (fromIntegral (i + 1) / n) w1 w2)
-      zm = (vz a + vz b) / 2
+      vs = [viewPoint sc (lerp (fromIntegral i / n) w1 w2) | i <- [0 .. subdivs]]
+  , (a, b) <- zip vs (drop 1 vs)
+  , let zm = (vz a + vz b) / 2
   , vz a > nearPlane && vz b > nearPlane
   ]
   where
     subdivs = 6 :: Int
     n = fromIntegral subdivs
     vz (V3 _ _ z) = z
-    along t u v = u + (v - u) ^* t
 
 {- | A soft shadow blob: a flattened dark ellipse at a ground point,
 drawn just behind anything standing on it. The cheapest strong depth

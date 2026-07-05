@@ -179,7 +179,9 @@ stepPhysics dT = do
 
 {- | Destroy the engine world along with all its bodies and shapes, and
 clear the registries. The store is unusable afterwards; call this on
-teardown.
+teardown. Box3D keeps worlds in a fixed-size global registry, so
+sessions that repeatedly create worlds (test suites, GHCi reloads) must
+destroy them too or world creation eventually fails.
 -}
 destroyPhysics :: forall w m. (MonadIO m, Has w m Physics) => SystemT w m ()
 destroyPhysics = do
@@ -413,9 +415,21 @@ instance (MonadIO m) => ExplSet m (B3Space Velocity) where
 instance (MonadIO m) => ExplMembers m (B3Space Velocity) where
   explMembers = bodyMembers
 
--- | A 'Body'\'s orientation quaternion.
+{- | A 'Body'\'s orientation quaternion. Setting it normalizes the
+quaternion on the way in (the engine requires unit rotations); setting
+a zero quaternion is a no-op.
+-}
 newtype Rotation = Rotation Quat
   deriving (Eq, Show)
+
+-- | 'Nothing' for a zero (or NaN) quaternion, which has no direction.
+normalizeQuat :: Quat -> Maybe Quat
+normalizeQuat (Quat (Vec3 x y z) w)
+  | m2 > 0 = Just (Quat (Vec3 (x / m) (y / m) (z / m)) (w / m))
+  | otherwise = Nothing
+  where
+    m2 = x * x + y * y + z * z + w * w
+    m = sqrt m2
 
 instance Component Rotation where
   type Storage Rotation = B3Space Rotation
@@ -429,9 +443,12 @@ instance (MonadIO m) => ExplGet m (B3Space Rotation) where
 
 instance (MonadIO m) => ExplSet m (B3Space Rotation) where
   explSet sp ety (Rotation q) = liftIO $
-    overBody sp ety $ \b -> do
-      pos <- B3Body.getPosition b
-      B3Body.setTransform b pos q
+    overBody sp ety $ \b ->
+      -- the engine asserts unit rotations; normalize so hand-built or
+      -- interpolated quaternions are safe to set
+      forM_ (normalizeQuat q) $ \q' -> do
+        pos <- B3Body.getPosition b
+        B3Body.setTransform b pos q'
 
 instance (MonadIO m) => ExplMembers m (B3Space Rotation) where
   explMembers = bodyMembers
@@ -645,7 +662,10 @@ data Geometry
     between them.
     -}
     GeoCapsule BVec BVec Float
-  | -- | A box from a local center and half-extents along each axis.
+  | {- | A box from a local center and half-extents along each axis.
+    A zero half-extent makes the corners coplanar and raises an error;
+    give flat geometry a small thickness.
+    -}
     GeoBox BVec Vec3
   | {- | The convex hull of at least 4 points. Setting a degenerate
     (coplanar) point set raises an error.
@@ -669,16 +689,17 @@ instance (MonadIO m, Has w m Physics) => Has w m Shape where
   getStore = cast <$> (getStore :: SystemT w m (B3Space Physics))
 
 {- | Build a hull shape from a point cloud; the engine clones the hull
-data, so the intermediate hull is destroyed right after.
+data, so the intermediate hull is destroyed right after. The label
+names the originating 'Geometry' constructor in errors.
 -}
-createHullShape :: BodyId -> B3T.ShapeDef -> VS.Vector Vec3 -> IO ShapeId
-createHullShape b sd pts = do
+createHullShape :: String -> BodyId -> B3T.ShapeDef -> VS.Vector Vec3 -> IO ShapeId
+createHullShape what b sd pts = do
   let n = VS.length pts
   when (n < 4) $
-    error ("GeoHull needs at least 4 points, got " <> show n)
+    error (what <> " needs at least 4 points, got " <> show n)
   hull <- VS.unsafeWith pts $ \p -> B3Hull.create p n n
   when (hull == nullPtr) $
-    error "GeoHull points are degenerate (coplanar or coincident)"
+    error (what <> " points are degenerate (coplanar or coincident)")
   s <- B3Shape.createHull b sd hull
   B3Hull.destroy hull
   pure s
@@ -714,8 +735,8 @@ instance (MonadIO m) => ExplSet m (B3Space Shape) where
       s <- case geo of
         GeoSphere c r -> B3Shape.createSphere b sd (B3T.Sphere c r)
         GeoCapsule c1 c2 r -> B3Shape.createCapsule b sd (B3T.Capsule c1 c2 r)
-        GeoBox c half -> createHullShape b sd (boxCorners c half)
-        GeoHull pts -> createHullShape b sd pts
+        GeoBox c half -> createHullShape "GeoBox" b sd (boxCorners c half)
+        GeoHull pts -> createHullShape "GeoHull" b sd pts
       setUserIndex s ety
       forM_ old $ \(ShapeRecord s' _) -> B3Shape.destroy s' True
       modifyIORef' (spShapes sp) (IM.insert ety (ShapeRecord s shape))
@@ -861,7 +882,8 @@ data JointSpec
   deriving (Eq, Show)
 
 {- | Gives an entity a joint connecting the 'Body's of the two given
-entities. Reads return the exact value written.
+entities, which must be distinct (the engine rejects self-joints;
+setting one is a silent no-op). Reads return the exact value written.
 -}
 data Joint = Joint Entity Entity JointSpec
   deriving (Eq, Show)
@@ -879,13 +901,14 @@ frameAt b p = do
   Quat (Vec3 x y z) w <- B3Body.getRotation b
   pure (Transform local (Quat (Vec3 (-x) (-y) (-z)) w))
 
-{- | Fill a joint def's base with the two bodies and their frames at a
-shared world anchor.
+{- | Fill a joint def's base with the two bodies and their frames at
+their respective world anchors (shared-point joints pass the same
+anchor twice).
 -}
-baseAt :: B3T.JointDef -> BodyId -> BodyId -> Vec3 -> IO B3T.JointDef
-baseAt jd a b p = do
-  fa <- frameAt a p
-  fb <- frameAt b p
+baseAt :: B3T.JointDef -> BodyId -> BodyId -> Vec3 -> Vec3 -> IO B3T.JointDef
+baseAt jd a b pA pB = do
+  fa <- frameAt a pA
+  fb <- frameAt b pB
   pure
     jd
       { B3T.jointDefBodyIdA = a
@@ -898,32 +921,24 @@ createJoint :: WorldId -> BodyId -> BodyId -> JointSpec -> IO JointId
 createJoint w a b spec = case spec of
   PivotJoint p -> do
     jd <- B3T.defaultSphericalJointDef
-    base <- baseAt (B3T.sphericalJointDefBase jd) a b p
+    base <- baseAt (B3T.sphericalJointDefBase jd) a b p p
     B3SphericalJoint.create w jd{B3T.sphericalJointDefBase = base}
   DistanceJoint pA pB -> do
     jd <- B3T.defaultDistanceJointDef
-    fa <- frameAt a pA
-    fb <- frameAt b pB
+    base <- baseAt (B3T.distanceJointDefBase jd) a b pA pB
     let
       Vec3 x1 y1 z1 = pA
       Vec3 x2 y2 z2 = pB
       len = sqrt ((x2 - x1) ^ two + (y2 - y1) ^ two + (z2 - z1) ^ two)
       two = 2 :: Int
-      base =
-        (B3T.distanceJointDefBase jd)
-          { B3T.jointDefBodyIdA = a
-          , B3T.jointDefBodyIdB = b
-          , B3T.jointDefLocalFrameA = fa
-          , B3T.jointDefLocalFrameB = fb
-          }
     B3DistanceJoint.create w jd{B3T.distanceJointDefBase = base, B3T.distanceJointDefLength = len}
   WeldJoint p -> do
     jd <- B3T.defaultWeldJointDef
-    base <- baseAt (B3T.weldJointDefBase jd) a b p
+    base <- baseAt (B3T.weldJointDefBase jd) a b p p
     B3WeldJoint.create w jd{B3T.weldJointDefBase = base}
 
 instance (MonadIO m) => ExplSet m (B3Space Joint) where
-  explSet sp ety joint@(Joint (Entity aEty) (Entity bEty) spec) = liftIO $ do
+  explSet sp ety joint@(Joint (Entity aEty) (Entity bEty) spec) = liftIO $ when (aEty /= bEty) $ do
     bodies <- readIORef (spBodies sp)
     forM_ ((,) <$> IM.lookup aEty bodies <*> IM.lookup bEty bodies) $ \(a, b) -> do
       old <- IM.lookup ety <$> readIORef (spJoints sp)
@@ -1010,8 +1025,11 @@ shapeEntities sp s = do
     ix <- getUserIndex s
     shapes <- readIORef (spShapes sp)
     pure $ case IM.lookup ix shapes of
-      Just (ShapeRecord _ (Shape bodyEty _)) -> Just (Entity ix, bodyEty)
-      Nothing -> Nothing
+      -- shapes created through the raw engine API have no user index and
+      -- read back as 0, a legitimate entity; requiring the registered
+      -- engine shape to be this very shape drops them instead
+      Just (ShapeRecord s' (Shape bodyEty _)) | s' == s -> Just (Entity ix, bodyEty)
+      _ -> Nothing
 
 {- | The closest shape along a world-space segment, if any. Initial
 overlaps are ignored: a segment starting inside a shape does not hit

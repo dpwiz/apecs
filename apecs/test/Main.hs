@@ -270,8 +270,8 @@ prop_count_combinations t12s t3s = assertSys initWorldEnumerable $ do
     has_t12s = S.fromList (map (unEntity . fst) t12s)
     has_t3s = S.fromList (map (unEntity . fst) t3s)
     tags ety =
-        (if ety `S.member` has_t12s then [TT1, TT2] else [])
-          ++ (if ety `S.member` has_t3s then [TT3] else [])
+      (if ety `S.member` has_t12s then [TT1, TT2] else [])
+        ++ (if ety `S.member` has_t3s then [TT3] else [])
   let expected =
         M.fromListWith
           (+)

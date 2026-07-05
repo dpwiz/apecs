@@ -863,7 +863,8 @@ data JointSpec
   deriving (Eq, Show)
 
 {- | Gives an entity a joint connecting the 'Body's of the two given
-entities. Reads return the exact value written.
+entities, which must be distinct (the engine rejects self-joints;
+setting one is a silent no-op). Reads return the exact value written.
 -}
 data Joint = Joint Entity Entity JointSpec
   deriving (Eq, Show)
@@ -881,13 +882,14 @@ frameAt b p = do
   Rot c s <- B2Body.getRotation b
   pure (Transform local (Rot c (-s)))
 
-{- | Fill a joint def's base with the two bodies and their frames at a
-shared world anchor.
+{- | Fill a joint def's base with the two bodies and their frames at
+their respective world anchors (shared-point joints pass the same
+anchor twice).
 -}
-baseAt :: B2T.JointDef -> BodyId -> BodyId -> Vec2 -> IO B2T.JointDef
-baseAt jd a b p = do
-  fa <- frameAt a p
-  fb <- frameAt b p
+baseAt :: B2T.JointDef -> BodyId -> BodyId -> Vec2 -> Vec2 -> IO B2T.JointDef
+baseAt jd a b pA pB = do
+  fa <- frameAt a pA
+  fb <- frameAt b pB
   pure
     jd
       { B2T.jointDefBodyIdA = a
@@ -941,32 +943,24 @@ createJoint w a b spec = case spec of
         }
   WeldJoint p -> do
     jd <- B2T.defaultWeldJointDef
-    base <- baseAt (B2T.weldJointDefBase jd) a b p
+    base <- baseAt (B2T.weldJointDefBase jd) a b p p
     B2WeldJoint.create w jd{B2T.weldJointDefBase = base}
   where
     revoluteAt p f = do
       jd <- B2T.defaultRevoluteJointDef
-      base <- baseAt (B2T.revoluteJointDefBase jd) a b p
+      base <- baseAt (B2T.revoluteJointDefBase jd) a b p p
       B2RevoluteJoint.create w (f jd){B2T.revoluteJointDefBase = base}
     distanceAt pA pB f = do
       jd <- B2T.defaultDistanceJointDef
-      fa <- frameAt a pA
-      fb <- frameAt b pB
+      base <- baseAt (B2T.distanceJointDefBase jd) a b pA pB
       let
         Vec2 x1 y1 = pA
         Vec2 x2 y2 = pB
         len = sqrt ((x2 - x1) ^ (2 :: Int) + (y2 - y1) ^ (2 :: Int))
-        base =
-          (B2T.distanceJointDefBase jd)
-            { B2T.jointDefBodyIdA = a
-            , B2T.jointDefBodyIdB = b
-            , B2T.jointDefLocalFrameA = fa
-            , B2T.jointDefLocalFrameB = fb
-            }
       B2DistanceJoint.create w (f jd){B2T.distanceJointDefBase = base, B2T.distanceJointDefLength = len}
 
 instance (MonadIO m) => ExplSet m (B2Space Joint) where
-  explSet sp ety joint@(Joint (Entity aEty) (Entity bEty) spec) = liftIO $ do
+  explSet sp ety joint@(Joint (Entity aEty) (Entity bEty) spec) = liftIO $ when (aEty /= bEty) $ do
     bodies <- readIORef (spBodies sp)
     forM_ ((,) <$> IM.lookup aEty bodies <*> IM.lookup bEty bodies) $ \(a, b) -> do
       old <- IM.lookup ety <$> readIORef (spJoints sp)
@@ -1051,8 +1045,11 @@ shapeEntities sp s = do
     ix <- getUserIndex s
     shapes <- readIORef (spShapes sp)
     pure $ case IM.lookup ix shapes of
-      Just (ShapeRecord _ (Shape bodyEty _)) -> Just (Entity ix, bodyEty)
-      Nothing -> Nothing
+      -- shapes created through the raw engine API have no user index and
+      -- read back as 0, a legitimate entity; requiring the registered
+      -- engine shape to be this very shape drops them instead
+      Just (ShapeRecord s' (Shape bodyEty _)) | s' == s -> Just (Entity ix, bodyEty)
+      _ -> Nothing
 
 {- | The closest shape along a world-space segment, if any. Initial
 overlaps are ignored: a segment starting inside a shape does not hit

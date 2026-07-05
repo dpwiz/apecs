@@ -10,6 +10,7 @@ module Main (main) where
 import Apecs
 import Apecs.Gloss
 import Control.Monad (forM_, replicateM_)
+import Graphics.Gloss.Geometry.Angle (radToDeg)
 import Linear (V2 (..))
 import System.Random (randomRIO)
 
@@ -76,7 +77,7 @@ spawnBall position = do
 -- | Read each body's transform back from Box2D and place its picture.
 draw :: SystemT World IO Picture
 draw = foldDraw $ \(Position (Vec2 x y), Angle theta, Look pic) ->
-  Translate x y (Rotate (-theta * 180 / pi) pic)
+  Translate x y (Rotate (negate (radToDeg theta)) pic)
 
 handle :: Event -> SystemT World IO ()
 handle (EventKey (MouseButton LeftButton) Down _ screenPos) = do
