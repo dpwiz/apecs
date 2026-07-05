@@ -173,12 +173,14 @@ import Foreign.Concurrent qualified as Concurrent
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
 import Foreign.Marshal.Utils (fromBool, toBool)
 import Foreign.Ptr (Ptr, castPtr, nullFunPtr, nullPtr)
+import Foreign.Storable (peek)
 
 import Box3D.Body qualified as B3Body
 import Box3D.BoxMesh qualified as B3BoxMesh
 import Box3D.Callbacks (withCastResultFcn, withOverlapResultFcn, withPlaneResultFcn)
 import Box3D.Collision qualified as B3Collision
 import Box3D.Cone qualified as B3Cone
+import Box3D.Contact qualified as B3Contact
 import Box3D.Cylinder qualified as B3Cylinder
 import Box3D.DistanceJoint qualified as B3DistanceJoint
 import Box3D.Events qualified as B3Events
@@ -2760,18 +2762,29 @@ validateRecording (Recording p) workerCount = liftIO $ do
 
 -- * Collisions
 
-{- | A contact that began touching during the last 'stepPhysics': the
-shapes involved and the bodies they hang off.
+{- | A contact from the last 'stepPhysics': the shapes involved, the
+bodies they hang off and — for begin-touch events — the contact
+manifold. Box3D uses speculative contacts, so a begin-touch manifold
+can contain slightly separated points (positive separation) and can
+even momentarily be empty. Mesh and height-field contacts can carry
+several manifolds; only the first is reported here — reach for
+@Box3D.Contact.getData@ via the raw engine ids for the rest.
 -}
 data Collision = Collision
   { collisionBodyA :: !Entity
   , collisionShapeA :: !Entity
   , collisionBodyB :: !Entity
   , collisionShapeB :: !Entity
+  , collisionNormal :: !WVec
+  -- ^ Contact normal, pointing from A to B (zero for 'CollisionsEnd' events).
+  , collisionPoints :: ![WVec]
+  -- ^ World contact points, up to 4 per 3D manifold (empty for 'CollisionsEnd').
   }
   deriving (Eq, Show)
 
--- | The shape/body entities behind a contact's two shape ids, if both are still alive and registered.
+{- | The shape/body entities behind a contact's two shape ids, if both
+are still alive and registered; the manifold fields are left zero/empty.
+-}
 toCollision :: B3Space c -> ShapeId -> ShapeId -> IO (Maybe Collision)
 toCollision sp sA sB = do
   ma <- shapeEntities sp sA
@@ -2779,7 +2792,36 @@ toCollision sp sA sB = do
   pure $ do
     (sa, ba) <- ma
     (sb, bb) <- mb
-    Just (Collision ba sa bb sb)
+    Just (Collision ba sa bb sb vec3Zero [])
+
+{- | 'toCollision' for a begin-touch event, with the first contact
+manifold filled in: the normal plus the world position of each manifold
+point (body A's world center of mass plus the point's A-side anchor).
+If the contact is no longer valid (a shape was destroyed after the
+step) or carries no manifolds, the manifold fields stay zero/empty.
+-}
+toBeginCollision :: B3Space c -> B3T.ContactBeginTouchEvent -> IO (Maybe Collision)
+toBeginCollision sp ev = do
+  let contact = B3T.contactBeginTouchEventContactId ev
+  valid <- B3Contact.isValid contact
+  if not valid then
+    toCollision sp (B3T.contactBeginTouchEventShapeIdA ev) (B3T.contactBeginTouchEventShapeIdB ev)
+  else do
+    cd <- B3Contact.getData contact
+    -- resolve from the ContactData's own shape order, so the A/B
+    -- entities stay consistent with the manifold normal's A-to-B
+    -- orientation
+    mc <- toCollision sp (B3T.contactDataShapeIdA cd) (B3T.contactDataShapeIdB cd)
+    if B3T.contactDataManifoldCount cd < 1 then
+      pure mc
+    else forM mc $ \c -> do
+      -- copy the first manifold right away: the array is
+      -- engine-owned and only valid until the next step
+      m <- peek (B3T.contactDataManifolds cd)
+      bodyA <- B3Shape.getBody (B3T.contactDataShapeIdA cd)
+      comA <- B3Body.getWorldCenterOfMass bodyA
+      let pts = map (vecAdd comA . B3T.manifoldPointAnchorA) (VS.toList (B3T.manifoldPoints m))
+      pure c{collisionNormal = B3T.manifoldNormal m, collisionPoints = pts}
 
 {- | The begin-touch contacts of the last 'stepPhysics', a read-only
 global: @Collisions touches <- get global@ after stepping. Shapes
@@ -2800,7 +2842,7 @@ instance (MonadIO m) => ExplGet m (B3Space Collisions) where
   explGet sp _ = liftIO $ do
     evs <- B3Events.contactBeginTouchEvents (spWorld sp)
     fmap (Collisions . catMaybes) . forM (VS.toList evs) $ \ev ->
-      toCollision sp (B3T.contactBeginTouchEventShapeIdA ev) (B3T.contactBeginTouchEventShapeIdB ev)
+      toBeginCollision sp ev
 
 {- | The end-touch contacts of the last 'stepPhysics', a read-only
 global: @CollisionsEnd separations <- get global@ after stepping — the
@@ -2808,7 +2850,8 @@ counterpart of 'Collisions' for contacts that stopped touching. Events
 whose shapes were destroyed since the step are dropped; this bites
 harder here than for begin-touch, since destroying a shape mid-contact
 drops its end event — clean up any per-contact bookkeeping when
-destroying shapes.
+destroying shapes. End events carry no manifold: 'collisionNormal' is
+zero and 'collisionPoints' is empty.
 -}
 newtype CollisionsEnd = CollisionsEnd [Collision]
   deriving (Show)

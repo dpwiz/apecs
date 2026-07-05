@@ -167,6 +167,7 @@ import Box2D.Body qualified as B2Body
 import Box2D.Callbacks (withCastResultFcn, withOverlapResultFcn, withPlaneResultFcn)
 import Box2D.Chain qualified as B2Chain
 import Box2D.Collision qualified as B2Collision
+import Box2D.Contact qualified as B2Contact
 import Box2D.DistanceJoint qualified as B2DistanceJoint
 import Box2D.Events qualified as B2Events
 import Box2D.Id (BodyId, ChainId, JointId, ShapeId, WorldId)
@@ -2684,18 +2685,27 @@ restoreWorld (Snapshot fp size) = do
 
 -- * Collisions
 
-{- | A contact that began touching during the last 'stepPhysics': the
-shapes involved and the bodies they hang off.
+{- | A contact from the last 'stepPhysics': the shapes involved, the
+bodies they hang off and — for begin-touch events — the contact
+manifold. Box2D uses speculative contacts, so a begin-touch manifold
+can contain slightly separated points (positive separation) and can
+even momentarily be empty.
 -}
 data Collision = Collision
   { collisionBodyA :: !Entity
   , collisionShapeA :: !Entity
   , collisionBodyB :: !Entity
   , collisionShapeB :: !Entity
+  , collisionNormal :: !WVec
+  -- ^ Contact normal, pointing from A to B (zero for 'CollisionsEnd' events).
+  , collisionPoints :: ![WVec]
+  -- ^ World contact points, up to 2 in 2D (empty for 'CollisionsEnd').
   }
   deriving (Eq, Show)
 
--- | The shape/body entities behind a contact's two shape ids, if both are still alive and registered.
+{- | The shape/body entities behind a contact's two shape ids, if both
+are still alive and registered; the manifold fields are left zero/empty.
+-}
 toCollision :: B2Space c -> ShapeId -> ShapeId -> IO (Maybe Collision)
 toCollision sp sA sB = do
   ma <- shapeEntities sp sA
@@ -2703,7 +2713,33 @@ toCollision sp sA sB = do
   pure $ do
     (sa, ba) <- ma
     (sb, bb) <- mb
-    Just (Collision ba sa bb sb)
+    Just (Collision ba sa bb sb vec2Zero [])
+
+{- | 'toCollision' for a begin-touch event, with the contact manifold
+filled in: the normal plus the world position of each manifold point
+(body A's world center of mass plus the point's A-side anchor). If the
+contact is no longer valid (a shape was destroyed after the step) the
+manifold fields stay zero/empty.
+-}
+toBeginCollision :: B2Space c -> B2T.ContactBeginTouchEvent -> IO (Maybe Collision)
+toBeginCollision sp ev = do
+  let contact = B2T.contactBeginTouchEventContactId ev
+  valid <- B2Contact.isValid contact
+  if not valid then
+    toCollision sp (B2T.contactBeginTouchEventShapeIdA ev) (B2T.contactBeginTouchEventShapeIdB ev)
+  else do
+    cd <- B2Contact.getData contact
+    -- resolve from the ContactData's own shape order, so the A/B
+    -- entities stay consistent with the manifold normal's A-to-B
+    -- orientation
+    mc <- toCollision sp (B2T.contactDataShapeIdA cd) (B2T.contactDataShapeIdB cd)
+    forM mc $ \c -> do
+      bodyA <- B2Shape.getBody (B2T.contactDataShapeIdA cd)
+      comA <- B2Body.getWorldCenter bodyA
+      let
+        m = B2T.contactDataManifold cd
+        pts = map (vecAdd comA . B2T.manifoldPointAnchorA) (VS.toList (B2T.manifoldPoints m))
+      pure c{collisionNormal = B2T.manifoldNormal m, collisionPoints = pts}
 
 {- | The begin-touch contacts of the last 'stepPhysics', a read-only
 global: @Collisions touches <- get global@ after stepping. Shapes
@@ -2724,7 +2760,7 @@ instance (MonadIO m) => ExplGet m (B2Space Collisions) where
   explGet sp _ = liftIO $ do
     evs <- B2Events.contactBeginTouchEvents (spWorld sp)
     fmap (Collisions . catMaybes) . forM (VS.toList evs) $ \ev ->
-      toCollision sp (B2T.contactBeginTouchEventShapeIdA ev) (B2T.contactBeginTouchEventShapeIdB ev)
+      toBeginCollision sp ev
 
 {- | The end-touch contacts of the last 'stepPhysics', a read-only
 global: @CollisionsEnd separations <- get global@ after stepping — the
@@ -2732,7 +2768,8 @@ counterpart of 'Collisions' for contacts that stopped touching. Events
 whose shapes were destroyed since the step are dropped; this bites
 harder here than for begin-touch, since destroying a shape mid-contact
 drops its end event — clean up any per-contact bookkeeping when
-destroying shapes.
+destroying shapes. End events carry no manifold: 'collisionNormal' is
+zero and 'collisionPoints' is empty.
 -}
 newtype CollisionsEnd = CollisionsEnd [Collision]
   deriving (Show)

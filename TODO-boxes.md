@@ -122,7 +122,7 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
   components + `JointEvents` global.** Upstream: `Joint.setForceThreshold/
   setTorqueThreshold`, `Events.jointEvents`. Pairs naturally with the P2
   joint-tuning work. (S once P2 joint work exists)
-- [ ] **Manifold/contact data on `Collisions`.** Begin-touch events carry
+- [x] **Manifold/contact data on `Collisions`.** Begin-touch events carry
   contact data upstream; exposing point/normal would save a follow-up query.
   Check what `ContactBeginTouchEvent` actually carries before promising. (M)
   *Checked 2026-07-05: the event carries only shape ids + a `ContactId`,
@@ -238,7 +238,7 @@ upstream side is spelled out in `NOTES-upstream.md`.
 - [ ] **`overlapShape` + `castShape` queries.** No way to build a
   `ShapeProxy` from Haskell (opaque tag, no constructor or size).
   NOTES-upstream §1. (S here once unblocked)
-- [ ] **Manifold/contact data on `Collisions`.** `ContactBeginTouchEvent`
+- [x] **Manifold/contact data on `Collisions`.** `ContactBeginTouchEvent`
   carries only ids + a `ContactId`, and `Contact.getData` writes into an
   opaque `ContactData`. NOTES-upstream §2. (S–M here once unblocked)
 - [ ] **[3D] User-authored meshes and height fields.** `GeoMesh`/
