@@ -185,7 +185,7 @@ upstream side is spelled out in `NOTES-upstream.md`.
   `JointSpec` constructor already determines the engine type. A pure
   spec → kind mapping (or a `JointType` cached in `JointRecord` at
   creation) makes exists/members/dispatch FFI-free. (S)
-- [ ] **Chain segment resolution.** Chain segments stay invisible to
+- [x] **Chain segment resolution.** Chain segments stay invisible to
   `Collisions`/`Impacts` *and* the queries; `segmentQuery` returns
   `Nothing` outright when a chain segment is the closest hit — the chain
   occludes whatever lies behind it. Documented on `Chain` now, but the

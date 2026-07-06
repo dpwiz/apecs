@@ -162,6 +162,7 @@ import Data.Vector.Unboxed qualified as U
 import Data.Word (Word8)
 import Foreign.C.String (peekCString, withCString)
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrBytes, withForeignPtr)
+import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.Marshal.Utils (fromBool, toBool)
 import Foreign.Ptr (Ptr, castPtr, nullPtr)
 
@@ -205,8 +206,10 @@ data ShapeRecord = ShapeRecord !ShapeId !Shape
 -- | The engine joint plus the exact 'Joint' value that created it.
 data JointRecord = JointRecord !JointId !Joint
 
--- | The engine chain plus the exact 'Chain' value that created it.
-data ChainRecord = ChainRecord !ChainId !Chain
+{- | The engine chain, the shape ids of the segments the engine generated
+for it (in creation order), and the exact 'Chain' value that created it.
+-}
+data ChainRecord = ChainRecord !ChainId !(VS.Vector ShapeId) !Chain
 
 {- | The store shared by 'Physics' and all its sub-components: the engine
 world plus entity registries for bodies, shapes, joints and chains.
@@ -381,7 +384,7 @@ jointMembers :: (MonadIO m) => B2Space c -> m (U.Vector Int)
 jointMembers sp = regMembers (spJoints sp)
 
 withChain :: B2Space c -> Int -> (ChainId -> IO a) -> IO a
-withChain sp ety f = withReg "Chain" (spChains sp) ety (\(ChainRecord c _) -> f c)
+withChain sp ety f = withReg "Chain" (spChains sp) ety (\(ChainRecord c _ _) -> f c)
 
 chainExists :: (MonadIO m) => B2Space c -> Int -> m Bool
 chainExists sp = regExists (spChains sp)
@@ -632,7 +635,7 @@ instance (MonadIO m) => ExplDestroy m (B2Space Body) where
       -- the body, so drop their entity records too
       modifyIORef' (spShapes sp) (IM.filter (\(ShapeRecord _ (Shape (Entity be) _)) -> be /= ety))
       modifyIORef' (spJoints sp) (IM.filter (\(JointRecord _ (Joint (Entity a) (Entity b') _)) -> a /= ety && b' /= ety))
-      modifyIORef' (spChains sp) (IM.filter (\(ChainRecord _ (Chain (Entity be) _ _)) -> be /= ety))
+      modifyIORef' (spChains sp) (IM.filter (\(ChainRecord _ _ (Chain (Entity be) _ _)) -> be /= ety))
       modifyIORef' (spBodies sp) (IM.delete ety)
       B2Body.destroy b
 
@@ -1395,16 +1398,25 @@ exact value written. Setting it on an entity whose body entity has no
 'Body' is a silent no-op.
 
 The segments the engine creates for a chain are its own internal
-@b2ChainSegment@ shapes, never registered in this layer's shape registry
-(there is no matching 'Shape' component for them), so contacts against
-them do not currently surface in 'Collisions', 'CollisionsEnd' or
-'Impacts' — those globals resolve engine shapes back to entities through
-the registry and silently drop anything not found there. The queries
-have the same blind spot: 'segmentQueryAll' and 'containsPointQuery'
-drop hits on chain segments, and 'segmentQuery' returns 'Nothing'
-outright when a chain segment is the closest hit — the chain occludes
-whatever lies behind it rather than being skipped. Chains still collide
-normally; only event and query reporting is affected.
+@b2ChainSegment@ shapes; there is no matching 'Shape' component for
+them, so they are not entered into this layer's shape registry. Instead,
+each segment is stamped with the chain entity's user index directly (see
+'Box2D.UserData.setUserIndex'), and the chain's contact and hit events
+are switched on for every segment at creation — mirroring what 'explInit'
+does per-shape for layer-created 'Shape's. Event and query resolution
+falls back to a chain lookup keyed by that index when a shape isn't found
+in the shape registry, so chain segments now surface in 'Collisions',
+'CollisionsEnd' and 'Impacts', and are visible to the queries
+('segmentQuery', 'segmentQueryAll', 'aabbQuery', 'pointQuery',
+'containsPointQuery', 'overlapQuery', 'sweepQuery') instead of being
+dropped — in particular 'segmentQuery' no longer returns 'Nothing' just
+because a chain segment is the closest hit. In every case the CHAIN
+entity is reported in the shape slot, not a per-segment entity: a reader
+following 'collisionShapeA' (or 'rayHitShape', etc.) to a 'Shape'
+component won't find one, but will find a 'Chain'. Chain creation also
+turns on @chainDefEnableSensorEvents@, the chain-level counterpart of
+'Shape'\'s 'Sensor' visitor opt-in, so chains are visible to sensors the
+same way ordinary shapes are.
 -}
 data Chain = Chain Entity (VS.Vector Vec2) Bool
   deriving (Eq, Show)
@@ -1414,6 +1426,19 @@ instance Component Chain where
 
 instance (MonadIO m, Has w m Physics) => Has w m Chain where
   getStore = cast <$> (getStore :: SystemT w m (B2Space Physics))
+
+{- | Fetch a chain's segment shape ids, in creation order — the two-call
+@b2Chain_GetSegmentCount@\/@b2Chain_GetSegments@ dance the raw binding
+exposes directly.
+-}
+chainSegments :: ChainId -> IO (VS.Vector ShapeId)
+chainSegments c = do
+  n <- B2Chain.getSegmentCount c
+  if n <= 0 then
+    pure VS.empty
+  else allocaArray n $ \arr -> do
+    got <- B2Chain.getSegments c arr n
+    VS.fromListN got <$> peekArray got arr
 
 {- | Create a fresh engine chain for a 'Chain' value, destroy the chain it
 replaces (if any) only after the new one exists (so a failed create,
@@ -1433,16 +1458,25 @@ recreateChain sp b ety chain@(Chain _ pts isLoop) old = do
         { B2T.chainDefPoints = p
         , B2T.chainDefCount = fromIntegral n
         , B2T.chainDefIsLoop = fromBool isLoop
+        , -- like 'explInit'\'s 'B2T.shapeDefEnableSensorEvents' for
+          -- layer-created shapes: lets sensors see this chain as a visitor
+          B2T.chainDefEnableSensorEvents = 1
         }
   -- Unlike BodyId/ShapeId/JointId, ChainId has no 'Box2D.UserData.HasUserData'
   -- instance, so the chain itself cannot be stamped with the entity's user
   -- index (the chain registry below, keyed by entity, is what
-  -- 'explGet'/'B2ChainId' use instead). Its segment 'ShapeId's could be
-  -- stamped, but that would not help event resolution either: 'shapeEntities'
-  -- only recognises shapes present in the shape registry, and chain segments
-  -- never are (see the haddock above).
-  forM_ old $ \(ChainRecord c' _) -> B2Chain.destroy c'
-  modifyIORef' (spChains sp) (IM.insert ety (ChainRecord c chain))
+  -- 'explGet'/'B2ChainId' use instead). Its segment 'ShapeId's are stamped
+  -- with it instead, and 'shapeEntities' falls back to this registry when a
+  -- shape isn't in the shape registry, matching the id against the segment
+  -- ids recorded here.
+  segs <- chainSegments c
+  VS.forM_ segs $ \seg -> setUserIndex seg ety
+  -- Chain creation turns segment contact/hit events off; opt every segment
+  -- in the way 'explInit' does per-shape for layer-created 'Shape's.
+  B2Chain.enableContactEvents c True
+  B2Chain.enableHitEvents c True
+  forM_ old $ \(ChainRecord c' _ _) -> B2Chain.destroy c'
+  modifyIORef' (spChains sp) (IM.insert ety (ChainRecord c segs chain))
 
 instance (MonadIO m) => ExplSet m (B2Space Chain) where
   explSet sp ety chain@(Chain (Entity bEty) _ _) = liftIO $
@@ -1454,12 +1488,12 @@ instance (MonadIO m) => ExplGet m (B2Space Chain) where
   explExists = chainExists
   explGet sp ety = liftIO $
     withReg "Chain" (spChains sp) ety $
-      \(ChainRecord _ chain) -> pure chain
+      \(ChainRecord _ _ chain) -> pure chain
 
 instance (MonadIO m) => ExplDestroy m (B2Space Chain) where
   explDestroy sp ety = liftIO $ do
     chains <- readIORef (spChains sp)
-    forM_ (IM.lookup ety chains) $ \(ChainRecord c _) -> do
+    forM_ (IM.lookup ety chains) $ \(ChainRecord c _ _) -> do
       modifyIORef' (spChains sp) (IM.delete ety)
       B2Chain.destroy c
 
@@ -2221,7 +2255,11 @@ toQueryFilter f = do
 
 {- | The shape and body entities behind an engine shape, if it is still
 alive and registered (event buffers can reference shapes destroyed
-after the step).
+after the step). The shape registry is the fast path; a shape not found
+there (in particular, a chain's internal @b2ChainSegment@, which is
+never entered into it) falls back to a lookup in the chain registry,
+resolving to the CHAIN entity as the "shape" and its body entity — see
+the 'Chain' haddock.
 -}
 shapeEntities :: B2Space c -> ShapeId -> IO (Maybe (Entity, Entity))
 shapeEntities sp s = do
@@ -2231,12 +2269,18 @@ shapeEntities sp s = do
   else do
     ix <- getUserIndex s
     shapes <- readIORef (spShapes sp)
-    pure $ case IM.lookup ix shapes of
+    case IM.lookup ix shapes of
       -- shapes created through the raw engine API have no user index and
       -- read back as 0, a legitimate entity; requiring the registered
       -- engine shape to be this very shape drops them instead
-      Just (ShapeRecord s' (Shape bodyEty _)) | s' == s -> Just (Entity ix, bodyEty)
-      _ -> Nothing
+      Just (ShapeRecord s' (Shape bodyEty _)) | s' == s -> pure (Just (Entity ix, bodyEty))
+      _ -> do
+        chains <- readIORef (spChains sp)
+        pure $ case IM.lookup ix chains of
+          -- same raw-API index-0 guard as above, checked against the
+          -- chain's own recorded segment ids instead of a single shape id
+          Just (ChainRecord _ segs (Chain bodyEty _ _)) | s `VS.elem` segs -> Just (Entity ix, bodyEty)
+          _ -> Nothing
 
 {- | The joint entity behind an engine joint, if it is still alive and
 registered (event buffers can reference joints destroyed after the
