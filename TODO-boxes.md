@@ -86,10 +86,10 @@ Rule applied: top-left first; bottom-right is explicitly *not worth wrapping*
   `Body.getClosestPoint`), `overlapShape` world query, all-hits
   `castRay` (list of `RayHit`), and `castShape` sweeps. Callback plumbing
   (`withCastResultFcn`, `withOverlapResultFcn`) is already available. (M)
-  *Done as `containsPointQuery` + `segmentQueryAll`. `overlapShape` and
-  `castShape` remain deferred: the box-nd Haskell API has no way to build
-  a `ShapeProxy` (opaque tag, no constructor/size exported), so they need
-  an upstream `makeProxy`-with-allocation helper first.*
+  *Done as `containsPointQuery` + `segmentQueryAll`; 2026-07-06, with
+  box-nd 33ecce4's Storable 2D `ShapeProxy`, also `overlapQuery` +
+  `sweepQuery` [2D]. The 3D twins wait on a 3D `withShapeProxy`
+  (NOTES-upstream §A).*
 - [x] **Joint tuning sub-components on the joint entity: `MotorSpeed`,
   `MotorMaxTorque`/`MaxForce`, `JointLimits`, `CollideConnected`,
   read-only `JointForce`/`JointTorque`.** Re-setting `Joint` recreates the
