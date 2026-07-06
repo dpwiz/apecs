@@ -248,7 +248,7 @@ upstream side is spelled out in `NOTES-upstream.md`.
   `GeoHeightField` currently only accept the procedural generators;
   loading real level geometry needs constructible `MeshDef`/
   `HeightFieldDef`. NOTES-upstream §3. (S here once unblocked)
-- [ ] **[3D] `GeoCompound`.** `CompoundDef` and its child defs are opaque.
+- [x] **[3D] `GeoCompound`.** `CompoundDef` and its child defs are opaque.
   NOTES-upstream §4. (M here once unblocked)
 - [x] **[3D] Exact containment via the engine.** `containsPointQuery`
   special-cases spheres and capsules analytically because

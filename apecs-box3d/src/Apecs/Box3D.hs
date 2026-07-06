@@ -76,6 +76,7 @@ module Apecs.Box3D
   , Mesh
   , HeightField
   , Hull
+  , Compound
   , Shape (..)
   , Density (..)
   , Friction (..)
@@ -103,6 +104,8 @@ module Apecs.Box3D
   , rockHull
   , coneHull
   , cylinderHull
+  , CompoundChild (..)
+  , compoundFromChildren
 
     -- * Joint
   , JointSpec (..)
@@ -179,7 +182,7 @@ import Data.Word (Word8)
 import Foreign.C.String (peekCString, withCString)
 import Foreign.Concurrent qualified as Concurrent
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
-import Foreign.Marshal.Utils (fromBool, toBool)
+import Foreign.Marshal.Utils (fromBool, toBool, with, withMany)
 import Foreign.Ptr (Ptr, castPtr, nullFunPtr, nullPtr)
 import Foreign.Storable (peek)
 
@@ -187,6 +190,7 @@ import Box3D.Body qualified as B3Body
 import Box3D.BoxMesh qualified as B3BoxMesh
 import Box3D.Callbacks (withCastResultFcn, withOverlapResultFcn, withPlaneResultFcn)
 import Box3D.Collision qualified as B3Collision
+import Box3D.Compound qualified as B3Compound
 import Box3D.Cone qualified as B3Cone
 import Box3D.Contact qualified as B3Contact
 import Box3D.Cylinder qualified as B3Cylinder
@@ -212,7 +216,7 @@ import Box3D.RevoluteJoint qualified as B3RevoluteJoint
 import Box3D.Rock qualified as B3Rock
 import Box3D.Shape qualified as B3Shape
 import Box3D.SphericalJoint qualified as B3SphericalJoint
-import Box3D.Tags (HeightFieldData, HullData, MeshData)
+import Box3D.Tags (CompoundData, HeightFieldData, HullData, MeshData)
 import Box3D.Tags qualified as B3Tags
 import Box3D.TorusMesh qualified as B3TorusMesh
 import Box3D.Types (Filter (..))
@@ -1277,6 +1281,20 @@ no user binding) references it any more.
 newtype Hull = Hull (ForeignPtr HullData)
   deriving (Eq, Show)
 
+{- | Compound collision data built from a mix of children by
+'compoundFromChildren' — several capsules, spheres, pre-built hulls and
+shared meshes baked into one static-body shape. Unlike 'Mesh'\/'HeightField',
+the engine fully clones every child's geometry into the compound's own
+allocation (@b3CreateCompound@ deep-copies the hull and mesh byte blobs it is
+given, not just the small definition structs), so a 'Compound' has no need
+to keep its source 'Hull'\/'Mesh' handles alive — they only need to live
+until 'compoundFromChildren' returns, same as 'GeoReadyHull'. The underlying
+engine compound is destroyed automatically once no 'Shape' (and no user
+binding) references it any more, same as 'Mesh'.
+-}
+newtype Compound = Compound (ForeignPtr CompoundData)
+  deriving (Eq, Show)
+
 -- | Shape geometry in body-local coordinates.
 data Geometry
   = -- | Center and radius.
@@ -1314,6 +1332,17 @@ data Geometry
     to live until the shape is created.
     -}
     GeoReadyHull Hull
+  | {- | A compound of several child shapes baked by 'compoundFromChildren'
+    into one collision shape. Static bodies only, same restriction as
+    'GeoMesh'\/'GeoHeightField' — the engine hard-asserts
+    (@b3CreateCompoundShape@ / @b3CreateShape@) that the body is static and
+    that the shape is not a sensor, so 'createGeometry' checks both up
+    front and raises a normal Haskell error instead of letting the engine
+    abort the process. Like 'GeoMesh', the engine references the
+    'Compound' rather than cloning it into the shape, which is exactly why
+    'Compound' is GC-lifetime managed; see its docs.
+    -}
+    GeoCompound Compound
   deriving (Eq, Show)
 
 {- | Gives an entity a collision shape attached to the 'Body' of the given
@@ -1366,6 +1395,13 @@ createGeometry b sd geo = case geo of
   GeoMesh (Mesh fp) scale -> withForeignPtr fp $ \p -> B3Shape.createMesh b sd p scale
   GeoHeightField (HeightField fp) -> withForeignPtr fp $ \p -> B3Shape.createHeightField b sd p
   GeoReadyHull (Hull fp) -> withForeignPtr fp $ \p -> B3Shape.createHull b sd p
+  GeoCompound (Compound fp) -> do
+    bodyType <- B3Body.getType b
+    when (bodyType /= B3T.StaticBody) $
+      error "GeoCompound: compound shapes are only allowed on static bodies"
+    when (toBool (B3T.shapeDefIsSensor sd)) $
+      error "GeoCompound: compound shapes cannot be sensors"
+    withForeignPtr fp $ \p -> with sd $ \pSd -> B3Shape.createCompound b pSd p
 
 -- Static geometry from user data --------------------------------------------
 
@@ -1440,6 +1476,91 @@ heightFieldFromData heights materials scale countX countZ opts =
       "heightFieldFromData"
       B3HeightField.destroy
       (B3Geometry.createHeightFieldFromData heights materials scale countX countZ opts)
+
+{- | A child of a 'compoundFromChildren' compound, entirely in the
+compound's local space. Mirrors the upstream @b3Compound*Def@ child kinds:
+a capsule and a sphere place their own geometry directly (like 'GeoCapsule'
+and 'GeoSphere' — there is no separate placement field because the
+capsule\/sphere centers already are the placement), while a hull or mesh is
+placed by an explicit local 'Transform', matching 'CompoundHullDef'\/
+'CompoundMeshDef'.
+
+Every child def upstream also carries a per-child 'B3T.SurfaceMaterial',
+but that knob is deliberately not exposed here: 'compoundFromChildren'
+fills it with 'B3T.defaultSurfaceMaterial' for every child, and per-shape
+material tuning stays where it already lives for every other 'Geometry'
+constructor — on the 'Shape'\'s wrapping components (surface material,
+friction, restitution), not on the geometry itself. A 'CompoundMesh'
+likewise gets exactly one material slot; a 'Mesh' built with more than one
+per-triangle material (e.g. 'gridMesh' called with a material count above
+one, or 'meshFromData' given per-triangle materials) is not supported as a
+compound child and will make the engine's own material-count assertion
+fail.
+-}
+data CompoundChild
+  = -- | Center and radius, as 'GeoSphere'.
+    CompoundSphere BVec Float
+  | -- | The two hemisphere centers and the radius, as 'GeoCapsule'.
+    CompoundCapsule BVec BVec Float
+  | {- | A pre-built convex hull ('rockHull', 'coneHull', 'cylinderHull')
+    placed by a local transform. The compound clones the hull data (see
+    'Compound'\'s docs), so — like 'GeoReadyHull' — the 'Hull' handle
+    only needs to live until 'compoundFromChildren' returns.
+    -}
+    CompoundHull Hull Transform
+  | {- | Shared mesh data (see 'GeoMesh'\/'boxMesh'\/'meshFromData' etc.)
+    placed by a local transform and a per-child scale. Only
+    single-material meshes are supported; see the note above.
+    -}
+    CompoundMesh Mesh Transform Vec3
+  deriving (Eq, Show)
+
+{- | Build compound collision data (@b3CreateCompound@) from a mix of
+children — see 'CompoundChild'. Errors, naming this function, on an empty
+child list: the upstream engine has no valid empty-compound representation
+(it asserts internally rather than returning @NULL@), so this checks first
+rather than letting the engine abort the process. Also errors if the
+engine itself rejects the parameters (a null pointer, e.g. too many
+children). The 'Hull'\/'Mesh' handles referenced by 'CompoundHull'\/
+'CompoundMesh' children only need to stay alive for the duration of this
+call; the resulting 'Compound' clones everything, as its docs explain.
+-}
+compoundFromChildren :: [CompoundChild] -> IO Compound
+compoundFromChildren children = do
+  when (null children) $
+    error "compoundFromChildren: empty child list"
+  material <- B3T.defaultSurfaceMaterial
+  let
+    capsules =
+      VS.fromList
+        [ B3Geometry.CompoundCapsuleDef (B3T.Capsule c1 c2 r) material
+        | CompoundCapsule c1 c2 r <- children
+        ]
+    spheres =
+      VS.fromList
+        [ B3Geometry.CompoundSphereDef (B3T.Sphere c r) material
+        | CompoundSphere c r <- children
+        ]
+    hullChildren = [(fp, tr) | CompoundHull (Hull fp) tr <- children]
+    meshChildren = [(fp, tr, scale) | CompoundMesh (Mesh fp) tr scale <- children]
+  withMany withForeignPtr (map fst hullChildren) $ \hullPtrs ->
+    withMany withForeignPtr (map (\(fp, _, _) -> fp) meshChildren) $ \meshPtrs ->
+      with material $ \pMaterial -> do
+        let
+          hulls =
+            VS.fromList
+              [ B3Geometry.CompoundHullDef hp tr material
+              | ((_, tr), hp) <- zip hullChildren hullPtrs
+              ]
+          meshes =
+            VS.fromList
+              [ B3Geometry.CompoundMeshDef mp tr scale pMaterial 1
+              | ((_, tr, scale), mp) <- zip meshChildren meshPtrs
+              ]
+        p <- B3Geometry.createCompoundFromData capsules hulls meshes spheres
+        when (p == nullPtr) $
+          error "compoundFromChildren: the engine rejected the parameters (returned a null pointer)"
+        Compound <$> Concurrent.newForeignPtr p (B3Compound.destroy p)
 
 -- Static geometry generators ------------------------------------------------
 
