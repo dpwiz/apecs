@@ -106,6 +106,8 @@ module Apecs.Box2D
   , aabbQuery
   , pointQuery
   , containsPointQuery
+  , overlapQuery
+  , sweepQuery
 
     -- * Character mover
   , MoverResult (..)
@@ -173,7 +175,7 @@ import Box2D.Events qualified as B2Events
 import Box2D.Id (BodyId, ChainId, JointId, ShapeId, WorldId)
 import Box2D.Joint qualified as B2Joint
 import Box2D.MathFunctions (makeRot, rotGetAngle)
-import Box2D.MathTypes (AABB (..), Rot (..), Transform (..), Vec2 (..), vec2Zero)
+import Box2D.MathTypes (AABB (..), Rot (..), Transform (..), Vec2 (..), rotateVector, vec2Add, vec2Zero)
 import Box2D.MotorJoint qualified as B2MotorJoint
 import Box2D.Mover qualified as B2Mover
 import Box2D.PrismaticJoint qualified as B2PrismaticJoint
@@ -2424,6 +2426,125 @@ containsPointQuery point fltr = do
     _ <- withOverlapResultFcn visit $ \fp ctx ->
       B2World.overlapAABB (spWorld sp) vec2Zero (AABB point point) qf fp ctx
     map Entity . IS.toList <$> readIORef found
+
+{- | The point-count range 'GeoPolygon' and 'GeoOffsetRoundedPolygon' need
+in 'geometryProxy': the same bound 'computeValidHull' enforces for shape
+creation, but without computing a hull — GJK proxies don't need one, so a
+degenerate or non-convex point set (which 'computeValidHull' would
+reject) is fine here.
+-}
+checkProxyPoints :: VS.Vector Vec2 -> VS.Vector Vec2
+checkProxyPoints pts
+  | n < 3 || n > B2T.maxPolygonVertices =
+      error ("polygon needs 3 to " <> show B2T.maxPolygonVertices <> " points, got " <> show n)
+  | otherwise = pts
+  where
+    n = VS.length pts
+
+{- | A query 'Geometry', interpreted in world space, as a shape proxy
+point cloud and radius, for 'overlapQuery' and 'sweepQuery'. Mirrors
+'createGeometry''s cases, but produces the raw point cloud 'B2World.overlapShape'
+and 'B2World.castShape' want instead of an engine shape:
+
+* 'GeoCircle', 'GeoCapsule' and 'GeoSegment' hand over their defining
+  points directly, circle and capsule carrying their radius onto the
+  proxy.
+* 'GeoBox' and 'GeoRoundedBox' both proxy the 4 corners at
+  @±(halfWidth, halfHeight)@: upstream @b2MakeRoundedBox@ just tacks the
+  radius onto a plain @b2MakeBox@ without insetting the corners, so the
+  rounded variant only differs by radius.
+* 'GeoOffsetBox' transforms those corners by the local center/angle
+  (matching @b2MakeOffsetBox@'s per-corner @b2TransformPoint@); the
+  rotation is rebuilt here as a plain cosine\/sine pair rather than
+  through 'makeRot' (an 'IO' action) to keep this function pure — the
+  two agree since @b2MakeRot@ is exactly @b2ComputeCosSin@.
+* 'GeoPolygon' and 'GeoOffsetRoundedPolygon' get the same point-count
+  range check 'computeValidHull' does (see 'checkProxyPoints'), but no
+  hull: @b2MakeProxy@ copies the point cloud verbatim (capped at
+  'B2T.maxPolygonVertices', which the range check already guarantees),
+  and GJK does not need a precomputed hull.
+-}
+geometryProxy :: Geometry -> (VS.Vector Vec2, Float)
+geometryProxy geo = case geo of
+  GeoCircle c r -> (VS.singleton c, r)
+  GeoCapsule c1 c2 r -> (VS.fromListN 2 [c1, c2], r)
+  GeoSegment p1 p2 -> (VS.fromListN 2 [p1, p2], 0)
+  GeoBox hw hh -> (boxCorners hw hh, 0)
+  GeoRoundedBox hw hh r -> (boxCorners hw hh, r)
+  GeoOffsetBox hw hh center angle -> (VS.map (place center angle) (boxCorners hw hh), 0)
+  GeoPolygon pts -> (checkProxyPoints pts, 0)
+  GeoOffsetRoundedPolygon pts center angle r ->
+    (VS.map (place center angle) (checkProxyPoints pts), r)
+  where
+    boxCorners hw hh = VS.fromListN 4 [Vec2 (-hw) (-hh), Vec2 hw (-hh), Vec2 hw hh, Vec2 (-hw) hh]
+    place center angle p = vec2Add center (rotateVector (Rot (cos angle) (sin angle)) p)
+
+{- | The body entities whose shapes actually overlap a query shape, given
+as a world-space 'Geometry' — exact narrow-phase overlap, the
+shape-shaped big brother of 'containsPointQuery'.
+-}
+overlapQuery
+  :: forall w m
+   . (MonadIO m, Has w m Physics)
+  => Geometry
+  -> Filter
+  -> SystemT w m [Entity]
+overlapQuery geo fltr = do
+  sp :: B2Space Physics <- getStore
+  liftIO $ do
+    qf <- toQueryFilter fltr
+    found <- newIORef IS.empty
+    let
+      (points, radius) = geometryProxy geo
+      visit s = do
+        hit <- shapeEntities sp s
+        forM_ hit $ \(_, Entity bodyIx) -> modifyIORef' found (IS.insert bodyIx)
+        pure True
+    _ <- withOverlapResultFcn visit $ \fp ctx ->
+      B2T.withShapeProxy points radius $ \proxy ->
+        B2World.overlapShape (spWorld sp) vec2Zero proxy qf fp ctx
+    map Entity . IS.toList <$> readIORef found
+
+{- | Sweep a query shape (a world-space 'Geometry') along a translation
+and collect everything it would hit, sorted nearest-first by
+'rayHitFraction' — 'segmentQueryAll' with volume. A shape that already
+overlaps the query shape at the start of the sweep is reported too, at
+fraction 0 (matching upstream @b2World_CastShape@, which treats an
+initial overlap as an immediate hit rather than skipping it).
+-}
+sweepQuery
+  :: forall w m
+   . (MonadIO m, Has w m Physics)
+  => Geometry
+  -> WVec
+  -> Filter
+  -> SystemT w m [RayHit]
+sweepQuery geo translation fltr = do
+  sp :: B2Space Physics <- getStore
+  liftIO $ do
+    qf <- toQueryFilter fltr
+    found <- newIORef []
+    let
+      (points, radius) = geometryProxy geo
+      visit s point normal frac = do
+        hit <- shapeEntities sp s
+        forM_ hit $ \(shapeEty, bodyEty) ->
+          modifyIORef'
+            found
+            ( RayHit
+                { rayHitShape = shapeEty
+                , rayHitBody = bodyEty
+                , rayHitPoint = point
+                , rayHitNormal = normal
+                , rayHitFraction = frac
+                }
+                :
+            )
+        pure 1
+    _ <- withCastResultFcn visit $ \fp ctx ->
+      B2T.withShapeProxy points radius $ \proxy ->
+        B2World.castShape (spWorld sp) vec2Zero proxy translation qf fp ctx
+    sortOn rayHitFraction <$> readIORef found
 
 -- * Character mover
 

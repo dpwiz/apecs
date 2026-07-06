@@ -235,9 +235,12 @@ upstream side is spelled out in `NOTES-upstream.md`.
 
 ### Blocked on upstream — do the box-nd side first (see NOTES-upstream.md)
 
-- [ ] **`overlapShape` + `castShape` queries.** No way to build a
+- [x] **`overlapShape` + `castShape` queries.** No way to build a
   `ShapeProxy` from Haskell (opaque tag, no constructor or size).
   NOTES-upstream §1. (S here once unblocked)
+  *2D done as `overlapQuery`/`sweepQuery` over `withShapeProxy` from
+  box-nd 33ecce4. 3D still blocked: the 3D `ShapeProxy` remains an
+  opaque tag.*
 - [x] **Manifold/contact data on `Collisions`.** `ContactBeginTouchEvent`
   carries only ids + a `ContactId`, and `Contact.getData` writes into an
   opaque `ContactData`. NOTES-upstream §2. (S–M here once unblocked)
