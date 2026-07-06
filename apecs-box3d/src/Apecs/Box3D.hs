@@ -86,6 +86,12 @@ module Apecs.Box3D
   , B3ShapeId (..)
 
     -- * Static geometry
+  , meshFromData
+  , MeshOptions (..)
+  , defaultMeshOptions
+  , heightFieldFromData
+  , HeightFieldOptions (..)
+  , defaultHeightFieldOptions
   , boxMesh
   , hollowBoxMesh
   , platformMesh
@@ -161,6 +167,7 @@ import Apecs.Core
 import Control.Monad (filterM, forM, forM_, when)
 import Control.Monad.IO.Class (MonadIO)
 import Data.IORef
+import Data.Int (Int32)
 import Data.IntMap.Strict (IntMap)
 import Data.IntMap.Strict qualified as IM
 import Data.IntSet qualified as IS
@@ -168,6 +175,7 @@ import Data.List (sortOn)
 import Data.Maybe (catMaybes)
 import Data.Vector.Storable qualified as VS
 import Data.Vector.Unboxed qualified as U
+import Data.Word (Word8)
 import Foreign.C.String (peekCString, withCString)
 import Foreign.Concurrent qualified as Concurrent
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
@@ -184,6 +192,8 @@ import Box3D.Contact qualified as B3Contact
 import Box3D.Cylinder qualified as B3Cylinder
 import Box3D.DistanceJoint qualified as B3DistanceJoint
 import Box3D.Events qualified as B3Events
+import Box3D.Geometry (HeightFieldOptions (..), MeshOptions (..), defaultHeightFieldOptions, defaultMeshOptions)
+import Box3D.Geometry qualified as B3Geometry
 import Box3D.Grid qualified as B3Grid
 import Box3D.GridMesh qualified as B3GridMesh
 import Box3D.HeightField qualified as B3HeightField
@@ -1356,6 +1366,80 @@ createGeometry b sd geo = case geo of
   GeoMesh (Mesh fp) scale -> withForeignPtr fp $ \p -> B3Shape.createMesh b sd p scale
   GeoHeightField (HeightField fp) -> withForeignPtr fp $ \p -> B3Shape.createHeightField b sd p
   GeoReadyHull (Hull fp) -> withForeignPtr fp $ \p -> B3Shape.createHull b sd p
+
+-- Static geometry from user data --------------------------------------------
+
+{- | Triangle-mesh collision data built from your own vertices and indices —
+the level-loading path, where the procedural generators ('boxMesh',
+'gridMesh', ...) are the test-scene path. Needs at least 3 vertices and
+vertex indices grouped 3 at a time, one triangle each, wound the same
+way as the generators' own meshes; an optional material index per
+triangle indexes into a shape's per-shape material slots (see
+'B3Shape.setMeshMaterial') and, if given, must have exactly one entry
+per triangle — a mismatched count is treated as invalid input rather
+than read out of bounds. 'MeshOptions' controls vertex welding, the
+BVH split strategy and whether triangle adjacency is identified (see
+the "internal edges" note on 'gridMesh'); start from
+'defaultMeshOptions'. The engine clones the input data, so the vectors
+can be reused or dropped right after this returns.
+
+Degenerate (zero-area) triangles are silently dropped from the built
+mesh; the second element of the result lists their indices into the
+input triangle list (i.e. the index of a bad triangle is
+@indices@\'s @3*i@\/@3*i+1@\/@3*i+2@), so a level pipeline can flag bad
+source data instead of silently losing collision. Errors, naming this
+function, if the engine rejects the parameters (a null pointer, e.g.
+from a mismatched material count).
+-}
+meshFromData
+  :: VS.Vector Vec3
+  -- ^ Triangle vertices.
+  -> VS.Vector Int32
+  -- ^ Triangle vertex indices, 3 per triangle.
+  -> Maybe (VS.Vector Word8)
+  -- ^ Per-triangle material indices.
+  -> MeshOptions
+  -> IO (Mesh, VS.Vector Int32)
+meshFromData vertices indices materials opts = do
+  (p, degenerate) <- B3Geometry.createMeshFromData vertices indices materials opts
+  when (p == nullPtr) $
+    error "meshFromData: the engine rejected the parameters (returned a null pointer)"
+  fp <- Concurrent.newForeignPtr p (B3Mesh.destroy p)
+  pure (Mesh fp, degenerate)
+
+{- | Height-field collision data built from your own grid samples — the
+level-loading path, where 'gridHeightField'\/'waveHeightField' are the
+test-scene path. Needs at least one height sample, row-major
+@countX * countZ@ values (must not be empty); an optional material
+index per grid cell (@(countX - 1) * (countZ - 1)@ entries), where
+@0xFF@ marks a hole shapes fall through, same as the procedural height
+fields'. 'HeightFieldOptions' controls the height range used for
+quantization (share it between adjacent tiles so they line up flush)
+and winding; start from 'defaultHeightFieldOptions'. The engine
+quantizes the heights into its own storage, so the input vectors can
+be reused or dropped right after this returns. Errors, naming this
+function, if the engine rejects the parameters (currently just an
+empty height vector).
+-}
+heightFieldFromData
+  :: VS.Vector Float
+  -- ^ Grid point heights, row-major, @countX * countZ@ samples.
+  -> Maybe (VS.Vector Word8)
+  -- ^ Grid cell material indices.
+  -> Vec3
+  -- ^ Scale; all components must be positive.
+  -> Int
+  -- ^ Grid lines along the x-axis.
+  -> Int
+  -- ^ Grid lines along the z-axis.
+  -> HeightFieldOptions
+  -> IO HeightField
+heightFieldFromData heights materials scale countX countZ opts =
+  HeightField
+    <$> wrapGenerated
+      "heightFieldFromData"
+      B3HeightField.destroy
+      (B3Geometry.createHeightFieldFromData heights materials scale countX countZ opts)
 
 -- Static geometry generators ------------------------------------------------
 

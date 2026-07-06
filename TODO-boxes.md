@@ -244,7 +244,7 @@ upstream side is spelled out in `NOTES-upstream.md`.
 - [x] **Manifold/contact data on `Collisions`.** `ContactBeginTouchEvent`
   carries only ids + a `ContactId`, and `Contact.getData` writes into an
   opaque `ContactData`. NOTES-upstream §2. (S–M here once unblocked)
-- [ ] **[3D] User-authored meshes and height fields.** `GeoMesh`/
+- [x] **[3D] User-authored meshes and height fields.** `GeoMesh`/
   `GeoHeightField` currently only accept the procedural generators;
   loading real level geometry needs constructible `MeshDef`/
   `HeightFieldDef`. NOTES-upstream §3. (S here once unblocked)
