@@ -101,6 +101,7 @@ module Apecs.Box2D
 
     -- * Queries
   , RayHit (..)
+  , everything
   , segmentQuery
   , segmentQueryAll
   , aabbQuery
@@ -130,6 +131,7 @@ module Apecs.Box2D
 
     -- * Collisions
   , Collision (..)
+  , ContactManifold (..)
   , Collisions (..)
   , CollisionsEnd (..)
   , Impact (..)
@@ -158,13 +160,13 @@ import Data.IntSet qualified as IS
 import Data.List (sortOn)
 import Data.Maybe (catMaybes)
 import Data.Vector.Storable qualified as VS
+import Data.Vector.Storable.Mutable qualified as VSM
 import Data.Vector.Unboxed qualified as U
 import Data.Word (Word8)
 import Foreign.C.String (peekCString, withCString)
 import Foreign.ForeignPtr (ForeignPtr, mallocForeignPtrBytes, withForeignPtr)
-import Foreign.Marshal.Array (allocaArray, peekArray)
 import Foreign.Marshal.Utils (fromBool, toBool)
-import Foreign.Ptr (Ptr, castPtr, nullPtr)
+import Foreign.Ptr (FunPtr, Ptr, castPtr, nullPtr)
 
 import Box2D.Body qualified as B2Body
 import Box2D.Callbacks (withCastResultFcn, withOverlapResultFcn, withPlaneResultFcn)
@@ -173,10 +175,10 @@ import Box2D.Collision qualified as B2Collision
 import Box2D.Contact qualified as B2Contact
 import Box2D.DistanceJoint qualified as B2DistanceJoint
 import Box2D.Events qualified as B2Events
-import Box2D.Id (BodyId, ChainId, JointId, ShapeId, WorldId)
+import Box2D.Id (BodyId, ChainId, JointId, ShapeId (..), WorldId)
 import Box2D.Joint qualified as B2Joint
 import Box2D.MathFunctions (makeRot, rotGetAngle)
-import Box2D.MathTypes (AABB (..), Rot (..), Transform (..), Vec2 (..), rotateVector, vec2Add, vec2Zero)
+import Box2D.MathTypes (AABB (..), Rot (..), Transform (..), Vec2 (..), vec2Add, vec2LengthSquared, vec2Scale, vec2Sub, vec2Zero)
 import Box2D.MotorJoint qualified as B2MotorJoint
 import Box2D.Mover qualified as B2Mover
 import Box2D.PrismaticJoint qualified as B2PrismaticJoint
@@ -206,10 +208,12 @@ data ShapeRecord = ShapeRecord !ShapeId !Shape
 -- | The engine joint plus the exact 'Joint' value that created it.
 data JointRecord = JointRecord !JointId !Joint
 
-{- | The engine chain, the shape ids of the segments the engine generated
-for it (in creation order), and the exact 'Chain' value that created it.
+{- | The engine chain, the packed ids of the segment shapes the engine
+generated for it (the full 'ShapeId' words, so stale entries can never
+match a live shape that reuses an index slot), and the exact 'Chain'
+value that created it.
 -}
-data ChainRecord = ChainRecord !ChainId !(VS.Vector ShapeId) !Chain
+data ChainRecord = ChainRecord !ChainId !IS.IntSet !Chain
 
 {- | The store shared by 'Physics' and all its sub-components: the engine
 world plus entity registries for bodies, shapes, joints and chains.
@@ -1285,24 +1289,39 @@ computeValidHull pts = do
     error "polygon points are degenerate (collinear or coincident)"
   pure hull
 
+{- | The engine polygon behind a polygon-backed 'Geometry' constructor —
+one dispatch shared by 'createGeometry' and 'geometryProxy', so the
+shape a 'Geometry' creates and the proxy it queries with can never
+drift. Errors on the point-backed constructors (circle, capsule,
+segment), which both callers handle themselves.
+-}
+geometryPolygon :: Geometry -> IO B2T.Polygon
+geometryPolygon geo = case geo of
+  GeoBox hw hh -> B2Collision.makeBox hw hh
+  GeoRoundedBox hw hh r -> B2Collision.makeRoundedBox hw hh r
+  GeoOffsetBox hw hh center angle -> do
+    rot <- makeRot angle
+    B2Collision.makeOffsetBox hw hh center rot
+  GeoPolygon pts -> do
+    hull <- computeValidHull pts
+    B2Collision.makePolygon hull 0
+  GeoOffsetRoundedPolygon pts center angle r -> do
+    hull <- computeValidHull pts
+    rot <- makeRot angle
+    B2Collision.makeOffsetRoundedPolygon hull center rot r
+  GeoCircle{} -> notPolygon
+  GeoCapsule{} -> notPolygon
+  GeoSegment{} -> notPolygon
+  where
+    notPolygon = error "geometryPolygon: not a polygon-backed Geometry"
+
 -- | Create the engine geometry for a 'Geometry' value on a body.
 createGeometry :: BodyId -> B2T.ShapeDef -> Geometry -> IO ShapeId
 createGeometry b sd geo = case geo of
   GeoCircle c r -> B2Shape.createCircle b sd (B2T.Circle c r)
   GeoCapsule c1 c2 r -> B2Shape.createCapsule b sd (B2T.Capsule c1 c2 r)
   GeoSegment p1 p2 -> B2Shape.createSegment b sd (B2T.Segment p1 p2)
-  GeoBox hw hh -> B2Collision.makeBox hw hh >>= B2Shape.createPolygon b sd
-  GeoRoundedBox hw hh r -> B2Collision.makeRoundedBox hw hh r >>= B2Shape.createPolygon b sd
-  GeoOffsetBox hw hh center angle -> do
-    rot <- makeRot angle
-    B2Collision.makeOffsetBox hw hh center rot >>= B2Shape.createPolygon b sd
-  GeoPolygon pts -> do
-    hull <- computeValidHull pts
-    B2Collision.makePolygon hull 0 >>= B2Shape.createPolygon b sd
-  GeoOffsetRoundedPolygon pts center angle r -> do
-    hull <- computeValidHull pts
-    rot <- makeRot angle
-    B2Collision.makeOffsetRoundedPolygon hull center rot r >>= B2Shape.createPolygon b sd
+  _ -> geometryPolygon geo >>= B2Shape.createPolygon b sd
 
 {- | A shape def with the surface material, density, filter and sensor
 flag carried over from the shape being replaced, if any.
@@ -1408,8 +1427,11 @@ falls back to a chain lookup keyed by that index when a shape isn't found
 in the shape registry, so chain segments now surface in 'Collisions',
 'CollisionsEnd' and 'Impacts', and are visible to the queries
 ('segmentQuery', 'segmentQueryAll', 'aabbQuery', 'pointQuery',
-'containsPointQuery', 'overlapQuery', 'sweepQuery') instead of being
-dropped — in particular 'segmentQuery' no longer returns 'Nothing' just
+'overlapQuery', 'sweepQuery') instead of being dropped
+('containsPointQuery' is the exception: its exact refinement,
+@b2Shape_TestPoint@, reports no containment for chain segments, same as
+for plain 'GeoSegment' shapes, so chains never pass it)
+— in particular 'segmentQuery' no longer returns 'Nothing' just
 because a chain segment is the closest hit. In every case the CHAIN
 entity is reported in the shape slot, not a per-segment entity: a reader
 following 'collisionShapeA' (or 'rayHitShape', etc.) to a 'Shape'
@@ -1434,11 +1456,9 @@ exposes directly.
 chainSegments :: ChainId -> IO (VS.Vector ShapeId)
 chainSegments c = do
   n <- B2Chain.getSegmentCount c
-  if n <= 0 then
-    pure VS.empty
-  else allocaArray n $ \arr -> do
-    got <- B2Chain.getSegments c arr n
-    VS.fromListN got <$> peekArray got arr
+  buf <- VSM.new n
+  got <- VSM.unsafeWith buf $ \arr -> B2Chain.getSegments c arr n
+  VS.take got <$> VS.unsafeFreeze buf
 
 {- | Create a fresh engine chain for a 'Chain' value, destroy the chain it
 replaces (if any) only after the new one exists (so a failed create,
@@ -1476,7 +1496,8 @@ recreateChain sp b ety chain@(Chain _ pts isLoop) old = do
   B2Chain.enableContactEvents c True
   B2Chain.enableHitEvents c True
   forM_ old $ \(ChainRecord c' _ _) -> B2Chain.destroy c'
-  modifyIORef' (spChains sp) (IM.insert ety (ChainRecord c segs chain))
+  let segSet = IS.fromList [fromIntegral w | ShapeId w <- VS.toList segs]
+  modifyIORef' (spChains sp) (IM.insert ety (ChainRecord c segSet chain))
 
 instance (MonadIO m) => ExplSet m (B2Space Chain) where
   explSet sp ety chain@(Chain (Entity bEty) _ _) = liftIO $
@@ -2239,10 +2260,21 @@ data RayHit = RayHit
   }
   deriving (Eq, Show)
 
+{- | The query filter that matches every shape: category 1 (the default
+shape category), full mask — the "just give me everything" argument
+for 'aabbQuery', 'overlapQuery' and friends.
+-}
+everything :: Filter
+everything =
+  Filter
+    { filterCategoryBits = 1
+    , filterMaskBits = maxBound
+    , filterGroupIndex = 0
+    }
+
 {- | Queries match a 'Filter''s category and mask bits against shape
 filters (see 'CollisionFilter'); 'filterGroupIndex' does not apply.
-@Filter 1 maxBound 0@ queries everything (the default shape category
-is 1).
+'everything' queries everything.
 -}
 toQueryFilter :: Filter -> IO B2T.QueryFilter
 toQueryFilter f = do
@@ -2262,7 +2294,7 @@ resolving to the CHAIN entity as the "shape" and its body entity — see
 the 'Chain' haddock.
 -}
 shapeEntities :: B2Space c -> ShapeId -> IO (Maybe (Entity, Entity))
-shapeEntities sp s = do
+shapeEntities sp s@(ShapeId w) = do
   alive <- B2Shape.isValid s
   if not alive then
     pure Nothing
@@ -2279,7 +2311,8 @@ shapeEntities sp s = do
         pure $ case IM.lookup ix chains of
           -- same raw-API index-0 guard as above, checked against the
           -- chain's own recorded segment ids instead of a single shape id
-          Just (ChainRecord _ segs (Chain bodyEty _ _)) | s `VS.elem` segs -> Just (Entity ix, bodyEty)
+          Just (ChainRecord _ segSet (Chain bodyEty _ _))
+            | IS.member (fromIntegral w) segSet -> Just (Entity ix, bodyEty)
           _ -> Nothing
 
 {- | The joint entity behind an engine joint, if it is still alive and
@@ -2354,6 +2387,55 @@ segmentQuery start end fltr = do
         )
         <$> shapeEntities sp (B2T.rayResultShapeId res)
 
+{- | Drive a cast-style engine query ('B2World.castRay',
+'B2World.castShape') with the collect-everything visitor: each reported
+shape becomes a 'RayHit' (hits whose shapes were destroyed since the last
+'stepPhysics' are dropped), sorted nearest-first by 'rayHitFraction'.
+-}
+collectCastHits :: B2Space c -> (FunPtr B2Tags.CastResultFcn -> Ptr () -> IO r) -> IO [RayHit]
+collectCastHits sp run = do
+  found <- newIORef []
+  let visit s point normal frac = do
+        hit <- shapeEntities sp s
+        forM_ hit $ \(shapeEty, bodyEty) ->
+          modifyIORef'
+            found
+            ( RayHit
+                { rayHitShape = shapeEty
+                , rayHitBody = bodyEty
+                , rayHitPoint = point
+                , rayHitNormal = normal
+                , rayHitFraction = frac
+                }
+                :
+            )
+        pure 1
+  _ <- withCastResultFcn visit run
+  sortOn rayHitFraction <$> readIORef found
+
+{- | Drive an overlap-style engine query ('B2World.overlapAABB',
+'B2World.overlapShape'), collecting the deduplicated body entities of
+every reported shape that passes the keep test. The keep test runs
+before entity resolution: it is at most one FFI call while resolution is
+two plus a registry lookup, and (for the exact tests) most broad-phase
+candidates fail it.
+-}
+collectOverlapBodies
+  :: B2Space c
+  -> (ShapeId -> IO Bool)
+  -> (FunPtr B2Tags.OverlapResultFcn -> Ptr () -> IO r)
+  -> IO [Entity]
+collectOverlapBodies sp keep run = do
+  found <- newIORef IS.empty
+  let visit s = do
+        wanted <- keep s
+        when wanted $ do
+          hit <- shapeEntities sp s
+          forM_ hit $ \(_, Entity bodyIx) -> modifyIORef' found (IS.insert bodyIx)
+        pure True
+  _ <- withOverlapResultFcn visit run
+  map Entity . IS.toList <$> readIORef found
+
 {- | Every shape along a world-space segment, sorted nearest-first by
 'rayHitFraction'. Filter semantics match 'segmentQuery'. Unlike
 'segmentQuery', which goes through the engine's @b2World_CastRayClosest@
@@ -2376,28 +2458,8 @@ segmentQueryAll start end fltr = do
   sp :: B2Space Physics <- getStore
   liftIO $ do
     qf <- toQueryFilter fltr
-    found <- newIORef []
-    let
-      Vec2 sx sy = start
-      Vec2 ex ey = end
-      visit s point normal frac = do
-        hit <- shapeEntities sp s
-        forM_ hit $ \(shapeEty, bodyEty) ->
-          modifyIORef'
-            found
-            ( RayHit
-                { rayHitShape = shapeEty
-                , rayHitBody = bodyEty
-                , rayHitPoint = point
-                , rayHitNormal = normal
-                , rayHitFraction = frac
-                }
-                :
-            )
-        pure 1
-    _ <- withCastResultFcn visit $ \fp ctx ->
-      B2World.castRay (spWorld sp) start (Vec2 (ex - sx) (ey - sy)) qf fp ctx
-    sortOn rayHitFraction <$> readIORef found
+    collectCastHits sp $ \fp ctx ->
+      B2World.castRay (spWorld sp) start (vec2Sub end start) qf fp ctx
 
 {- | The body entities whose shapes' broad-phase bounding boxes overlap
 the world-space box spanned by two corners (any order). Broad-phase:
@@ -2414,14 +2476,8 @@ aabbQuery cornerA cornerB fltr = do
   sp :: B2Space Physics <- getStore
   liftIO $ do
     qf <- toQueryFilter fltr
-    found <- newIORef IS.empty
-    let visit s = do
-          hit <- shapeEntities sp s
-          forM_ hit $ \(_, Entity bodyIx) -> modifyIORef' found (IS.insert bodyIx)
-          pure True
-    _ <- withOverlapResultFcn visit $ \fp ctx ->
+    collectOverlapBodies sp (\_ -> pure True) $ \fp ctx ->
       B2World.overlapAABB (spWorld sp) vec2Zero box qf fp ctx
-    map Entity . IS.toList <$> readIORef found
   where
     Vec2 ax ay = cornerA
     Vec2 bx by = cornerB
@@ -2457,71 +2513,28 @@ containsPointQuery point fltr = do
   sp :: B2Space Physics <- getStore
   liftIO $ do
     qf <- toQueryFilter fltr
-    found <- newIORef IS.empty
-    let visit s = do
-          -- the exact test first: most broad-phase candidates only
-          -- overlap by AABB, and testPoint is one FFI call while entity
-          -- resolution is two plus a registry lookup
-          inside <- B2Shape.testPoint s point
-          when inside $ do
-            hit <- shapeEntities sp s
-            forM_ hit $ \(_, Entity bodyIx) -> modifyIORef' found (IS.insert bodyIx)
-          pure True
-    _ <- withOverlapResultFcn visit $ \fp ctx ->
+    collectOverlapBodies sp (`B2Shape.testPoint` point) $ \fp ctx ->
       B2World.overlapAABB (spWorld sp) vec2Zero (AABB point point) qf fp ctx
-    map Entity . IS.toList <$> readIORef found
-
-{- | The point-count range 'GeoPolygon' and 'GeoOffsetRoundedPolygon' need
-in 'geometryProxy': the same bound 'computeValidHull' enforces for shape
-creation, but without computing a hull — GJK proxies don't need one, so a
-degenerate or non-convex point set (which 'computeValidHull' would
-reject) is fine here.
--}
-checkProxyPoints :: VS.Vector Vec2 -> VS.Vector Vec2
-checkProxyPoints pts
-  | n < 3 || n > B2T.maxPolygonVertices =
-      error ("polygon needs 3 to " <> show B2T.maxPolygonVertices <> " points, got " <> show n)
-  | otherwise = pts
-  where
-    n = VS.length pts
 
 {- | A query 'Geometry', interpreted in world space, as a shape proxy
-point cloud and radius, for 'overlapQuery' and 'sweepQuery'. Mirrors
-'createGeometry''s cases, but produces the raw point cloud 'B2World.overlapShape'
-and 'B2World.castShape' want instead of an engine shape:
-
-* 'GeoCircle', 'GeoCapsule' and 'GeoSegment' hand over their defining
-  points directly, circle and capsule carrying their radius onto the
-  proxy.
-* 'GeoBox' and 'GeoRoundedBox' both proxy the 4 corners at
-  @±(halfWidth, halfHeight)@: upstream @b2MakeRoundedBox@ just tacks the
-  radius onto a plain @b2MakeBox@ without insetting the corners, so the
-  rounded variant only differs by radius.
-* 'GeoOffsetBox' transforms those corners by the local center/angle
-  (matching @b2MakeOffsetBox@'s per-corner @b2TransformPoint@); the
-  rotation is rebuilt here as a plain cosine\/sine pair rather than
-  through 'makeRot' (an 'IO' action) to keep this function pure — the
-  two agree since @b2MakeRot@ is exactly @b2ComputeCosSin@.
-* 'GeoPolygon' and 'GeoOffsetRoundedPolygon' get the same point-count
-  range check 'computeValidHull' does (see 'checkProxyPoints'), but no
-  hull: @b2MakeProxy@ copies the point cloud verbatim (capped at
-  'B2T.maxPolygonVertices', which the range check already guarantees),
-  and GJK does not need a precomputed hull.
+point cloud and radius, for 'overlapQuery' and 'sweepQuery'.
+'GeoCircle', 'GeoCapsule' and 'GeoSegment' hand over their defining
+points directly, circle and capsule carrying their radius onto the
+proxy (their created shapes place the same points verbatim); every
+other constructor reads the proxy off the engine polygon
+'geometryPolygon' builds — the same dispatch 'createGeometry' uses —
+so a query with the same 'Geometry' as a created shape tests exactly
+the created volume, including 'computeValidHull' rejecting degenerate
+polygon point sets the same way shape creation does.
 -}
-geometryProxy :: Geometry -> (VS.Vector Vec2, Float)
+geometryProxy :: Geometry -> IO (VS.Vector Vec2, Float)
 geometryProxy geo = case geo of
-  GeoCircle c r -> (VS.singleton c, r)
-  GeoCapsule c1 c2 r -> (VS.fromListN 2 [c1, c2], r)
-  GeoSegment p1 p2 -> (VS.fromListN 2 [p1, p2], 0)
-  GeoBox hw hh -> (boxCorners hw hh, 0)
-  GeoRoundedBox hw hh r -> (boxCorners hw hh, r)
-  GeoOffsetBox hw hh center angle -> (VS.map (place center angle) (boxCorners hw hh), 0)
-  GeoPolygon pts -> (checkProxyPoints pts, 0)
-  GeoOffsetRoundedPolygon pts center angle r ->
-    (VS.map (place center angle) (checkProxyPoints pts), r)
-  where
-    boxCorners hw hh = VS.fromListN 4 [Vec2 (-hw) (-hh), Vec2 hw (-hh), Vec2 hw hh, Vec2 (-hw) hh]
-    place center angle p = vec2Add center (rotateVector (Rot (cos angle) (sin angle)) p)
+  GeoCircle c r -> pure (VS.singleton c, r)
+  GeoCapsule c1 c2 r -> pure (VS.fromListN 2 [c1, c2], r)
+  GeoSegment p1 p2 -> pure (VS.fromListN 2 [p1, p2], 0)
+  _ -> do
+    poly <- geometryPolygon geo
+    pure (B2T.polygonVertices poly, B2T.polygonRadius poly)
 
 {- | The body entities whose shapes actually overlap a query shape, given
 as a world-space 'Geometry' — exact narrow-phase overlap, the
@@ -2537,17 +2550,10 @@ overlapQuery geo fltr = do
   sp :: B2Space Physics <- getStore
   liftIO $ do
     qf <- toQueryFilter fltr
-    found <- newIORef IS.empty
-    let
-      (points, radius) = geometryProxy geo
-      visit s = do
-        hit <- shapeEntities sp s
-        forM_ hit $ \(_, Entity bodyIx) -> modifyIORef' found (IS.insert bodyIx)
-        pure True
-    _ <- withOverlapResultFcn visit $ \fp ctx ->
+    (points, radius) <- geometryProxy geo
+    collectOverlapBodies sp (\_ -> pure True) $ \fp ctx ->
       B2T.withShapeProxy points radius $ \proxy ->
         B2World.overlapShape (spWorld sp) vec2Zero proxy qf fp ctx
-    map Entity . IS.toList <$> readIORef found
 
 {- | Sweep a query shape (a world-space 'Geometry') along a translation
 and collect everything it would hit, sorted nearest-first by
@@ -2567,28 +2573,10 @@ sweepQuery geo translation fltr = do
   sp :: B2Space Physics <- getStore
   liftIO $ do
     qf <- toQueryFilter fltr
-    found <- newIORef []
-    let
-      (points, radius) = geometryProxy geo
-      visit s point normal frac = do
-        hit <- shapeEntities sp s
-        forM_ hit $ \(shapeEty, bodyEty) ->
-          modifyIORef'
-            found
-            ( RayHit
-                { rayHitShape = shapeEty
-                , rayHitBody = bodyEty
-                , rayHitPoint = point
-                , rayHitNormal = normal
-                , rayHitFraction = frac
-                }
-                :
-            )
-        pure 1
-    _ <- withCastResultFcn visit $ \fp ctx ->
+    (points, radius) <- geometryProxy geo
+    collectCastHits sp $ \fp ctx ->
       B2T.withShapeProxy points radius $ \proxy ->
         B2World.castShape (spWorld sp) vec2Zero proxy translation qf fp ctx
-    sortOn rayHitFraction <$> readIORef found
 
 -- * Character mover
 
@@ -2603,21 +2591,6 @@ moverStepIterations = 5
 -- | @sample_character.cpp@'s per-iteration break tolerance on the swept translation.
 moverStepTolerance :: Float
 moverStepTolerance = 0.01
-
-vecAdd :: Vec2 -> Vec2 -> Vec2
-vecAdd (Vec2 ax ay) (Vec2 bx by) = Vec2 (ax + bx) (ay + by)
-
-vecSub :: Vec2 -> Vec2 -> Vec2
-vecSub (Vec2 ax ay) (Vec2 bx by) = Vec2 (ax - bx) (ay - by)
-
-vecScale :: Float -> Vec2 -> Vec2
-vecScale s (Vec2 x y) = Vec2 (s * x) (s * y)
-
-vecDot :: Vec2 -> Vec2 -> Float
-vecDot (Vec2 ax ay) (Vec2 bx by) = ax * bx + ay * by
-
-vecLenSq :: Vec2 -> Float
-vecLenSq v = vecDot v v
 
 {- | A 'B2T.PlaneResult' as a fresh 'B2T.CollisionPlane' for
 "Box2D.Mover": no push limit (the sample's per-shape @maxPush@ user
@@ -2687,33 +2660,37 @@ moveCharacter c1 c2 radius pos0 target vel0 fltr = do
   liftIO $ do
     qf <- toQueryFilter fltr
     let capsule = B2T.Capsule c1 c2 radius
-    -- (count, planes gathered so far this iteration); reset before every
-    -- 'B2World.collideMover' call so the FunPtr below can be wrapped once
-    -- for the whole call instead of once per iteration.
-    gatherRef <- newIORef (0 :: Int, [] :: [B2T.CollisionPlane])
+    -- planes land in a buffer reused across iterations (reset before
+    -- every 'B2World.collideMover' call), so the FunPtr below can be
+    -- wrapped once for the whole call instead of once per iteration
+    -- and no per-plane list is built.
+    buf <- VSM.new planeCapacity
+    countRef <- newIORef (0 :: Int)
     let visit _shapeId pr = do
-          when (toBool (B2T.planeResultHit pr)) $
-            modifyIORef' gatherRef $ \(n, ps) ->
-              if n >= planeCapacity then (n, ps) else (n + 1, mkCollisionPlane pr : ps)
+          when (toBool (B2T.planeResultHit pr)) $ do
+            n <- readIORef countRef
+            when (n < planeCapacity) $ do
+              VSM.write buf n (mkCollisionPlane pr)
+              writeIORef countRef (n + 1)
           pure True
     withPlaneResultFcn visit $ \fp ctx -> do
       let
         gatherPlanes pos = do
-          writeIORef gatherRef (0, [])
+          writeIORef countRef 0
           _ <- B2World.collideMover (spWorld sp) pos capsule qf fp ctx
-          (_, ps) <- readIORef gatherRef
-          pure (VS.fromList (reverse ps))
+          n <- readIORef countRef
+          VS.freeze (VSM.take n buf)
 
         step i pos lastPlanes
           | i >= moverStepIterations = pure (pos, lastPlanes)
           | otherwise = do
               planes <- gatherPlanes pos
-              (translation, planes', _iters) <- B2Mover.solvePlanes (vecSub target pos) planes
+              (translation, planes', _iters) <- B2Mover.solvePlanes (vec2Sub target pos) planes
               fraction <- B2World.castMover (spWorld sp) pos capsule translation qf
               let
-                delta = vecScale fraction translation
-                pos' = vecAdd pos delta
-              if vecLenSq delta < moverStepTolerance * moverStepTolerance then
+                delta = vec2Scale fraction translation
+                pos' = vec2Add pos delta
+              if vec2LengthSquared delta < moverStepTolerance * moverStepTolerance then
                 pure (pos', planes')
               else
                 step (i + 1) pos' planes'
@@ -2850,26 +2827,46 @@ restoreWorld (Snapshot fp size) = do
 
 -- * Collisions
 
+{- | A contact manifold: the surface normal and the world contact
+points. Box2D uses speculative contacts, so a begin-touch manifold can
+contain slightly separated points (positive separation) and can even
+momentarily have no points.
+-}
+data ContactManifold = ContactManifold
+  { contactNormal :: !WVec
+  -- ^ Contact normal, pointing from A to B.
+  , contactPoints :: ![WVec]
+  -- ^ World contact points, up to 2 in 2D.
+  }
+  deriving (Eq, Show)
+
 {- | A contact from the last 'stepPhysics': the shapes involved, the
 bodies they hang off and — for begin-touch events — the contact
-manifold. Box2D uses speculative contacts, so a begin-touch manifold
-can contain slightly separated points (positive separation) and can
-even momentarily be empty.
+manifold. 'CollisionsEnd' events never carry a manifold; a begin-touch
+event lacks one only when its contact died between the step and the
+read (a shape destroyed after the step).
+
+Equality compares the participants only, ignoring the manifold, so a
+begin-touch value and the end-touch value of the same contact compare
+equal — active-contact bookkeeping can pair them up with e.g.
+'Data.List.delete'.
 -}
 data Collision = Collision
   { collisionBodyA :: !Entity
   , collisionShapeA :: !Entity
   , collisionBodyB :: !Entity
   , collisionShapeB :: !Entity
-  , collisionNormal :: !WVec
-  -- ^ Contact normal, pointing from A to B (zero for 'CollisionsEnd' events).
-  , collisionPoints :: ![WVec]
-  -- ^ World contact points, up to 2 in 2D (empty for 'CollisionsEnd').
+  , collisionManifold :: !(Maybe ContactManifold)
   }
-  deriving (Eq, Show)
+  deriving (Show)
+
+instance Eq Collision where
+  a == b =
+    (collisionBodyA a, collisionShapeA a, collisionBodyB a, collisionShapeB a)
+      == (collisionBodyA b, collisionShapeA b, collisionBodyB b, collisionShapeB b)
 
 {- | The shape/body entities behind a contact's two shape ids, if both
-are still alive and registered; the manifold fields are left zero/empty.
+are still alive and registered; no manifold.
 -}
 toCollision :: B2Space c -> ShapeId -> ShapeId -> IO (Maybe Collision)
 toCollision sp sA sB = do
@@ -2878,13 +2875,13 @@ toCollision sp sA sB = do
   pure $ do
     (sa, ba) <- ma
     (sb, bb) <- mb
-    Just (Collision ba sa bb sb vec2Zero [])
+    Just (Collision ba sa bb sb Nothing)
 
 {- | 'toCollision' for a begin-touch event, with the contact manifold
 filled in: the normal plus the world position of each manifold point
 (body A's world center of mass plus the point's A-side anchor). If the
 contact is no longer valid (a shape was destroyed after the step) the
-manifold fields stay zero/empty.
+manifold stays 'Nothing'.
 -}
 toBeginCollision :: B2Space c -> B2T.ContactBeginTouchEvent -> IO (Maybe Collision)
 toBeginCollision sp ev = do
@@ -2899,12 +2896,23 @@ toBeginCollision sp ev = do
     -- orientation
     mc <- toCollision sp (B2T.contactDataShapeIdA cd) (B2T.contactDataShapeIdB cd)
     forM mc $ \c -> do
-      bodyA <- B2Shape.getBody (B2T.contactDataShapeIdA cd)
-      comA <- B2Body.getWorldCenter bodyA
       let
         m = B2T.contactDataManifold cd
-        pts = map (vecAdd comA . B2T.manifoldPointAnchorA) (VS.toList (B2T.manifoldPoints m))
-      pure c{collisionNormal = B2T.manifoldNormal m, collisionPoints = pts}
+        anchors = B2T.manifoldPoints m
+      pts <-
+        if VS.null anchors then
+          pure []
+        else do
+          -- body A's world center of mass turns the manifold's A-side
+          -- anchors into world points; its id comes from the body
+          -- registry (toCollision just resolved the entity) rather
+          -- than a getBody FFI round-trip
+          bodies <- readIORef (spBodies sp)
+          let Entity bIx = collisionBodyA c
+          bodyA <- maybe (B2Shape.getBody (B2T.contactDataShapeIdA cd)) pure (IM.lookup bIx bodies)
+          comA <- B2Body.getWorldCenter bodyA
+          pure (map (vec2Add comA . B2T.manifoldPointAnchorA) (VS.toList anchors))
+      pure c{collisionManifold = Just (ContactManifold (B2T.manifoldNormal m) pts)}
 
 {- | The begin-touch contacts of the last 'stepPhysics', a read-only
 global: @Collisions touches <- get global@ after stepping. Shapes
@@ -2933,8 +2941,8 @@ counterpart of 'Collisions' for contacts that stopped touching. Events
 whose shapes were destroyed since the step are dropped; this bites
 harder here than for begin-touch, since destroying a shape mid-contact
 drops its end event — clean up any per-contact bookkeeping when
-destroying shapes. End events carry no manifold: 'collisionNormal' is
-zero and 'collisionPoints' is empty.
+destroying shapes. End events carry no manifold ('collisionManifold'
+is 'Nothing').
 -}
 newtype CollisionsEnd = CollisionsEnd [Collision]
   deriving (Show)

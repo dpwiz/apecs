@@ -123,6 +123,7 @@ module Apecs.Box3D
 
     -- * Queries
   , RayHit (..)
+  , everything
   , segmentQuery
   , segmentQueryAll
   , aabbQuery
@@ -145,6 +146,7 @@ module Apecs.Box3D
 
     -- * Collisions
   , Collision (..)
+  , ContactManifold (..)
   , Collisions (..)
   , CollisionsEnd (..)
   , Impact (..)
@@ -167,7 +169,7 @@ module Apecs.Box3D
 
 import Apecs
 import Apecs.Core
-import Control.Monad (filterM, forM, forM_, when)
+import Control.Monad (filterM, forM, forM_, unless, when)
 import Control.Monad.IO.Class (MonadIO)
 import Data.IORef
 import Data.Int (Int32)
@@ -177,14 +179,15 @@ import Data.IntSet qualified as IS
 import Data.List (sortOn)
 import Data.Maybe (catMaybes)
 import Data.Vector.Storable qualified as VS
+import Data.Vector.Storable.Mutable qualified as VSM
 import Data.Vector.Unboxed qualified as U
 import Data.Word (Word8)
 import Foreign.C.String (peekCString, withCString)
 import Foreign.Concurrent qualified as Concurrent
 import Foreign.ForeignPtr (ForeignPtr, withForeignPtr)
+import Foreign.Marshal.Array (peekArray)
 import Foreign.Marshal.Utils (fromBool, toBool, with, withMany)
-import Foreign.Ptr (Ptr, castPtr, nullFunPtr, nullPtr)
-import Foreign.Storable (peek)
+import Foreign.Ptr (FunPtr, Ptr, castPtr, nullFunPtr, nullPtr)
 
 import Box3D.Body qualified as B3Body
 import Box3D.BoxMesh qualified as B3BoxMesh
@@ -206,7 +209,7 @@ import Box3D.Hull qualified as B3Hull
 import Box3D.Id (BodyId, JointId, ShapeId, WorldId)
 import Box3D.Joint qualified as B3Joint
 import Box3D.MathFunctions (computeQuatBetweenUnitVectors)
-import Box3D.MathTypes (AABB (..), Matrix3 (..), Quat (..), Transform (..), Vec3 (..), quatIdentity, vec3Zero)
+import Box3D.MathTypes (AABB (..), Matrix3 (..), Quat (..), Transform (..), Vec3 (..), quatIdentity, vec3Add, vec3LengthSquared, vec3Scale, vec3Sub, vec3Zero)
 import Box3D.Mesh qualified as B3Mesh
 import Box3D.Mover qualified as B3Mover
 import Box3D.PlatformMesh qualified as B3PlatformMesh
@@ -1259,7 +1262,14 @@ it, so the same 'Mesh' can be shared between shapes at different
 per-shape scales. The underlying engine mesh is destroyed automatically
 once no 'Shape' (and no user binding) references it any more.
 -}
-newtype Mesh = Mesh (ForeignPtr MeshData)
+data Mesh = Mesh !(ForeignPtr MeshData) !Int
+  -- ^ The engine mesh data plus its per-shape material slot count, tracked
+  -- here because the binding exposes no way to read it back off the pointer
+  -- and 'compoundFromChildren' needs it to reject multi-material children
+  -- before the engine's own assertion aborts the process. The count
+  -- shadows engine formulas (mesh.c's max-index+1 and the grid clamp);
+  -- a @materialCount@ accessor in box-nd (NOTES-upstream §D) would
+  -- delete it and this reverts to a plain newtype.
   deriving (Eq, Show)
 
 {- | Shared height-field collision data, produced by 'gridHeightField' and
@@ -1392,7 +1402,7 @@ createGeometry b sd geo = case geo of
   GeoCapsule c1 c2 r -> B3Shape.createCapsule b sd (B3T.Capsule c1 c2 r)
   GeoBox c half -> createHullShape "GeoBox" b sd (boxCorners c half)
   GeoHull pts -> createHullShape "GeoHull" b sd pts
-  GeoMesh (Mesh fp) scale -> withForeignPtr fp $ \p -> B3Shape.createMesh b sd p scale
+  GeoMesh (Mesh fp _) scale -> withForeignPtr fp $ \p -> B3Shape.createMesh b sd p scale
   GeoHeightField (HeightField fp) -> withForeignPtr fp $ \p -> B3Shape.createHeightField b sd p
   GeoReadyHull (Hull fp) -> withForeignPtr fp $ \p -> B3Shape.createHull b sd p
   GeoCompound (Compound fp) -> do
@@ -1409,8 +1419,10 @@ createGeometry b sd geo = case geo of
 the level-loading path, where the procedural generators ('boxMesh',
 'gridMesh', ...) are the test-scene path. Needs at least 3 vertices and
 vertex indices grouped 3 at a time, one triangle each, wound the same
-way as the generators' own meshes; an optional material index per
-triangle indexes into a shape's per-shape material slots (see
+way as the generators' own meshes — an index count that is not a
+multiple of 3, or an index outside the vertex range, is rejected here
+rather than read out of bounds by the engine; an optional material
+index per triangle indexes into a shape's per-shape material slots (see
 'B3Shape.setMeshMaterial') and, if given, must have exactly one entry
 per triangle — a mismatched count is treated as invalid input rather
 than read out of bounds. 'MeshOptions' controls vertex welding, the
@@ -1437,25 +1449,34 @@ meshFromData
   -> MeshOptions
   -> IO (Mesh, VS.Vector Int32)
 meshFromData vertices indices materials opts = do
+  -- the engine reads @vertices.data[index]@ with no bounds information, so
+  -- malformed indices must be caught here, not left to a heap over-read
+  when (VS.length indices `rem` 3 /= 0) $
+    error ("meshFromData: indices length must be a multiple of 3, got " <> show (VS.length indices))
+  unless (VS.all (\i -> i >= 0 && fromIntegral i < VS.length vertices) indices) $
+    error ("meshFromData: triangle index out of bounds for " <> show (VS.length vertices) <> " vertices")
   (p, degenerate) <- B3Geometry.createMeshFromData vertices indices materials opts
-  when (p == nullPtr) $
-    error "meshFromData: the engine rejected the parameters (returned a null pointer)"
-  fp <- Concurrent.newForeignPtr p (B3Mesh.destroy p)
-  pure (Mesh fp, degenerate)
+  fp <- wrapGenerated "meshFromData" B3Mesh.destroy (pure p)
+  let materialCount = case materials of
+        Just m | not (VS.null m) -> 1 + fromIntegral (VS.maximum m)
+        _ -> 1
+  pure (Mesh fp materialCount, degenerate)
 
 {- | Height-field collision data built from your own grid samples — the
 level-loading path, where 'gridHeightField'\/'waveHeightField' are the
-test-scene path. Needs at least one height sample, row-major
-@countX * countZ@ values (must not be empty); an optional material
-index per grid cell (@(countX - 1) * (countZ - 1)@ entries), where
-@0xFF@ marks a hole shapes fall through, same as the procedural height
+test-scene path. Needs at least 2 grid lines per axis and row-major
+@countX * countZ@ height values; an optional material index per grid
+cell (exactly @(countX - 1) * (countZ - 1)@ entries), where @0xFF@
+marks a hole shapes fall through, same as the procedural height
 fields'. 'HeightFieldOptions' controls the height range used for
 quantization (share it between adjacent tiles so they line up flush)
 and winding; start from 'defaultHeightFieldOptions'. The engine
 quantizes the heights into its own storage, so the input vectors can
 be reused or dropped right after this returns. Errors, naming this
-function, if the engine rejects the parameters (currently just an
-empty height vector).
+function, on mismatched grid\/vector sizes — the engine reads
+@countX * countZ@ heights (and the per-cell materials) with no bounds
+information, so mismatches must be caught here, not left to a heap
+over-read — or if the engine rejects the parameters.
 -}
 heightFieldFromData
   :: VS.Vector Float
@@ -1470,7 +1491,14 @@ heightFieldFromData
   -- ^ Grid lines along the z-axis.
   -> HeightFieldOptions
   -> IO HeightField
-heightFieldFromData heights materials scale countX countZ opts =
+heightFieldFromData heights materials scale countX countZ opts = do
+  when (countX < 2 || countZ < 2) $
+    error ("heightFieldFromData: needs at least 2 grid lines per axis, got " <> show countX <> "x" <> show countZ)
+  when (VS.length heights /= countX * countZ) $
+    error ("heightFieldFromData: expected " <> show (countX * countZ) <> " height samples, got " <> show (VS.length heights))
+  forM_ materials $ \m ->
+    when (VS.length m /= (countX - 1) * (countZ - 1)) $
+      error ("heightFieldFromData: expected " <> show ((countX - 1) * (countZ - 1)) <> " cell materials, got " <> show (VS.length m))
   HeightField
     <$> wrapGenerated
       "heightFieldFromData"
@@ -1493,9 +1521,10 @@ constructor — on the 'Shape'\'s wrapping components (surface material,
 friction, restitution), not on the geometry itself. A 'CompoundMesh'
 likewise gets exactly one material slot; a 'Mesh' built with more than one
 per-triangle material (e.g. 'gridMesh' called with a material count above
-one, or 'meshFromData' given per-triangle materials) is not supported as a
-compound child and will make the engine's own material-count assertion
-fail.
+one, or 'meshFromData' given per-triangle material indices above zero) is
+not supported as a compound child, and 'compoundFromChildren' rejects it
+with an error rather than letting the engine's own material-count
+assertion abort the process.
 -}
 data CompoundChild
   = -- | Center and radius, as 'GeoSphere'.
@@ -1510,7 +1539,8 @@ data CompoundChild
     CompoundHull Hull Transform
   | {- | Shared mesh data (see 'GeoMesh'\/'boxMesh'\/'meshFromData' etc.)
     placed by a local transform and a per-child scale. Only
-    single-material meshes are supported; see the note above.
+    single-material meshes are supported ('compoundFromChildren' errors
+    on the rest); see the note above.
     -}
     CompoundMesh Mesh Transform Vec3
   deriving (Eq, Show)
@@ -1529,6 +1559,11 @@ compoundFromChildren :: [CompoundChild] -> IO Compound
 compoundFromChildren children = do
   when (null children) $
     error "compoundFromChildren: empty child list"
+  -- the compound child def has one material slot; a multi-material mesh
+  -- would trip the engine's material-count assertion and abort the process
+  forM_ [mats | CompoundMesh (Mesh _ mats) _ _ <- children] $ \mats ->
+    when (mats /= 1) $
+      error ("compoundFromChildren: a 'CompoundMesh' child has " <> show mats <> " material slots; only single-material meshes are supported")
   material <- B3T.defaultSurfaceMaterial
   let
     capsules =
@@ -1542,7 +1577,7 @@ compoundFromChildren children = do
         | CompoundSphere c r <- children
         ]
     hullChildren = [(fp, tr) | CompoundHull (Hull fp) tr <- children]
-    meshChildren = [(fp, tr, scale) | CompoundMesh (Mesh fp) tr scale <- children]
+    meshChildren = [(fp, tr, scale) | CompoundMesh (Mesh fp _) tr scale <- children]
   withMany withForeignPtr (map fst hullChildren) $ \hullPtrs ->
     withMany withForeignPtr (map (\(fp, _, _) -> fp) meshChildren) $ \meshPtrs ->
       with material $ \pMaterial -> do
@@ -1557,10 +1592,11 @@ compoundFromChildren children = do
               [ B3Geometry.CompoundMeshDef mp tr scale pMaterial 1
               | ((_, tr, scale), mp) <- zip meshChildren meshPtrs
               ]
-        p <- B3Geometry.createCompoundFromData capsules hulls meshes spheres
-        when (p == nullPtr) $
-          error "compoundFromChildren: the engine rejected the parameters (returned a null pointer)"
-        Compound <$> Concurrent.newForeignPtr p (B3Compound.destroy p)
+        Compound
+          <$> wrapGenerated
+            "compoundFromChildren"
+            B3Compound.destroy
+            (B3Geometry.createCompoundFromData capsules hulls meshes spheres)
 
 -- Static geometry generators ------------------------------------------------
 
@@ -1572,7 +1608,7 @@ this small.
 -}
 boxMesh :: BVec -> Vec3 -> IO Mesh
 boxMesh center halfExtents =
-  Mesh <$> wrapGenerated "boxMesh" B3Mesh.destroy (B3BoxMesh.create center halfExtents True)
+  (`Mesh` 1) <$> wrapGenerated "boxMesh" B3Mesh.destroy (B3BoxMesh.create center halfExtents True)
 
 {- | A hollow box mesh: the same box as 'boxMesh' but with every triangle's
 winding reversed, so its inside faces are solid and its outside is
@@ -1580,7 +1616,7 @@ open — a box-shaped room instead of a box-shaped solid.
 -}
 hollowBoxMesh :: BVec -> Vec3 -> IO Mesh
 hollowBoxMesh center halfExtents =
-  Mesh <$> wrapGenerated "hollowBoxMesh" B3Mesh.destroy (B3HollowBoxMesh.create center halfExtents)
+  (`Mesh` 1) <$> wrapGenerated "hollowBoxMesh" B3Mesh.destroy (B3HollowBoxMesh.create center halfExtents)
 
 {- | A platform mesh: a truncated pyramid (frustum) centered locally on
 'center', with a 'topWidth' square face at +height\/2 and a
@@ -1588,7 +1624,7 @@ hollowBoxMesh center halfExtents =
 -}
 platformMesh :: BVec -> Float -> Float -> Float -> IO Mesh
 platformMesh center height topWidth bottomWidth =
-  Mesh <$> wrapGenerated "platformMesh" B3Mesh.destroy (B3PlatformMesh.create center height topWidth bottomWidth)
+  (`Mesh` 1) <$> wrapGenerated "platformMesh" B3Mesh.destroy (B3PlatformMesh.create center height topWidth bottomWidth)
 
 {- | A flat grid mesh of @xCount * zCount@ cells (each 'cellWidth' wide) in
 the local XZ plane, centered on the origin. 'materialCount' round-robins
@@ -1603,7 +1639,10 @@ binding does not expose the choice.
 -}
 gridMesh :: Int -> Int -> Float -> Int -> IO Mesh
 gridMesh xCount zCount cellWidth materialCount =
-  Mesh <$> wrapGenerated "gridMesh" B3Mesh.destroy (B3GridMesh.create xCount zCount cellWidth materialCount True)
+  -- the engine stores max(1, min(materialCount, triangles)) material
+  -- slots; a grid of x*z cells has 2 triangles per cell
+  (`Mesh` max 1 (min materialCount (2 * xCount * zCount)))
+    <$> wrapGenerated "gridMesh" B3Mesh.destroy (B3GridMesh.create xCount zCount cellWidth materialCount True)
 
 {- | A torus mesh centered on the origin, its main ring lying in the local
 XY plane (the tube's axis is local Z). 'radialResolution' is the number
@@ -1614,7 +1653,7 @@ of segments around the tube's circular cross-section and
 -}
 torusMesh :: Int -> Int -> Float -> Float -> IO Mesh
 torusMesh radialResolution tubularResolution radius thickness =
-  Mesh <$> wrapGenerated "torusMesh" B3Mesh.destroy (B3TorusMesh.create radialResolution tubularResolution radius thickness)
+  (`Mesh` 1) <$> wrapGenerated "torusMesh" B3Mesh.destroy (B3TorusMesh.create radialResolution tubularResolution radius thickness)
 
 {- | A wavy grid mesh like 'gridMesh', with the vertex at row @ix@, column
 @iz@ (0-based, along local x and z respectively) displaced to height
@@ -1627,7 +1666,7 @@ for 'gridMesh'.
 -}
 waveMesh :: Int -> Int -> Float -> Float -> Float -> Float -> IO Mesh
 waveMesh xCount zCount cellWidth amplitude rowFrequency columnFrequency =
-  Mesh
+  (`Mesh` 1)
     <$> wrapGenerated
       "waveMesh"
       B3Mesh.destroy
@@ -2520,11 +2559,23 @@ data RayHit = RayHit
   }
   deriving (Eq, Show)
 
+{- | The query filter that matches every shape: all category and mask
+bits set — the "just give me everything" argument for 'aabbQuery',
+'containsPointQuery' and friends.
+-}
+everything :: Filter
+everything =
+  Filter
+    { filterCategoryBits = maxBound
+    , filterMaskBits = maxBound
+    , filterGroupIndex = 0
+    }
+
 {- | Queries match a 'Filter''s category and mask bits against shape
 filters (see 'CollisionFilter'); 'filterGroupIndex' does not apply.
-@Filter maxBound maxBound 0@ queries everything. Note Box3D's default
-shape category is /all bits set/ (unlike Box2D's category 1), so any
-query mask matches shapes with default filters — give shapes explicit
+'everything' queries everything. Note Box3D's default shape category
+is /all bits set/ (unlike Box2D's category 1), so any query mask
+matches shapes with default filters — give shapes explicit
 'CollisionFilter' categories to partition them for queries.
 -}
 toQueryFilter :: Filter -> IO B3T.QueryFilter
@@ -2627,6 +2678,54 @@ segmentQuery start end fltr = do
         )
         <$> shapeEntities sp (B3T.rayResultShapeId res)
 
+{- | Drive a cast-style engine query ('B3World.castRay') with the
+collect-everything visitor: each reported shape becomes a 'RayHit'
+(hits whose shapes were destroyed since the last 'stepPhysics' are
+dropped), sorted nearest-first by 'rayHitFraction'.
+-}
+collectCastHits :: B3Space c -> (FunPtr B3Tags.CastResultFcn -> Ptr () -> IO r) -> IO [RayHit]
+collectCastHits sp run = do
+  found <- newIORef []
+  let visit s point normal frac _matId _triangleIx _childIx = do
+        hit <- shapeEntities sp s
+        forM_ hit $ \(shapeEty, bodyEty) ->
+          modifyIORef'
+            found
+            ( RayHit
+                { rayHitShape = shapeEty
+                , rayHitBody = bodyEty
+                , rayHitPoint = point
+                , rayHitNormal = normal
+                , rayHitFraction = frac
+                }
+                :
+            )
+        pure 1
+  _ <- withCastResultFcn visit run
+  sortOn rayHitFraction <$> readIORef found
+
+{- | Drive an overlap-style engine query ('B3World.overlapAABB'),
+collecting the deduplicated body entities of every reported shape that
+passes the keep test. The keep test runs before entity resolution: it
+is at most one FFI call while resolution is two plus a registry
+lookup, and (for the exact tests) most broad-phase candidates fail it.
+-}
+collectOverlapBodies
+  :: B3Space c
+  -> (ShapeId -> IO Bool)
+  -> (FunPtr B3Tags.OverlapResultFcn -> Ptr () -> IO r)
+  -> IO [Entity]
+collectOverlapBodies sp keep run = do
+  found <- newIORef IS.empty
+  let visit s = do
+        wanted <- keep s
+        when wanted $ do
+          hit <- shapeEntities sp s
+          forM_ hit $ \(_, Entity bodyIx) -> modifyIORef' found (IS.insert bodyIx)
+        pure True
+  _ <- withOverlapResultFcn visit run
+  map Entity . IS.toList <$> readIORef found
+
 {- | Every shape along a world-space segment, sorted nearest-first by
 'rayHitFraction'. Filter semantics match 'segmentQuery'. Unlike
 'segmentQuery', which goes through the engine's @b3World_CastRayClosest@
@@ -2649,28 +2748,8 @@ segmentQueryAll start end fltr = do
   sp :: B3Space Physics <- getStore
   liftIO $ do
     qf <- toQueryFilter fltr
-    found <- newIORef []
-    let
-      Vec3 sx sy sz = start
-      Vec3 ex ey ez = end
-      visit s point normal frac _matId _triangleIx _childIx = do
-        hit <- shapeEntities sp s
-        forM_ hit $ \(shapeEty, bodyEty) ->
-          modifyIORef'
-            found
-            ( RayHit
-                { rayHitShape = shapeEty
-                , rayHitBody = bodyEty
-                , rayHitPoint = point
-                , rayHitNormal = normal
-                , rayHitFraction = frac
-                }
-                :
-            )
-        pure 1
-    _ <- withCastResultFcn visit $ \fp ctx ->
-      B3World.castRay (spWorld sp) start (Vec3 (ex - sx) (ey - sy) (ez - sz)) qf fp ctx
-    sortOn rayHitFraction <$> readIORef found
+    collectCastHits sp $ \fp ctx ->
+      B3World.castRay (spWorld sp) start (vec3Sub end start) qf fp ctx
 
 {- | The body entities whose shapes' broad-phase bounding boxes overlap
 the world-space box spanned by two corners (any order). Broad-phase:
@@ -2687,14 +2766,8 @@ aabbQuery cornerA cornerB fltr = do
   sp :: B3Space Physics <- getStore
   liftIO $ do
     qf <- toQueryFilter fltr
-    found <- newIORef IS.empty
-    let visit s = do
-          hit <- shapeEntities sp s
-          forM_ hit $ \(_, Entity bodyIx) -> modifyIORef' found (IS.insert bodyIx)
-          pure True
-    _ <- withOverlapResultFcn visit $ \fp ctx ->
+    collectOverlapBodies sp (\_ -> pure True) $ \fp ctx ->
       B3World.overlapAABB (spWorld sp) box qf fp ctx
-    map Entity . IS.toList <$> readIORef found
   where
     Vec3 ax ay az = cornerA
     Vec3 bx by bz = cornerB
@@ -2730,19 +2803,8 @@ containsPointQuery point fltr = do
   sp :: B3Space Physics <- getStore
   liftIO $ do
     qf <- toQueryFilter fltr
-    found <- newIORef IS.empty
-    let visit s = do
-          -- the exact test first: most broad-phase candidates only
-          -- overlap by AABB, and testPoint is one FFI call while entity
-          -- resolution is two plus a registry lookup
-          inside <- B3Shape.testPoint s point
-          when inside $ do
-            hit <- shapeEntities sp s
-            forM_ hit $ \(_, Entity bodyIx) -> modifyIORef' found (IS.insert bodyIx)
-          pure True
-    _ <- withOverlapResultFcn visit $ \fp ctx ->
+    collectOverlapBodies sp (`B3Shape.testPoint` point) $ \fp ctx ->
       B3World.overlapAABB (spWorld sp) (AABB point point) qf fp ctx
-    map Entity . IS.toList <$> readIORef found
 
 -- * Character mover
 
@@ -2757,21 +2819,6 @@ moverStepIterations = 5
 -- | @sample.cpp@'s per-iteration break tolerance on the swept translation — identical to the 2D sample.
 moverStepTolerance :: Float
 moverStepTolerance = 0.01
-
-vecAdd :: Vec3 -> Vec3 -> Vec3
-vecAdd (Vec3 ax ay az) (Vec3 bx by bz) = Vec3 (ax + bx) (ay + by) (az + bz)
-
-vecSub :: Vec3 -> Vec3 -> Vec3
-vecSub (Vec3 ax ay az) (Vec3 bx by bz) = Vec3 (ax - bx) (ay - by) (az - bz)
-
-vecScale :: Float -> Vec3 -> Vec3
-vecScale s (Vec3 x y z) = Vec3 (s * x) (s * y) (s * z)
-
-vecDot :: Vec3 -> Vec3 -> Float
-vecDot (Vec3 ax ay az) (Vec3 bx by bz) = ax * bx + ay * by + az * bz
-
-vecLenSq :: Vec3 -> Float
-vecLenSq v = vecDot v v
 
 {- | A 'B3T.PlaneResult' as a fresh 'B3T.CollisionPlane' for
 "Box3D.Mover": no push limit (the sample's per-shape @maxPush@ user
@@ -2849,35 +2896,36 @@ moveCharacter c1 c2 radius pos0 target vel0 fltr = do
   liftIO $ do
     qf <- toQueryFilter fltr
     let capsule = B3T.Capsule c1 c2 radius
-    -- (count, planes gathered so far this iteration); reset before every
-    -- 'B3World.collideMover' call so the FunPtr below can be wrapped once
-    -- for the whole call instead of once per iteration.
-    gatherRef <- newIORef (0 :: Int, [] :: [B3T.CollisionPlane])
+    -- planes land in a buffer reused across iterations (reset before
+    -- every 'B3World.collideMover' call), so the FunPtr below can be
+    -- wrapped once for the whole call instead of once per iteration
+    -- and no per-plane list is built.
+    buf <- VSM.new planeCapacity
+    countRef <- newIORef (0 :: Int)
     let visit _shapeId prs = do
-          modifyIORef' gatherRef $ \(n, ps) ->
-            foldl'
-              (\(n', ps') pr -> if n' >= planeCapacity then (n', ps') else (n' + 1, mkCollisionPlane pr : ps'))
-              (n, ps)
-              (VS.toList prs)
+          n0 <- readIORef countRef
+          let room = VS.take (planeCapacity - n0) prs
+          VS.imapM_ (\i pr -> VSM.write buf (n0 + i) (mkCollisionPlane pr)) room
+          writeIORef countRef (n0 + VS.length room)
           pure True
     withPlaneResultFcn visit $ \fp ctx -> do
       let
         gatherPlanes pos = do
-          writeIORef gatherRef (0, [])
+          writeIORef countRef 0
           _ <- B3World.collideMover (spWorld sp) pos capsule qf fp ctx
-          (_, ps) <- readIORef gatherRef
-          pure (VS.fromList (reverse ps))
+          n <- readIORef countRef
+          VS.freeze (VSM.take n buf)
 
         step i pos lastPlanes
           | i >= moverStepIterations = pure (pos, lastPlanes)
           | otherwise = do
               planes <- gatherPlanes pos
-              (translation, planes', _iters) <- B3Mover.solvePlanes (vecSub target pos) planes
+              (translation, planes', _iters) <- B3Mover.solvePlanes (vec3Sub target pos) planes
               fraction <- B3World.castMover (spWorld sp) pos capsule translation qf nullFunPtr nullPtr
               let
-                delta = vecScale fraction translation
-                pos' = vecAdd pos delta
-              if vecLenSq delta < moverStepTolerance * moverStepTolerance then
+                delta = vec3Scale fraction translation
+                pos' = vec3Add pos delta
+              if vec3LengthSquared delta < moverStepTolerance * moverStepTolerance then
                 pure (pos', planes')
               else
                 step (i + 1) pos' planes'
@@ -2967,28 +3015,50 @@ validateRecording (Recording p) workerCount = liftIO $ do
 
 -- * Collisions
 
+{- | A contact manifold: the surface normal and the world contact
+points. Box3D uses speculative contacts, so a begin-touch manifold can
+contain slightly separated points (positive separation) and can even
+momentarily have no points.
+-}
+data ContactManifold = ContactManifold
+  { contactNormal :: !WVec
+  -- ^ Contact normal, pointing from A to B.
+  , contactPoints :: ![WVec]
+  -- ^ World contact points, up to 4 per 3D manifold.
+  }
+  deriving (Eq, Show)
+
 {- | A contact from the last 'stepPhysics': the shapes involved, the
 bodies they hang off and — for begin-touch events — the contact
-manifold. Box3D uses speculative contacts, so a begin-touch manifold
-can contain slightly separated points (positive separation) and can
-even momentarily be empty. Mesh and height-field contacts can carry
-several manifolds; only the first is reported here — reach for
-@Box3D.Contact.getData@ via the raw engine ids for the rest.
+manifolds; convex-pair contacts carry one, mesh and height-field
+contacts can carry several (one per touched region). 'CollisionsEnd'
+events never carry manifolds; a begin-touch event lacks them when its
+contact died between the step and the read (a shape destroyed after
+the step) — and, unlike 2D's 'Maybe' encoding, an empty list also
+covers the rare live speculative contact the engine reports with zero
+manifolds, so the two cases are not distinguishable here.
+
+Equality compares the participants only, ignoring the manifolds, so a
+begin-touch value and the end-touch value of the same contact compare
+equal — active-contact bookkeeping can pair them up with e.g.
+'Data.List.delete'.
 -}
 data Collision = Collision
   { collisionBodyA :: !Entity
   , collisionShapeA :: !Entity
   , collisionBodyB :: !Entity
   , collisionShapeB :: !Entity
-  , collisionNormal :: !WVec
-  -- ^ Contact normal, pointing from A to B (zero for 'CollisionsEnd' events).
-  , collisionPoints :: ![WVec]
-  -- ^ World contact points, up to 4 per 3D manifold (empty for 'CollisionsEnd').
+  , collisionManifolds :: ![ContactManifold]
   }
-  deriving (Eq, Show)
+  deriving (Show)
+
+instance Eq Collision where
+  a == b =
+    (collisionBodyA a, collisionShapeA a, collisionBodyB a, collisionShapeB a)
+      == (collisionBodyA b, collisionShapeA b, collisionBodyB b, collisionShapeB b)
 
 {- | The shape/body entities behind a contact's two shape ids, if both
-are still alive and registered; the manifold fields are left zero/empty.
+are still alive and registered; no manifolds.
 -}
 toCollision :: B3Space c -> ShapeId -> ShapeId -> IO (Maybe Collision)
 toCollision sp sA sB = do
@@ -2997,13 +3067,13 @@ toCollision sp sA sB = do
   pure $ do
     (sa, ba) <- ma
     (sb, bb) <- mb
-    Just (Collision ba sa bb sb vec3Zero [])
+    Just (Collision ba sa bb sb [])
 
-{- | 'toCollision' for a begin-touch event, with the first contact
-manifold filled in: the normal plus the world position of each manifold
-point (body A's world center of mass plus the point's A-side anchor).
-If the contact is no longer valid (a shape was destroyed after the
-step) or carries no manifolds, the manifold fields stay zero/empty.
+{- | 'toCollision' for a begin-touch event, with every contact manifold
+filled in: per manifold, the normal plus the world position of each
+manifold point (body A's world center of mass plus the point's A-side
+anchor). If the contact is no longer valid (a shape was destroyed after
+the step) the manifold list stays empty.
 -}
 toBeginCollision :: B3Space c -> B3T.ContactBeginTouchEvent -> IO (Maybe Collision)
 toBeginCollision sp ev = do
@@ -3014,19 +3084,34 @@ toBeginCollision sp ev = do
   else do
     cd <- B3Contact.getData contact
     -- resolve from the ContactData's own shape order, so the A/B
-    -- entities stay consistent with the manifold normal's A-to-B
+    -- entities stay consistent with the manifold normals' A-to-B
     -- orientation
     mc <- toCollision sp (B3T.contactDataShapeIdA cd) (B3T.contactDataShapeIdB cd)
     if B3T.contactDataManifoldCount cd < 1 then
       pure mc
     else forM mc $ \c -> do
-      -- copy the first manifold right away: the array is
-      -- engine-owned and only valid until the next step
-      m <- peek (B3T.contactDataManifolds cd)
-      bodyA <- B3Shape.getBody (B3T.contactDataShapeIdA cd)
-      comA <- B3Body.getWorldCenterOfMass bodyA
-      let pts = map (vecAdd comA . B3T.manifoldPointAnchorA) (VS.toList (B3T.manifoldPoints m))
-      pure c{collisionNormal = B3T.manifoldNormal m, collisionPoints = pts}
+      -- copy the manifolds right away: the array is engine-owned and
+      -- only valid until the next step
+      ms <- peekArray (fromIntegral (B3T.contactDataManifoldCount cd)) (B3T.contactDataManifolds cd)
+      comA <-
+        if all (VS.null . B3T.manifoldPoints) ms then
+          -- no points anywhere (speculative contact): the center of
+          -- mass would go unused, skip both FFI calls
+          pure vec3Zero
+        else do
+          -- body A's world center of mass turns the manifolds' A-side
+          -- anchors into world points; its id comes from the body
+          -- registry (toCollision just resolved the entity) rather
+          -- than a getBody FFI round-trip
+          bodies <- readIORef (spBodies sp)
+          let Entity bIx = collisionBodyA c
+          bodyA <- maybe (B3Shape.getBody (B3T.contactDataShapeIdA cd)) pure (IM.lookup bIx bodies)
+          B3Body.getWorldCenterOfMass bodyA
+      let toManifold m =
+            ContactManifold
+              (B3T.manifoldNormal m)
+              (map (vec3Add comA . B3T.manifoldPointAnchorA) (VS.toList (B3T.manifoldPoints m)))
+      pure c{collisionManifolds = map toManifold ms}
 
 {- | The begin-touch contacts of the last 'stepPhysics', a read-only
 global: @Collisions touches <- get global@ after stepping. Shapes
@@ -3055,8 +3140,8 @@ counterpart of 'Collisions' for contacts that stopped touching. Events
 whose shapes were destroyed since the step are dropped; this bites
 harder here than for begin-touch, since destroying a shape mid-contact
 drops its end event — clean up any per-contact bookkeeping when
-destroying shapes. End events carry no manifold: 'collisionNormal' is
-zero and 'collisionPoints' is empty.
+destroying shapes. End events carry no manifolds ('collisionManifolds'
+is empty).
 -}
 newtype CollisionsEnd = CollisionsEnd [Collision]
   deriving (Show)

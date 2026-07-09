@@ -46,6 +46,21 @@ executable apecs-box2d-demo
   default-language: GHC2021
   ghc-options:      -Wall -threaded
 
+test-suite apecs-box2d-test
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Main.hs
+  build-depends:
+      apecs
+    , apecs-box2d
+    , base         >=4.16 && <5
+    , tasty
+    , tasty-hunit
+    , vector
+
+  default-language: GHC2021
+  ghc-options:      -Wall -threaded
+
 executable apecs-box2d-gallery
   hs-source-dirs:   gallery
   main-is:          Main.hs

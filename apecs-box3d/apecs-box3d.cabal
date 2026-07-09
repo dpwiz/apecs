@@ -32,6 +32,22 @@ library
   default-language: GHC2021
   ghc-options:      -Wall
 
+test-suite apecs-box3d-test
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   test
+  main-is:          Main.hs
+  build-depends:
+      apecs
+    , apecs-box3d
+    , base         >=4.16 && <5
+    , Box3D
+    , tasty
+    , tasty-hunit
+    , vector
+
+  default-language: GHC2021
+  ghc-options:      -Wall -threaded
+
 executable apecs-box3d-demo
   hs-source-dirs:   demo
   main-is:          Main.hs
