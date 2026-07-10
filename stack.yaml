@@ -12,6 +12,12 @@ packages:
 
 allow-newer: true
 
+flags:
+  apecs-box2d:
+    examples: true
+  apecs-box3d:
+    examples: true
+
 extra-deps:
   - git: https://gitlab.com/dpwiz/box-nd
     commit: 33ecce451ed5e128b73ba502c6f43af2fe92a318

@@ -16,8 +16,11 @@ extra-doc-files:
 
 description:
   apecs components and systems backed by the Box3D physics engine.
-  Comes with a demo scene rendered with apecs-gloss via a CPU
-  perspective projection.
+
+flag examples
+  description: Build the example executables.
+  default:     False
+  manual:      True
 
 library
   hs-source-dirs:   src
@@ -59,7 +62,10 @@ test-suite apecs-box3d-test
   default-language: GHC2021
   ghc-options:      -Wall -threaded
 
-executable apecs-box3d-demo
+executable apecs-box3d-tumbler
+  if !flag(examples)
+    buildable: False
+
   hs-source-dirs:   demo
   main-is:          Main.hs
   build-depends:
@@ -75,6 +81,9 @@ executable apecs-box3d-demo
   ghc-options:      -Wall -threaded
 
 executable apecs-box3d-elite
+  if !flag(examples)
+    buildable: False
+
   hs-source-dirs:   elite
   main-is:          Main.hs
   build-depends:

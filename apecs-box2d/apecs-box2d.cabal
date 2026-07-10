@@ -18,6 +18,11 @@ description:
   apecs components and systems backed by the Box2D physics engine.
   Comes with a demo scene rendered with apecs-gloss.
 
+flag examples
+  description: Build the example executables.
+  default:     False
+  manual:      True
+
 library
   hs-source-dirs:   src
   exposed-modules:  Apecs.Box2D
@@ -43,6 +48,9 @@ library
   ghc-options:      -Wall
 
 executable apecs-box2d-demo
+  if !flag(examples)
+    buildable: False
+
   hs-source-dirs:   demo
   main-is:          Main.hs
   build-depends:
@@ -73,6 +81,9 @@ test-suite apecs-box2d-test
   ghc-options:      -Wall -threaded
 
 executable apecs-box2d-gallery
+  if !flag(examples)
+    buildable: False
+
   hs-source-dirs:   gallery
   main-is:          Main.hs
   build-depends:

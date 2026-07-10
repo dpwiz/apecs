@@ -17,6 +17,12 @@ source-repository-package
 package apecs
   tests: True
 
+package apecs-box2d
+  flags: +examples
+
+package apecs-box3d
+  flags: +examples
+
 package apecs-stm
   tests: True
 
