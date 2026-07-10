@@ -26,19 +26,20 @@ main =
   -- (an intermittent b2_awakeSet assertion / SIGILL). Tasty parallelises
   -- test cases by default under the threaded RTS, so pin the suite to one
   -- thread; a real app steps a single world from one thread and is fine.
-  defaultMain $ localOption (NumThreads 1) $
-    testGroup
-      "Apecs.Box2D"
-      [ testCase "gravity pulls a dynamic body down" gravityPullsDown
-      , testCase "begin-touch carries a manifold and pairs with its end event" contactLifecycle
-      , testCase "point and AABB queries find the shapes that are there" pointAndAabbQueries
-      , testCase "overlapQuery with a created shape's own Geometry reports its body" overlapRoundTrip
-      , testCase "sweepQuery reports hits nearest-first" sweepOrdering
-      , testCase "segmentQuery reports the closest body" segmentClosest
-      , testCase "chain segments resolve to the chain entity in queries" chainVisibility
-      , testCase "moveCharacter reaches its target in free space" moverFreeSpace
-      , testCase "moveCharacter stops at a wall and clips velocity" moverWall
-      ]
+  defaultMain $
+    localOption (NumThreads 1) $
+      testGroup
+        "Apecs.Box2D"
+        [ testCase "gravity pulls a dynamic body down" gravityPullsDown
+        , testCase "begin-touch carries a manifold and pairs with its end event" contactLifecycle
+        , testCase "point and AABB queries find the shapes that are there" pointAndAabbQueries
+        , testCase "overlapQuery with a created shape's own Geometry reports its body" overlapRoundTrip
+        , testCase "sweepQuery reports hits nearest-first" sweepOrdering
+        , testCase "segmentQuery reports the closest body" segmentClosest
+        , testCase "chain segments resolve to the chain entity in queries" chainVisibility
+        , testCase "moveCharacter reaches its target in free space" moverFreeSpace
+        , testCase "moveCharacter stops at a wall and clips velocity" moverWall
+        ]
 
 run :: SystemT World IO a -> IO a
 run sys = initWorld >>= runSystem (sys <* destroyPhysics)

@@ -29,24 +29,25 @@ main =
   -- (an intermittent solver-set assertion / SIGILL). Tasty parallelises
   -- test cases by default under the threaded RTS, so pin the suite to one
   -- thread; a real app steps a single world from one thread and is fine.
-  defaultMain $ localOption (NumThreads 1) $
-    testGroup
-      "Apecs.Box3D"
-      [ testGroup
-          "authoring validation"
-          [ testCase "meshFromData rejects out-of-range indices" meshRejectsBadIndex
-          , testCase "meshFromData rejects a ragged index count" meshRejectsRaggedIndices
-          , testCase "heightFieldFromData rejects mismatched sample counts" heightFieldRejectsBadSizes
-          , testCase "heightFieldFromData accepts a matching grid" heightFieldAcceptsGoodSizes
-          , testCase "compoundFromChildren rejects multi-material meshes" compoundRejectsMultiMaterial
-          , testCase "compoundFromChildren accepts single-material meshes" compoundAcceptsSingleMaterial
-          ]
-      , testCase "gravity pulls a dynamic body down" gravityPullsDown
-      , testCase "begin-touch carries manifolds and pairs with its end event" contactLifecycle
-      , testCase "containsPointQuery is exact for hulls, silent for meshes" containsPointHullVsMesh
-      , testCase "segment and AABB queries find the shapes that are there" basicQueries
-      , testCase "moveCharacter reaches its target in free space" moverFreeSpace
-      ]
+  defaultMain $
+    localOption (NumThreads 1) $
+      testGroup
+        "Apecs.Box3D"
+        [ testGroup
+            "authoring validation"
+            [ testCase "meshFromData rejects out-of-range indices" meshRejectsBadIndex
+            , testCase "meshFromData rejects a ragged index count" meshRejectsRaggedIndices
+            , testCase "heightFieldFromData rejects mismatched sample counts" heightFieldRejectsBadSizes
+            , testCase "heightFieldFromData accepts a matching grid" heightFieldAcceptsGoodSizes
+            , testCase "compoundFromChildren rejects multi-material meshes" compoundRejectsMultiMaterial
+            , testCase "compoundFromChildren accepts single-material meshes" compoundAcceptsSingleMaterial
+            ]
+        , testCase "gravity pulls a dynamic body down" gravityPullsDown
+        , testCase "begin-touch carries manifolds and pairs with its end event" contactLifecycle
+        , testCase "containsPointQuery is exact for hulls, silent for meshes" containsPointHullVsMesh
+        , testCase "segment and AABB queries find the shapes that are there" basicQueries
+        , testCase "moveCharacter reaches its target in free space" moverFreeSpace
+        ]
 
 run :: SystemT World IO a -> IO a
 run sys = initWorld >>= runSystem (sys <* destroyPhysics)

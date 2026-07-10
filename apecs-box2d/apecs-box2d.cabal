@@ -21,6 +21,17 @@ description:
 library
   hs-source-dirs:   src
   exposed-modules:  Apecs.Box2D
+  other-modules:
+    Apecs.Box2D.Body
+    Apecs.Box2D.Collision
+    Apecs.Box2D.Geometry
+    Apecs.Box2D.Joint
+    Apecs.Box2D.Mover
+    Apecs.Box2D.Query
+    Apecs.Box2D.Recording
+    Apecs.Box2D.Shape
+    Apecs.Box2D.Space
+    Apecs.Box2D.Types
   build-depends:
       apecs       >=0.9 && <0.11
     , base        >=4.16 && <5
