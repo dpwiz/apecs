@@ -13,6 +13,17 @@ stays reachable through `B2BodyId`, `B2ShapeId`, `B2JointId` and
 `getWorldId` — add `Box2D` to your own build-depends to import the raw
 modules those ids unlock.
 
+## Tutorial
+
+New to Box2D (or to this integration)? The [arena tag
+tutorial](tutorial/README.md) builds a small top-down game from
+scratch — bodies, forces, teleports, ray casts and impact events —
+assuming only apecs familiarity.
+
+```sh
+stack run apecs-box2d-tutorial
+```
+
 ## Demo
 
 `apecs-box2d-demo` is a Box2D take on the apecs-physics tumbler,

@@ -13,6 +13,8 @@ build-type:         Simple
 extra-doc-files:
   CHANGELOG.md
   README.md
+  tutorial/*.md
+  tutorial/*.png
 
 description:
   apecs components and systems backed by the Box2D physics engine.
@@ -93,6 +95,27 @@ executable apecs-box2d-gallery
     , base         >=4.16 && <5
     , gloss
     , linear
+
+  default-language: GHC2021
+  ghc-options:      -Wall -threaded
+
+executable apecs-box2d-tutorial
+  if !flag(examples)
+    buildable: False
+
+  hs-source-dirs:   tutorial
+  main-is:          Main.hs
+  build-depends:
+      apecs
+    , apecs-box2d
+    , apecs-gloss
+    , base          >=4.16 && <5
+    , Box2D
+    , containers
+    , gloss
+    , gloss-export
+    , linear
+    , random
 
   default-language: GHC2021
   ghc-options:      -Wall -threaded
