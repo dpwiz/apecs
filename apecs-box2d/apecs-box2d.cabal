@@ -25,8 +25,8 @@ flag examples
 
 library
   hs-source-dirs:   src
-  exposed-modules:  Apecs.Box2D
-  other-modules:
+  exposed-modules:
+    Apecs.Box2D
     Apecs.Box2D.Body
     Apecs.Box2D.Collision
     Apecs.Box2D.Geometry
