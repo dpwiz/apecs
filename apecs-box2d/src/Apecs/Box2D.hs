@@ -1,3 +1,5 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+
 {-| Apecs glue for the Box2D physics engine, modelled on apecs-physics.
 
 Add 'Physics' to your world to get a Box2D world. Giving an entity a

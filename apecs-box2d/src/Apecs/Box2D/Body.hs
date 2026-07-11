@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -53,13 +54,13 @@ instance (MonadIO m, Has w m Physics) => Has w m Body where
 
 instance (MonadIO m) => ExplSet m (B2Space Body) where
   explSet sp ety btype = liftIO $ do
-    bodies <- readIORef (spBodies sp)
+    bodies <- readIORef sp.bodies
     case IM.lookup ety bodies of
       Just b -> B2Body.setType b (toB2BodyType btype)
       Nothing -> do
-        b <- B2Body.create (spWorld sp) (spBodyDef sp){B2T.bodyDefType = toB2BodyType btype}
+        b <- B2Body.create sp.world (sp.bodyDef){B2T.bodyDefType = toB2BodyType btype}
         setUserIndex b ety
-        modifyIORef' (spBodies sp) (IM.insert ety b)
+        modifyIORef' sp.bodies (IM.insert ety b)
 
 instance (MonadIO m) => ExplGet m (B2Space Body) where
   explExists = bodyExists
@@ -70,14 +71,14 @@ instance (MonadIO m) => ExplGet m (B2Space Body) where
 
 instance (MonadIO m) => ExplDestroy m (B2Space Body) where
   explDestroy sp ety = liftIO $ do
-    bodies <- readIORef (spBodies sp)
+    bodies <- readIORef sp.bodies
     forM_ (IM.lookup ety bodies) $ \b -> do
       -- the engine destroys attached shapes, joints and chains along with
       -- the body, so drop their entity records too
-      modifyIORef' (spShapes sp) (IM.filter (\(ShapeRecord _ (Shape (Entity be) _)) -> be /= ety))
-      modifyIORef' (spJoints sp) (IM.filter (\(JointRecord _ (Joint (Entity a) (Entity b') _)) -> a /= ety && b' /= ety))
-      modifyIORef' (spChains sp) (IM.filter (\(ChainRecord _ _ (Chain (Entity be) _ _)) -> be /= ety))
-      modifyIORef' (spBodies sp) (IM.delete ety)
+      modifyIORef' sp.shapes (IM.filter (\(ShapeRecord _ (Shape (Entity be) _)) -> be /= ety))
+      modifyIORef' sp.joints (IM.filter (\(JointRecord _ (Joint (Entity a) (Entity b') _)) -> a /= ety && b' /= ety))
+      modifyIORef' sp.chains (IM.filter (\(ChainRecord _ _ (Chain (Entity be) _ _)) -> be /= ety))
+      modifyIORef' sp.bodies (IM.delete ety)
       B2Body.destroy b
 
 instance (MonadIO m) => ExplMembers m (B2Space Body) where
@@ -490,9 +491,9 @@ body to rail-style movement along the other. All axes are unlocked by
 default.
 -}
 data MotionLocks = MotionLocks
-  { lockLinearX :: Bool
-  , lockLinearY :: Bool
-  , lockAngularZ :: Bool
+  { linearX :: Bool
+  , linearY :: Bool
+  , angularZ :: Bool
   }
   deriving (Eq, Show)
 

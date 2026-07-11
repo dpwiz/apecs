@@ -1,3 +1,5 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -34,9 +36,9 @@ contain slightly separated points (positive separation) and can even
 momentarily have no points.
 -}
 data ContactManifold = ContactManifold
-  { contactNormal :: !WVec
+  { normal :: !WVec
   -- ^ Contact normal, pointing from A to B.
-  , contactPoints :: ![WVec]
+  , points :: ![WVec]
   -- ^ World contact points, up to 2 in 2D.
   }
   deriving (Eq, Show)
@@ -53,18 +55,18 @@ equal — active-contact bookkeeping can pair them up with e.g.
 'Data.List.delete'.
 -}
 data Collision = Collision
-  { collisionBodyA :: !Entity
-  , collisionShapeA :: !Entity
-  , collisionBodyB :: !Entity
-  , collisionShapeB :: !Entity
-  , collisionManifold :: !(Maybe ContactManifold)
+  { bodyA :: !Entity
+  , shapeA :: !Entity
+  , bodyB :: !Entity
+  , shapeB :: !Entity
+  , manifold :: !(Maybe ContactManifold)
   }
   deriving (Show)
 
 instance Eq Collision where
   a == b =
-    (collisionBodyA a, collisionShapeA a, collisionBodyB a, collisionShapeB a)
-      == (collisionBodyA b, collisionShapeA b, collisionBodyB b, collisionShapeB b)
+    (a.bodyA, a.shapeA, a.bodyB, a.shapeB)
+      == (b.bodyA, b.shapeA, b.bodyB, b.shapeB)
 
 {- | The shape/body entities behind a contact's two shape ids, if both
 are still alive and registered; no manifold.
@@ -108,12 +110,12 @@ toBeginCollision sp ev = do
           -- anchors into world points; its id comes from the body
           -- registry (toCollision just resolved the entity) rather
           -- than a getBody FFI round-trip
-          bodies <- readIORef (spBodies sp)
-          let Entity bIx = collisionBodyA c
-          bodyA <- maybe (B2Shape.getBody (B2T.contactDataShapeIdA cd)) pure (IM.lookup bIx bodies)
-          comA <- B2Body.getWorldCenter bodyA
+          bodies <- readIORef sp.bodies
+          let Entity bIx = c.bodyA
+          bodyAId <- maybe (B2Shape.getBody (B2T.contactDataShapeIdA cd)) pure (IM.lookup bIx bodies)
+          comA <- B2Body.getWorldCenter bodyAId
           pure (map (vec2Add comA . B2T.manifoldPointAnchorA) (VS.toList anchors))
-      pure c{collisionManifold = Just (ContactManifold (B2T.manifoldNormal m) pts)}
+      pure c{manifold = Just (ContactManifold (B2T.manifoldNormal m) pts)}
 
 {- | The begin-touch contacts of the last 'Apecs.Box2D.Space.stepPhysics', a read-only
 global: @Collisions touches <- get global@ after stepping. Shapes
@@ -132,7 +134,7 @@ instance (MonadIO m, Has w m Physics) => Has w m Collisions where
 instance (MonadIO m) => ExplGet m (B2Space Collisions) where
   explExists _ _ = pure True
   explGet sp _ = liftIO $ do
-    evs <- B2Events.contactBeginTouchEvents (spWorld sp)
+    evs <- B2Events.contactBeginTouchEvents sp.world
     fmap (Collisions . catMaybes) . forM (VS.toList evs) $ \ev ->
       toBeginCollision sp ev
 
@@ -142,7 +144,7 @@ counterpart of 'Collisions' for contacts that stopped touching. Events
 whose shapes were destroyed since the step are dropped; this bites
 harder here than for begin-touch, since destroying a shape mid-contact
 drops its end event — clean up any per-contact bookkeeping when
-destroying shapes. End events carry no manifold ('collisionManifold'
+destroying shapes. End events carry no manifold ('manifold'
 is 'Nothing').
 -}
 newtype CollisionsEnd = CollisionsEnd [Collision]
@@ -157,7 +159,7 @@ instance (MonadIO m, Has w m Physics) => Has w m CollisionsEnd where
 instance (MonadIO m) => ExplGet m (B2Space CollisionsEnd) where
   explExists _ _ = pure True
   explGet sp _ = liftIO $ do
-    evs <- B2Events.contactEndTouchEvents (spWorld sp)
+    evs <- B2Events.contactEndTouchEvents sp.world
     fmap (CollisionsEnd . catMaybes) . forM (VS.toList evs) $ \ev ->
       toCollision sp (B2T.contactEndTouchEventShapeIdA ev) (B2T.contactEndTouchEventShapeIdB ev)
 
@@ -168,13 +170,13 @@ speed exceeds the world's hit-event threshold (engine default 1;
 tune with 'Apecs.Box2D.Space.HitEventThreshold').
 -}
 data Impact = Impact
-  { impactBodyA :: !Entity
-  , impactShapeA :: !Entity
-  , impactBodyB :: !Entity
-  , impactShapeB :: !Entity
-  , impactPoint :: !WVec
-  , impactNormal :: !WVec
-  , impactSpeed :: !Float
+  { bodyA :: !Entity
+  , shapeA :: !Entity
+  , bodyB :: !Entity
+  , shapeB :: !Entity
+  , point :: !WVec
+  , normal :: !WVec
+  , speed :: !Float
   }
   deriving (Eq, Show)
 
@@ -193,7 +195,7 @@ instance (MonadIO m, Has w m Physics) => Has w m Impacts where
 instance (MonadIO m) => ExplGet m (B2Space Impacts) where
   explExists _ _ = pure True
   explGet sp _ = liftIO $ do
-    evs <- B2Events.contactHitEvents (spWorld sp)
+    evs <- B2Events.contactHitEvents sp.world
     fmap (Impacts . catMaybes) . forM (VS.toList evs) $ \ev -> do
       ma <- shapeEntities sp (B2T.contactHitEventShapeIdA ev)
       mb <- shapeEntities sp (B2T.contactHitEventShapeIdB ev)
@@ -202,13 +204,13 @@ instance (MonadIO m) => ExplGet m (B2Space Impacts) where
         (sb, bb) <- mb
         Just
           Impact
-            { impactBodyA = ba
-            , impactShapeA = sa
-            , impactBodyB = bb
-            , impactShapeB = sb
-            , impactPoint = B2T.contactHitEventPoint ev
-            , impactNormal = B2T.contactHitEventNormal ev
-            , impactSpeed = B2T.contactHitEventApproachSpeed ev
+            { bodyA = ba
+            , shapeA = sa
+            , bodyB = bb
+            , shapeB = sb
+            , point = B2T.contactHitEventPoint ev
+            , normal = B2T.contactHitEventNormal ev
+            , speed = B2T.contactHitEventApproachSpeed ev
             }
 
 {- | A sensor overlap that began or ended during the last 'Apecs.Box2D.Space.stepPhysics':
@@ -240,8 +242,8 @@ events, both as sensors and as visitors; events whose sensor or visitor
 shape was destroyed since the step are dropped.
 -}
 data SensorEvents = SensorEvents
-  { sensorBegins :: [SensorEvent]
-  , sensorEnds :: [SensorEvent]
+  { begins :: [SensorEvent]
+  , ends :: [SensorEvent]
   }
   deriving (Show)
 
@@ -254,8 +256,8 @@ instance (MonadIO m, Has w m Physics) => Has w m SensorEvents where
 instance (MonadIO m) => ExplGet m (B2Space SensorEvents) where
   explExists _ _ = pure True
   explGet sp _ = liftIO $ do
-    begins <- B2Events.sensorBeginTouchEvents (spWorld sp)
-    ends <- B2Events.sensorEndTouchEvents (spWorld sp)
+    begins <- B2Events.sensorBeginTouchEvents sp.world
+    ends <- B2Events.sensorEndTouchEvents sp.world
     beginEvs <-
       fmap catMaybes . forM (VS.toList begins) $ \ev ->
         toSensorEvent sp (B2T.sensorBeginTouchEventSensorShapeId ev) (B2T.sensorBeginTouchEventVisitorShapeId ev)
@@ -283,7 +285,7 @@ instance (MonadIO m, Has w m Physics) => Has w m JointEvents where
 instance (MonadIO m) => ExplGet m (B2Space JointEvents) where
   explExists _ _ = pure True
   explGet sp _ = liftIO $ do
-    evs <- B2Events.jointEvents (spWorld sp)
+    evs <- B2Events.jointEvents sp.world
     fmap (JointEvents . catMaybes) . forM (VS.toList evs) $ \ev ->
       jointEntity sp (B2T.jointEventJointId ev)
 
@@ -292,10 +294,10 @@ transform, and whether it fell asleep on this step (sleeping bodies stop
 emitting moves — use the flag for a final render sync).
 -}
 data BodyMove = BodyMove
-  { bodyMoveBody :: !Entity
-  , bodyMovePosition :: !WVec
-  , bodyMoveAngle :: !Float
-  , bodyMoveFellAsleep :: !Bool
+  { body :: !Entity
+  , position :: !WVec
+  , angle :: !Float
+  , fellAsleep :: !Bool
   }
   deriving (Eq, Show)
 
@@ -320,7 +322,7 @@ instance (MonadIO m, Has w m Physics) => Has w m Moved where
 instance (MonadIO m) => ExplGet m (B2Space Moved) where
   explExists _ _ = pure True
   explGet sp _ = liftIO $ do
-    evs <- B2Events.bodyMoveEvents (spWorld sp)
+    evs <- B2Events.bodyMoveEvents sp.world
     fmap (Moved . catMaybes) . forM (VS.toList evs) $ \ev -> do
       met <- bodyEntity sp (B2T.bodyMoveEventBodyId ev)
       pure $ do
@@ -328,8 +330,8 @@ instance (MonadIO m) => ExplGet m (B2Space Moved) where
         let Transform pos rot = B2T.bodyMoveEventTransform ev
         Just
           BodyMove
-            { bodyMoveBody = ety
-            , bodyMovePosition = pos
-            , bodyMoveAngle = rotGetAngle rot
-            , bodyMoveFellAsleep = toBool (B2T.bodyMoveEventFellAsleep ev)
+            { body = ety
+            , position = pos
+            , angle = rotGetAngle rot
+            , fellAsleep = toBool (B2T.bodyMoveEventFellAsleep ev)
             }

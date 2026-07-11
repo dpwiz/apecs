@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -21,7 +22,7 @@ import Apecs.Box3D.Types
 
 -- | The raw Box3D world, for use with the "Box3D" modules directly.
 getWorldId :: forall w m. (MonadIO m, Has w m Physics) => SystemT w m WorldId
-getWorldId = spWorld <$> (getStore :: SystemT w m (B3Space Physics))
+getWorldId = (.world) <$> (getStore :: SystemT w m (B3Space Physics))
 
 {- | Advance the simulation by a time delta, resolving contacts with the
 'Substeps' number of substeps.
@@ -30,8 +31,8 @@ stepPhysics :: forall w m. (MonadIO m, Has w m Physics) => Float -> SystemT w m 
 stepPhysics dT = do
   sp :: B3Space Physics <- getStore
   liftIO $ do
-    substeps <- readIORef (spSubsteps sp)
-    B3World.step (spWorld sp) dT substeps
+    substeps <- readIORef sp.substeps
+    B3World.step sp.world dT substeps
 
 {- | Destroy the engine world along with all its bodies and shapes, and
 clear the registries. The store is unusable afterwards; call this on
@@ -43,10 +44,10 @@ destroyPhysics :: forall w m. (MonadIO m, Has w m Physics) => SystemT w m ()
 destroyPhysics = do
   sp :: B3Space Physics <- getStore
   liftIO $ do
-    B3World.destroy (spWorld sp)
-    writeIORef (spBodies sp) mempty
-    writeIORef (spShapes sp) mempty
-    writeIORef (spJoints sp) mempty
+    B3World.destroy sp.world
+    writeIORef sp.bodies mempty
+    writeIORef sp.shapes mempty
+    writeIORef sp.joints mempty
 
 {- | Apply a radial impulse to every dynamic body within a radius of a
 world point, as if from an explosion: each affected shape is pushed
@@ -75,7 +76,7 @@ explode center radius impulse = do
   liftIO $ do
     def <- B3T.defaultExplosionDef
     B3World.explode
-      (spWorld sp)
+      sp.world
       def
         { B3T.explosionDefPosition = center
         , B3T.explosionDefRadius = radius
@@ -99,10 +100,10 @@ instance (MonadIO m, Has w m Physics) => Has w m Gravity where
 
 instance (MonadIO m) => ExplGet m (B3Space Gravity) where
   explExists _ _ = pure True
-  explGet sp _ = liftIO $ Gravity <$> B3World.getGravity (spWorld sp)
+  explGet sp _ = liftIO $ Gravity <$> B3World.getGravity sp.world
 
 instance (MonadIO m) => ExplSet m (B3Space Gravity) where
-  explSet sp _ (Gravity v) = liftIO $ B3World.setGravity (spWorld sp) v
+  explSet sp _ (Gravity v) = liftIO $ B3World.setGravity sp.world v
 
 {- | The number of contact substeps per 'stepPhysics' call. Defaults to 4;
 clamped to at least 1.
@@ -118,10 +119,10 @@ instance (MonadIO m, Has w m Physics) => Has w m Substeps where
 
 instance (MonadIO m) => ExplGet m (B3Space Substeps) where
   explExists _ _ = pure True
-  explGet sp _ = liftIO $ Substeps <$> readIORef (spSubsteps sp)
+  explGet sp _ = liftIO $ Substeps <$> readIORef sp.substeps
 
 instance (MonadIO m) => ExplSet m (B3Space Substeps) where
-  explSet sp _ (Substeps n) = liftIO $ writeIORef (spSubsteps sp) (max 1 n)
+  explSet sp _ (Substeps n) = liftIO $ writeIORef sp.substeps (max 1 n)
 
 {- | Whether bodies in this world may fall asleep at all (on by
 default). Disabling it wakes everything and saves the bookkeeping when
@@ -139,10 +140,10 @@ instance (MonadIO m, Has w m Physics) => Has w m SleepingEnabled where
 
 instance (MonadIO m) => ExplGet m (B3Space SleepingEnabled) where
   explExists _ _ = pure True
-  explGet sp _ = liftIO $ SleepingEnabled <$> B3World.isSleepingEnabled (spWorld sp)
+  explGet sp _ = liftIO $ SleepingEnabled <$> B3World.isSleepingEnabled sp.world
 
 instance (MonadIO m) => ExplSet m (B3Space SleepingEnabled) where
-  explSet sp _ (SleepingEnabled e) = liftIO $ B3World.enableSleeping (spWorld sp) e
+  explSet sp _ (SleepingEnabled e) = liftIO $ B3World.enableSleeping sp.world e
 
 {- | Whether continuous collision detection runs between fast dynamic
 bodies and static geometry, keeping them from tunnelling through walls
@@ -161,10 +162,10 @@ instance (MonadIO m, Has w m Physics) => Has w m ContinuousEnabled where
 
 instance (MonadIO m) => ExplGet m (B3Space ContinuousEnabled) where
   explExists _ _ = pure True
-  explGet sp _ = liftIO $ ContinuousEnabled <$> B3World.isContinuousEnabled (spWorld sp)
+  explGet sp _ = liftIO $ ContinuousEnabled <$> B3World.isContinuousEnabled sp.world
 
 instance (MonadIO m) => ExplSet m (B3Space ContinuousEnabled) where
-  explSet sp _ (ContinuousEnabled e) = liftIO $ B3World.enableContinuous (spWorld sp) e
+  explSet sp _ (ContinuousEnabled e) = liftIO $ B3World.enableContinuous sp.world e
 
 {- | The approach speed above which a contact generates a hit event,
 usually in meters per second (engine default 1). Read by 'Apecs.Box3D.Collision.Impacts',
@@ -182,10 +183,10 @@ instance (MonadIO m, Has w m Physics) => Has w m HitEventThreshold where
 
 instance (MonadIO m) => ExplGet m (B3Space HitEventThreshold) where
   explExists _ _ = pure True
-  explGet sp _ = liftIO $ HitEventThreshold <$> B3World.getHitEventThreshold (spWorld sp)
+  explGet sp _ = liftIO $ HitEventThreshold <$> B3World.getHitEventThreshold sp.world
 
 instance (MonadIO m) => ExplSet m (B3Space HitEventThreshold) where
-  explSet sp _ (HitEventThreshold t) = liftIO $ B3World.setHitEventThreshold (spWorld sp) t
+  explSet sp _ (HitEventThreshold t) = liftIO $ B3World.setHitEventThreshold sp.world t
 
 {- | The relative approach speed below which a contact's 'Apecs.Box3D.Shape.Elasticity'
 is ignored and it doesn't bounce, usually in meters per second. Don't
@@ -204,10 +205,10 @@ instance (MonadIO m, Has w m Physics) => Has w m RestitutionThreshold where
 
 instance (MonadIO m) => ExplGet m (B3Space RestitutionThreshold) where
   explExists _ _ = pure True
-  explGet sp _ = liftIO $ RestitutionThreshold <$> B3World.getRestitutionThreshold (spWorld sp)
+  explGet sp _ = liftIO $ RestitutionThreshold <$> B3World.getRestitutionThreshold sp.world
 
 instance (MonadIO m) => ExplSet m (B3Space RestitutionThreshold) where
-  explSet sp _ (RestitutionThreshold t) = liftIO $ B3World.setRestitutionThreshold (spWorld sp) t
+  explSet sp _ (RestitutionThreshold t) = liftIO $ B3World.setRestitutionThreshold sp.world t
 
 {- | The speed cap applied to every 'Apecs.Box3D.Body.Body' in this world, usually in
 meters per second: velocities that would exceed it are clamped each
@@ -225,10 +226,10 @@ instance (MonadIO m, Has w m Physics) => Has w m MaximumLinearSpeed where
 
 instance (MonadIO m) => ExplGet m (B3Space MaximumLinearSpeed) where
   explExists _ _ = pure True
-  explGet sp _ = liftIO $ MaximumLinearSpeed <$> B3World.getMaximumLinearSpeed (spWorld sp)
+  explGet sp _ = liftIO $ MaximumLinearSpeed <$> B3World.getMaximumLinearSpeed sp.world
 
 instance (MonadIO m) => ExplSet m (B3Space MaximumLinearSpeed) where
-  explSet sp _ (MaximumLinearSpeed s) = liftIO $ B3World.setMaximumLinearSpeed (spWorld sp) s
+  explSet sp _ (MaximumLinearSpeed s) = liftIO $ B3World.setMaximumLinearSpeed sp.world s
 
 {- | The number of solver worker threads the world uses (default 1).
 Raising it parallelises the solver across islands; it only pays off on
@@ -247,7 +248,7 @@ instance (MonadIO m, Has w m Physics) => Has w m WorkerCount where
 
 instance (MonadIO m) => ExplGet m (B3Space WorkerCount) where
   explExists _ _ = pure True
-  explGet sp _ = liftIO $ WorkerCount <$> B3World.getWorkerCount (spWorld sp)
+  explGet sp _ = liftIO $ WorkerCount <$> B3World.getWorkerCount sp.world
 
 instance (MonadIO m) => ExplSet m (B3Space WorkerCount) where
-  explSet sp _ (WorkerCount c) = liftIO $ B3World.setWorkerCount (spWorld sp) c
+  explSet sp _ (WorkerCount c) = liftIO $ B3World.setWorkerCount sp.world c

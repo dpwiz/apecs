@@ -1,3 +1,5 @@
+{-# LANGUAGE DuplicateRecordFields #-}
+
 {-| Apecs glue for the Box3D physics engine, the 3D sibling of
 apecs-box2d (both modelled on apecs-physics).
 

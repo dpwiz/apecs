@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 -- 'Joint' itself lives in "Apecs.Box2D.Types" — the store's joint
@@ -214,25 +215,25 @@ createJoint w a b spec = case spec of
 
 instance (MonadIO m) => ExplSet m (B2Space Joint) where
   explSet sp ety joint@(Joint (Entity aEty) (Entity bEty) spec) = liftIO $ when (aEty /= bEty) $ do
-    bodies <- readIORef (spBodies sp)
+    bodies <- readIORef sp.bodies
     forM_ ((,) <$> IM.lookup aEty bodies <*> IM.lookup bEty bodies) $ \(a, b) -> do
-      old <- IM.lookup ety <$> readIORef (spJoints sp)
-      j <- createJoint (spWorld sp) a b spec
+      old <- IM.lookup ety <$> readIORef sp.joints
+      j <- createJoint sp.world a b spec
       setUserIndex j ety
       forM_ old $ \(JointRecord j' _) -> B2Joint.destroy j' True
-      modifyIORef' (spJoints sp) (IM.insert ety (JointRecord j joint))
+      modifyIORef' sp.joints (IM.insert ety (JointRecord j joint))
 
 instance (MonadIO m) => ExplGet m (B2Space Joint) where
   explExists = jointExists
   explGet sp ety = liftIO $
-    withReg "Joint" (spJoints sp) ety $
+    withReg "Joint" sp.joints ety $
       \(JointRecord _ joint) -> pure joint
 
 instance (MonadIO m) => ExplDestroy m (B2Space Joint) where
   explDestroy sp ety = liftIO $ do
-    joints <- readIORef (spJoints sp)
+    joints <- readIORef sp.joints
     forM_ (IM.lookup ety joints) $ \(JointRecord j _) -> do
-      modifyIORef' (spJoints sp) (IM.delete ety)
+      modifyIORef' sp.joints (IM.delete ety)
       B2Joint.destroy j True
 
 instance (MonadIO m) => ExplMembers m (B2Space Joint) where

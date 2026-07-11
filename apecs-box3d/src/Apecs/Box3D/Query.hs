@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | World queries: ray casts, AABB and point tests.
 module Apecs.Box3D.Query where
 
@@ -27,11 +29,11 @@ normal, and the fraction along the segment (0 at the start, 1 at the
 end).
 -}
 data RayHit = RayHit
-  { rayHitShape :: !Entity
-  , rayHitBody :: !Entity
-  , rayHitPoint :: !WVec
-  , rayHitNormal :: !WVec
-  , rayHitFraction :: !Float
+  { shape :: !Entity
+  , body :: !Entity
+  , point :: !WVec
+  , normal :: !WVec
+  , fraction :: !Float
   }
   deriving (Eq, Show)
 
@@ -81,18 +83,18 @@ segmentQuery start end fltr = do
     let
       Vec3 sx sy sz = start
       Vec3 ex ey ez = end
-    res <- B3World.castRayClosest (spWorld sp) start (Vec3 (ex - sx) (ey - sy) (ez - sz)) qf
+    res <- B3World.castRayClosest sp.world start (Vec3 (ex - sx) (ey - sy) (ez - sz)) qf
     if B3T.rayResultHit res == 0 then
       pure Nothing
     else
       fmap
         ( \(shapeEty, bodyEty) ->
             RayHit
-              { rayHitShape = shapeEty
-              , rayHitBody = bodyEty
-              , rayHitPoint = B3T.rayResultPoint res
-              , rayHitNormal = B3T.rayResultNormal res
-              , rayHitFraction = B3T.rayResultFraction res
+              { shape = shapeEty
+              , body = bodyEty
+              , point = B3T.rayResultPoint res
+              , normal = B3T.rayResultNormal res
+              , fraction = B3T.rayResultFraction res
               }
         )
         <$> shapeEntities sp (B3T.rayResultShapeId res)
@@ -100,7 +102,7 @@ segmentQuery start end fltr = do
 {- | Drive a cast-style engine query ('B3World.castRay') with the
 collect-everything visitor: each reported shape becomes a 'RayHit'
 (hits whose shapes were destroyed since the last 'Apecs.Box3D.Space.stepPhysics' are
-dropped), sorted nearest-first by 'rayHitFraction'.
+dropped), sorted nearest-first by 'fraction'.
 -}
 collectCastHits :: B3Space c -> (FunPtr B3Tags.CastResultFcn -> Ptr () -> IO r) -> IO [RayHit]
 collectCastHits sp run = do
@@ -111,17 +113,17 @@ collectCastHits sp run = do
           modifyIORef'
             found
             ( RayHit
-                { rayHitShape = shapeEty
-                , rayHitBody = bodyEty
-                , rayHitPoint = point
-                , rayHitNormal = normal
-                , rayHitFraction = frac
+                { shape = shapeEty
+                , body = bodyEty
+                , point = point
+                , normal = normal
+                , fraction = frac
                 }
                 :
             )
         pure 1
   _ <- withCastResultFcn visit run
-  sortOn rayHitFraction <$> readIORef found
+  sortOn (.fraction) <$> readIORef found
 
 {- | Drive an overlap-style engine query ('B3World.overlapAABB'),
 collecting the deduplicated body entities of every reported shape that
@@ -146,13 +148,13 @@ collectOverlapBodies sp keep run = do
   map Entity . IS.toList <$> readIORef found
 
 {- | Every shape along a world-space segment, sorted nearest-first by
-'rayHitFraction'. Filter semantics match 'segmentQuery'. Unlike
+'fraction'. Filter semantics match 'segmentQuery'. Unlike
 'segmentQuery', which goes through the engine's @b3World_CastRayClosest@
 convenience path, this drives the general @b3World_CastRay@ callback
 directly — and that path does /not/ ignore initial overlaps itself (the
 "ignore initial overlap" behaviour lives in the closest-hit callback, which
 skips fraction-0 hits before they reach the caller). So a segment starting
-inside a shape here reports that shape too, with 'rayHitFraction' 0. Hits
+inside a shape here reports that shape too, with 'fraction' 0. Hits
 whose shapes were destroyed since the last 'Apecs.Box3D.Space.stepPhysics' are dropped, same
 as 'segmentQuery'.
 -}
@@ -168,7 +170,7 @@ segmentQueryAll start end fltr = do
   liftIO $ do
     qf <- toQueryFilter fltr
     collectCastHits sp $ \fp ctx ->
-      B3World.castRay (spWorld sp) start (vec3Sub end start) qf fp ctx
+      B3World.castRay sp.world start (vec3Sub end start) qf fp ctx
 
 {- | The body entities whose shapes' broad-phase bounding boxes overlap
 the world-space box spanned by two corners (any order). Broad-phase:
@@ -186,7 +188,7 @@ aabbQuery cornerA cornerB fltr = do
   liftIO $ do
     qf <- toQueryFilter fltr
     collectOverlapBodies sp (\_ -> pure True) $ \fp ctx ->
-      B3World.overlapAABB (spWorld sp) box qf fp ctx
+      B3World.overlapAABB sp.world box qf fp ctx
   where
     Vec3 ax ay az = cornerA
     Vec3 bx by bz = cornerB
@@ -223,4 +225,4 @@ containsPointQuery point fltr = do
   liftIO $ do
     qf <- toQueryFilter fltr
     collectOverlapBodies sp (`B3Shape.testPoint` point) $ \fp ctx ->
-      B3World.overlapAABB (spWorld sp) (AABB point point) qf fp ctx
+      B3World.overlapAABB sp.world (AABB point point) qf fp ctx

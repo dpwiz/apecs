@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE TypeFamilies #-}
 
 {-| The store shared by every component in "Apecs.Box2D" ('B2Space'),
@@ -48,14 +49,14 @@ data ChainRecord = ChainRecord !ChainId !IS.IntSet !Chain
 world plus entity registries for bodies, shapes, joints and chains.
 -}
 data B2Space c = B2Space
-  { spWorld :: !WorldId
-  , spBodyDef :: !B2T.BodyDef
-  , spShapeDef :: !B2T.ShapeDef
-  , spBodies :: !(IORef (IntMap BodyId))
-  , spShapes :: !(IORef (IntMap ShapeRecord))
-  , spJoints :: !(IORef (IntMap JointRecord))
-  , spChains :: !(IORef (IntMap ChainRecord))
-  , spSubsteps :: !(IORef Int)
+  { world :: !WorldId
+  , bodyDef :: !B2T.BodyDef
+  , shapeDef :: !B2T.ShapeDef
+  , bodies :: !(IORef (IntMap BodyId))
+  , shapes :: !(IORef (IntMap ShapeRecord))
+  , joints :: !(IORef (IntMap JointRecord))
+  , chains :: !(IORef (IntMap ChainRecord))
+  , substeps :: !(IORef Int)
   }
 
 cast :: B2Space a -> B2Space b
@@ -117,54 +118,54 @@ regMembers ref = liftIO $ do
   pure (U.fromListN (IM.size m) (IM.keys m))
 
 withBody :: B2Space c -> Int -> (BodyId -> IO a) -> IO a
-withBody sp = withReg "Body" (spBodies sp)
+withBody sp = withReg "Body" sp.bodies
 
 overBody :: B2Space c -> Int -> (BodyId -> IO ()) -> IO ()
-overBody sp = overReg (spBodies sp)
+overBody sp = overReg sp.bodies
 
 bodyExists :: (MonadIO m) => B2Space c -> Int -> m Bool
-bodyExists sp = regExists (spBodies sp)
+bodyExists sp = regExists sp.bodies
 
 bodyMembers :: (MonadIO m) => B2Space c -> m (U.Vector Int)
-bodyMembers sp = regMembers (spBodies sp)
+bodyMembers sp = regMembers sp.bodies
 
 withShape :: B2Space c -> Int -> (ShapeId -> IO a) -> IO a
-withShape sp ety f = withReg "Shape" (spShapes sp) ety (\(ShapeRecord s _) -> f s)
+withShape sp ety f = withReg "Shape" sp.shapes ety (\(ShapeRecord s _) -> f s)
 
 overShape :: B2Space c -> Int -> (ShapeId -> IO ()) -> IO ()
-overShape sp ety f = overReg (spShapes sp) ety (\(ShapeRecord s _) -> f s)
+overShape sp ety f = overReg sp.shapes ety (\(ShapeRecord s _) -> f s)
 
 shapeExists :: (MonadIO m) => B2Space c -> Int -> m Bool
-shapeExists sp = regExists (spShapes sp)
+shapeExists sp = regExists sp.shapes
 
 shapeMembers :: (MonadIO m) => B2Space c -> m (U.Vector Int)
-shapeMembers sp = regMembers (spShapes sp)
+shapeMembers sp = regMembers sp.shapes
 
 withJoint :: B2Space c -> Int -> (JointId -> IO a) -> IO a
-withJoint sp ety f = withReg "Joint" (spJoints sp) ety (\(JointRecord j _) -> f j)
+withJoint sp ety f = withReg "Joint" sp.joints ety (\(JointRecord j _) -> f j)
 
 overJoint :: B2Space c -> Int -> (JointId -> IO ()) -> IO ()
-overJoint sp ety f = overReg (spJoints sp) ety (\(JointRecord j _) -> f j)
+overJoint sp ety f = overReg sp.joints ety (\(JointRecord j _) -> f j)
 
 jointExists :: (MonadIO m) => B2Space c -> Int -> m Bool
-jointExists sp = regExists (spJoints sp)
+jointExists sp = regExists sp.joints
 
 jointMembers :: (MonadIO m) => B2Space c -> m (U.Vector Int)
-jointMembers sp = regMembers (spJoints sp)
+jointMembers sp = regMembers sp.joints
 
 withChain :: B2Space c -> Int -> (ChainId -> IO a) -> IO a
-withChain sp ety f = withReg "Chain" (spChains sp) ety (\(ChainRecord c _ _) -> f c)
+withChain sp ety f = withReg "Chain" sp.chains ety (\(ChainRecord c _ _) -> f c)
 
 chainExists :: (MonadIO m) => B2Space c -> Int -> m Bool
-chainExists sp = regExists (spChains sp)
+chainExists sp = regExists sp.chains
 
 chainMembers :: (MonadIO m) => B2Space c -> m (U.Vector Int)
-chainMembers sp = regMembers (spChains sp)
+chainMembers sp = regMembers sp.chains
 
 -- | Whether an entity has a 'Joint' whose engine type is one of the given kinds.
 jointIsKind :: B2Space c -> Int -> [B2T.JointType] -> IO Bool
 jointIsKind sp ety kinds = do
-  m <- readIORef (spJoints sp)
+  m <- readIORef sp.joints
   case IM.lookup ety m of
     Nothing -> pure False
     Just (JointRecord j _) -> (`elem` kinds) <$> B2Joint.getType j
@@ -177,7 +178,7 @@ would hand joints of the wrong kind to a type-specific engine getter.
 -}
 jointKindMembers :: (MonadIO m) => B2Space c -> [B2T.JointType] -> m (U.Vector Int)
 jointKindMembers sp kinds = liftIO $ do
-  m <- readIORef (spJoints sp)
+  m <- readIORef sp.joints
   U.fromList . map fst
     <$> filterM (\(_, JointRecord j _) -> (`elem` kinds) <$> B2Joint.getType j) (IM.toList m)
 
@@ -222,7 +223,7 @@ for plain 'GeoSegment' shapes, so chains never pass it)
 — in particular 'Apecs.Box2D.Query.segmentQuery' no longer returns 'Nothing' just
 because a chain segment is the closest hit. In every case the CHAIN
 entity is reported in the shape slot, not a per-segment entity: a reader
-following 'Apecs.Box2D.Collision.collisionShapeA' (or 'Apecs.Box2D.Query.rayHitShape', etc.) to a 'Shape'
+following a 'Apecs.Box2D.Collision.Collision' or 'Apecs.Box2D.Query.RayHit' shape entity to a 'Shape'
 component won't find one, but will find a 'Chain'. Chain creation also
 turns on @chainDefEnableSensorEvents@, the chain-level counterpart of
 'Shape'\'s 'Apecs.Box2D.Shape.Sensor' visitor opt-in, so chains are visible to sensors the
@@ -313,14 +314,14 @@ shapeEntities sp s@(ShapeId w) = do
     pure Nothing
   else do
     ix <- getUserIndex s
-    shapes <- readIORef (spShapes sp)
+    shapes <- readIORef sp.shapes
     case IM.lookup ix shapes of
       -- shapes created through the raw engine API have no user index and
       -- read back as 0, a legitimate entity; requiring the registered
       -- engine shape to be this very shape drops them instead
       Just (ShapeRecord s' (Shape bodyEty _)) | s' == s -> pure (Just (Entity ix, bodyEty))
       _ -> do
-        chains <- readIORef (spChains sp)
+        chains <- readIORef sp.chains
         pure $ case IM.lookup ix chains of
           -- same raw-API index-0 guard as above, checked against the
           -- chain's own recorded segment ids instead of a single shape id
@@ -339,7 +340,7 @@ jointEntity sp j = do
     pure Nothing
   else do
     ix <- getUserIndex j
-    joints <- readIORef (spJoints sp)
+    joints <- readIORef sp.joints
     pure $ case IM.lookup ix joints of
       -- joints created through the raw engine API have no user index and
       -- read back as 0, a legitimate entity; requiring the registered
@@ -358,7 +359,7 @@ bodyEntity sp b = do
     pure Nothing
   else do
     ix <- getUserIndex b
-    bodies <- readIORef (spBodies sp)
+    bodies <- readIORef sp.bodies
     pure $ case IM.lookup ix bodies of
       -- bodies created through the raw engine API have no user index and
       -- read back as 0, a legitimate entity; requiring the registered

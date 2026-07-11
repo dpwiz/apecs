@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 -- 'Shape' itself lives in "Apecs.Box3D.Types" — the store's shape
@@ -62,30 +63,30 @@ recreateShape sp b ety sd shape@(Shape _ geo) old = do
   s <- createGeometry b sd geo
   setUserIndex s ety
   forM_ old $ \(ShapeRecord s' _) -> B3Shape.destroy s' True
-  modifyIORef' (spShapes sp) (IM.insert ety (ShapeRecord s shape))
+  modifyIORef' sp.shapes (IM.insert ety (ShapeRecord s shape))
 
 instance (MonadIO m) => ExplSet m (B3Space Shape) where
   explSet sp ety shape@(Shape (Entity bEty) _) = liftIO $
     overBody sp bEty $ \b -> do
-      old <- IM.lookup ety <$> readIORef (spShapes sp)
-      sd <- carryMaterial (spShapeDef sp) old
+      old <- IM.lookup ety <$> readIORef sp.shapes
+      sd <- carryMaterial sp.shapeDef old
       recreateShape sp b ety sd shape old
 
 instance (MonadIO m) => ExplGet m (B3Space Shape) where
   explExists = shapeExists
   explGet sp ety = liftIO $
-    withReg "Shape" (spShapes sp) ety $
+    withReg "Shape" sp.shapes ety $
       \(ShapeRecord _ shape) -> pure shape
 
 instance (MonadIO m) => ExplDestroy m (B3Space Shape) where
   explDestroy sp ety = liftIO $ do
-    shapes <- readIORef (spShapes sp)
+    shapes <- readIORef sp.shapes
     forM_ (IM.lookup ety shapes) $ \(ShapeRecord s _) -> do
       -- destroy the engine shape before dropping the record: the record
       -- keeps mesh and height-field ForeignPtrs alive, and the engine
       -- shape references that geometry until it is destroyed
       B3Shape.destroy s True
-      modifyIORef' (spShapes sp) (IM.delete ety)
+      modifyIORef' sp.shapes (IM.delete ety)
 
 instance (MonadIO m) => ExplMembers m (B3Space Shape) where
   explMembers = shapeMembers
@@ -223,12 +224,12 @@ instance (MonadIO m) => ExplGet m (B3Space Sensor) where
 
 instance (MonadIO m) => ExplSet m (B3Space Sensor) where
   explSet sp ety (Sensor wantSensor) = liftIO $ do
-    old <- IM.lookup ety <$> readIORef (spShapes sp)
+    old <- IM.lookup ety <$> readIORef sp.shapes
     forM_ old $ \old'@(ShapeRecord s shape@(Shape (Entity bEty) _)) -> do
       isSensorNow <- B3Shape.isSensor s
       when (isSensorNow /= wantSensor) $
         overBody sp bEty $ \b -> do
-          sd <- carryMaterial (spShapeDef sp) (Just old')
+          sd <- carryMaterial sp.shapeDef (Just old')
           recreateShape sp b ety sd{B3T.shapeDefIsSensor = fromBool wantSensor} shape (Just old')
 
 instance (MonadIO m) => ExplMembers m (B3Space Sensor) where

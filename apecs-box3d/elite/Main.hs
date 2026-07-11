@@ -1,4 +1,6 @@
+{-# LANGUAGE DisambiguateRecordFields #-}
 {-# LANGUAGE LambdaCase #-}
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -347,7 +349,7 @@ avoidRocks p v fallback = do
   hit <- segmentQuery (vec3 p) (vec3 (p + dir ^* lookahead)) rocksOnly
   let dodge = case hit of
         Nothing -> V3 0 0 0
-        Just RayHit{rayHitNormal = n', rayHitFraction = f} ->
+        Just RayHit{normal = n', fraction = f} ->
           let
             n = v3 n'
             lat = n - dot n dir *^ dir
@@ -469,7 +471,7 @@ detonations :: Float -> SystemT World IO ()
 detonations dT = do
   Impacts hits <- get global
   forM_ hits $ \hit -> do
-    spent <- fmap or . forM [impactBodyA hit, impactBodyB hit] $ \b -> do
+    spent <- fmap or . forM [hit.bodyA, hit.bodyB] $ \b -> do
       slug <- get b
       case slug of
         Just (Bullet _) -> do
@@ -477,12 +479,12 @@ detonations dT = do
           pure True
         Nothing -> pure False
     let
-      speed = impactSpeed hit
+      speed = hit.speed
       mag
         | spent = 0.5 + speed * 0.04
         | otherwise = 0.25 + speed * 0.02
     when (spent || speed > 6) $
-      newEntity_ (Boom (v3 (impactPoint hit)) mag 0)
+      newEntity_ (Boom (v3 hit.point) mag 0)
   cmapM_ $ \(Boom pos mag age, e :: Entity) ->
     if age > boomLife then
       destroy e (Proxy @Boom)

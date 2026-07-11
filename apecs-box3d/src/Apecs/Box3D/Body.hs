@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE TypeFamilies #-}
 {-# LANGUAGE UndecidableInstances #-}
 
@@ -52,13 +53,13 @@ instance (MonadIO m, Has w m Physics) => Has w m Body where
 
 instance (MonadIO m) => ExplSet m (B3Space Body) where
   explSet sp ety btype = liftIO $ do
-    bodies <- readIORef (spBodies sp)
+    bodies <- readIORef sp.bodies
     case IM.lookup ety bodies of
       Just b -> B3Body.setType b (toB3BodyType btype)
       Nothing -> do
-        b <- B3Body.create (spWorld sp) (spBodyDef sp){B3T.bodyDefType = toB3BodyType btype}
+        b <- B3Body.create sp.world (sp.bodyDef){B3T.bodyDefType = toB3BodyType btype}
         setUserIndex b ety
-        modifyIORef' (spBodies sp) (IM.insert ety b)
+        modifyIORef' sp.bodies (IM.insert ety b)
 
 instance (MonadIO m) => ExplGet m (B3Space Body) where
   explExists = bodyExists
@@ -69,7 +70,7 @@ instance (MonadIO m) => ExplGet m (B3Space Body) where
 
 instance (MonadIO m) => ExplDestroy m (B3Space Body) where
   explDestroy sp ety = liftIO $ do
-    bodies <- readIORef (spBodies sp)
+    bodies <- readIORef sp.bodies
     forM_ (IM.lookup ety bodies) $ \b -> do
       -- destroy the engine body first: the ShapeRecords keep mesh and
       -- height-field ForeignPtrs alive, and dropping them before the
@@ -78,9 +79,9 @@ instance (MonadIO m) => ExplDestroy m (B3Space Body) where
       B3Body.destroy b
       -- the engine destroys attached shapes and joints along with the
       -- body, so drop their entity records too
-      modifyIORef' (spShapes sp) (IM.filter (\(ShapeRecord _ (Shape (Entity be) _)) -> be /= ety))
-      modifyIORef' (spJoints sp) (IM.filter (\(JointRecord _ (Joint (Entity a) (Entity b') _)) -> a /= ety && b' /= ety))
-      modifyIORef' (spBodies sp) (IM.delete ety)
+      modifyIORef' sp.shapes (IM.filter (\(ShapeRecord _ (Shape (Entity be) _)) -> be /= ety))
+      modifyIORef' sp.joints (IM.filter (\(JointRecord _ (Joint (Entity a) (Entity b') _)) -> a /= ety && b' /= ety))
+      modifyIORef' sp.bodies (IM.delete ety)
 
 instance (MonadIO m) => ExplMembers m (B3Space Body) where
   explMembers = bodyMembers
@@ -503,12 +504,12 @@ locking a single linear axis constrains movement to a plane. All axes
 are unlocked by default.
 -}
 data MotionLocks = MotionLocks
-  { lockLinearX :: Bool
-  , lockLinearY :: Bool
-  , lockLinearZ :: Bool
-  , lockAngularX :: Bool
-  , lockAngularY :: Bool
-  , lockAngularZ :: Bool
+  { linearX :: Bool
+  , linearY :: Bool
+  , linearZ :: Bool
+  , angularX :: Bool
+  , angularY :: Bool
+  , angularZ :: Bool
   }
   deriving (Eq, Show)
 

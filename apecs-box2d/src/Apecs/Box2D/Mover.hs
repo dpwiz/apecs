@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 {-| The kinematic character mover, mirroring the engine's character
 sample: collide, solve planes, sweep, iterate.
 -}
@@ -52,8 +54,8 @@ velocity clipped against every surface it touched (kill the
 into-the-wall component so speed doesn't build up against obstacles).
 -}
 data MoverResult = MoverResult
-  { moverPosition :: !WVec
-  , moverVelocity :: !WVec
+  { position :: !WVec
+  , velocity :: !WVec
   }
   deriving (Eq, Show)
 
@@ -119,7 +121,7 @@ moveCharacter c1 c2 radius pos0 target vel0 fltr = do
       let
         gatherPlanes pos = do
           writeIORef countRef 0
-          _ <- B2World.collideMover (spWorld sp) pos capsule qf fp ctx
+          _ <- B2World.collideMover sp.world pos capsule qf fp ctx
           n <- readIORef countRef
           VS.freeze (VSM.take n buf)
 
@@ -128,7 +130,7 @@ moveCharacter c1 c2 radius pos0 target vel0 fltr = do
           | otherwise = do
               planes <- gatherPlanes pos
               (translation, planes', _iters) <- B2Mover.solvePlanes (vec2Sub target pos) planes
-              fraction <- B2World.castMover (spWorld sp) pos capsule translation qf
+              fraction <- B2World.castMover sp.world pos capsule translation qf
               let
                 delta = vec2Scale fraction translation
                 pos' = vec2Add pos delta

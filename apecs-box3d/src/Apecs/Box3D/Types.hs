@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE TypeFamilies #-}
 
 {-| The store shared by every component in "Apecs.Box3D" ('B3Space'),
@@ -38,13 +39,13 @@ data JointRecord = JointRecord !JointId !Joint
 world plus entity registries for bodies, shapes and joints.
 -}
 data B3Space c = B3Space
-  { spWorld :: !WorldId
-  , spBodyDef :: !B3T.BodyDef
-  , spShapeDef :: !B3T.ShapeDef
-  , spBodies :: !(IORef (IntMap BodyId))
-  , spShapes :: !(IORef (IntMap ShapeRecord))
-  , spJoints :: !(IORef (IntMap JointRecord))
-  , spSubsteps :: !(IORef Int)
+  { world :: !WorldId
+  , bodyDef :: !B3T.BodyDef
+  , shapeDef :: !B3T.ShapeDef
+  , bodies :: !(IORef (IntMap BodyId))
+  , shapes :: !(IORef (IntMap ShapeRecord))
+  , joints :: !(IORef (IntMap JointRecord))
+  , substeps :: !(IORef Int)
   }
 
 cast :: B3Space a -> B3Space b
@@ -105,45 +106,45 @@ regMembers ref = liftIO $ do
   pure (U.fromListN (IM.size m) (IM.keys m))
 
 withBody :: B3Space c -> Int -> (BodyId -> IO a) -> IO a
-withBody sp = withReg "Body" (spBodies sp)
+withBody sp = withReg "Body" sp.bodies
 
 overBody :: B3Space c -> Int -> (BodyId -> IO ()) -> IO ()
-overBody sp = overReg (spBodies sp)
+overBody sp = overReg sp.bodies
 
 bodyExists :: (MonadIO m) => B3Space c -> Int -> m Bool
-bodyExists sp = regExists (spBodies sp)
+bodyExists sp = regExists sp.bodies
 
 bodyMembers :: (MonadIO m) => B3Space c -> m (U.Vector Int)
-bodyMembers sp = regMembers (spBodies sp)
+bodyMembers sp = regMembers sp.bodies
 
 withShape :: B3Space c -> Int -> (ShapeId -> IO a) -> IO a
-withShape sp ety f = withReg "Shape" (spShapes sp) ety (\(ShapeRecord s _) -> f s)
+withShape sp ety f = withReg "Shape" sp.shapes ety (\(ShapeRecord s _) -> f s)
 
 overShape :: B3Space c -> Int -> (ShapeId -> IO ()) -> IO ()
-overShape sp ety f = overReg (spShapes sp) ety (\(ShapeRecord s _) -> f s)
+overShape sp ety f = overReg sp.shapes ety (\(ShapeRecord s _) -> f s)
 
 shapeExists :: (MonadIO m) => B3Space c -> Int -> m Bool
-shapeExists sp = regExists (spShapes sp)
+shapeExists sp = regExists sp.shapes
 
 shapeMembers :: (MonadIO m) => B3Space c -> m (U.Vector Int)
-shapeMembers sp = regMembers (spShapes sp)
+shapeMembers sp = regMembers sp.shapes
 
 withJoint :: B3Space c -> Int -> (JointId -> IO a) -> IO a
-withJoint sp ety f = withReg "Joint" (spJoints sp) ety (\(JointRecord j _) -> f j)
+withJoint sp ety f = withReg "Joint" sp.joints ety (\(JointRecord j _) -> f j)
 
 overJoint :: B3Space c -> Int -> (JointId -> IO ()) -> IO ()
-overJoint sp ety f = overReg (spJoints sp) ety (\(JointRecord j _) -> f j)
+overJoint sp ety f = overReg sp.joints ety (\(JointRecord j _) -> f j)
 
 jointExists :: (MonadIO m) => B3Space c -> Int -> m Bool
-jointExists sp = regExists (spJoints sp)
+jointExists sp = regExists sp.joints
 
 jointMembers :: (MonadIO m) => B3Space c -> m (U.Vector Int)
-jointMembers sp = regMembers (spJoints sp)
+jointMembers sp = regMembers sp.joints
 
 -- | Whether an entity has a 'Joint' whose engine type is one of the given kinds.
 jointIsKind :: B3Space c -> Int -> [B3T.JointType] -> IO Bool
 jointIsKind sp ety kinds = do
-  m <- readIORef (spJoints sp)
+  m <- readIORef sp.joints
   case IM.lookup ety m of
     Nothing -> pure False
     Just (JointRecord j _) -> (`elem` kinds) <$> B3Joint.getType j
@@ -156,7 +157,7 @@ would hand joints of the wrong kind to a type-specific engine getter.
 -}
 jointKindMembers :: (MonadIO m) => B3Space c -> [B3T.JointType] -> m (U.Vector Int)
 jointKindMembers sp kinds = liftIO $ do
-  m <- readIORef (spJoints sp)
+  m <- readIORef sp.joints
   U.fromList . map fst
     <$> filterM (\(_, JointRecord j _) -> (`elem` kinds) <$> B3Joint.getType j) (IM.toList m)
 
@@ -243,7 +244,7 @@ shapeEntities sp s = do
     pure Nothing
   else do
     ix <- getUserIndex s
-    shapes <- readIORef (spShapes sp)
+    shapes <- readIORef sp.shapes
     pure $ case IM.lookup ix shapes of
       -- shapes created through the raw engine API have no user index and
       -- read back as 0, a legitimate entity; requiring the registered
@@ -262,7 +263,7 @@ jointEntity sp j = do
     pure Nothing
   else do
     ix <- getUserIndex j
-    joints <- readIORef (spJoints sp)
+    joints <- readIORef sp.joints
     pure $ case IM.lookup ix joints of
       -- joints created through the raw engine API have no user index and
       -- read back as 0, a legitimate entity; requiring the registered
@@ -281,7 +282,7 @@ bodyEntity sp b = do
     pure Nothing
   else do
     ix <- getUserIndex b
-    bodies <- readIORef (spBodies sp)
+    bodies <- readIORef sp.bodies
     pure $ case IM.lookup ix bodies of
       -- bodies created through the raw engine API have no user index and
       -- read back as 0, a legitimate entity; requiring the registered

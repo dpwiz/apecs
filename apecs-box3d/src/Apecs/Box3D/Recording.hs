@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Deterministic capture\/replay recordings.
 module Apecs.Box3D.Recording where
 
@@ -52,7 +54,7 @@ it before 'stopRecording'.
 startRecording :: forall w m. (MonadIO m, Has w m Physics) => Recording -> SystemT w m ()
 startRecording (Recording p) = do
   sp :: B3Space Physics <- getStore
-  liftIO $ B3World.startRecording (spWorld sp) p
+  liftIO $ B3World.startRecording sp.world p
 
 {- | End the recording session started by 'startRecording'. Writes the
 trailing geometry registry and backpatches the header; the buffer
@@ -62,7 +64,7 @@ destroy it when you are done.
 stopRecording :: forall w m. (MonadIO m, Has w m Physics) => SystemT w m ()
 stopRecording = do
   sp :: B3Space Physics <- getStore
-  liftIO $ B3World.stopRecording (spWorld sp)
+  liftIO $ B3World.stopRecording sp.world
 
 -- | Save a recording's bytes to a file. Returns 'False' if the file could not be written.
 saveRecording :: (MonadIO m) => Recording -> FilePath -> m Bool

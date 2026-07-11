@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -81,13 +82,13 @@ contactLifecycle = run $ do
   ball <- newEntity (DynamicBody, Position (Vec2 0 1.5))
   newEntity_ (Shape ball (GeoCircle vec2Zero 0.5))
   let involvesBoth c =
-        (collisionBodyA c, collisionBodyB c) `elem` [(ground, ball), (ball, ground)]
+        (c.bodyA, c.bodyB) `elem` [(ground, ball), (ball, ground)]
   mcol <- stepUntil 300 $ do
     Collisions cols <- get global
     pure (find involvesBoth cols)
   col <- maybe (liftIO (assertFailure "the ball never touched the ground")) pure mcol
-  m <- maybe (liftIO (assertFailure "begin-touch carried no manifold")) pure (collisionManifold col)
-  let Vec2 nx ny = contactNormal m
+  m <- maybe (liftIO (assertFailure "begin-touch carried no manifold")) pure col.manifold
+  let Vec2 nx ny = m.normal
   liftIO $ assertBool ("contact normal is vertical: " <> show (nx, ny)) (abs nx < 0.1 && abs ny > 0.9)
   -- teleporting the ball away breaks the contact; the end event must
   -- pair with the begin event under the participants-only Eq
@@ -129,8 +130,8 @@ sweepOrdering = run $ do
   stepPhysics dT
   hits <- sweepQuery (GeoCircle vec2Zero 0.2) (Vec2 20 0) everything
   liftIO $ do
-    map rayHitBody hits @?= [near, far]
-    let fracs = map rayHitFraction hits
+    map (.body) hits @?= [near, far]
+    let fracs = map (.fraction) hits
     assertBool ("fractions ascend: " <> show fracs) (fracs == sort fracs)
 
 segmentClosest :: Assertion
@@ -139,7 +140,7 @@ segmentClosest = run $ do
   _behind <- staticShape (Vec2 4 0) (GeoBox 1 1)
   stepPhysics dT
   hit <- segmentQuery (Vec2 (-5) 0) (Vec2 5 0) everything
-  liftIO $ fmap rayHitBody hit @?= Just body
+  liftIO $ fmap (.body) hit @?= Just body
 
 chainVisibility :: Assertion
 chainVisibility = run $ do
@@ -151,10 +152,10 @@ chainVisibility = run $ do
   -- one-sided, so probe from both sides
   above <- segmentQueryAll (Vec2 0 2) (Vec2 0 (-2)) everything
   below <- segmentQueryAll (Vec2 0 (-2)) (Vec2 0 2) everything
-  let chainHits = filter ((== chain) . rayHitShape) (above <> below)
+  let chainHits = filter ((== chain) . (.shape)) (above <> below)
   liftIO $ do
     assertBool "a ray across the chain reports the chain entity" (not (null chainHits))
-    assertBool "the chain's body entity rides along" (all ((== body) . rayHitBody) chainHits)
+    assertBool "the chain's body entity rides along" (all ((== body) . (.body)) chainHits)
   -- containsPointQuery can never report a chain (documented): the
   -- engine's exact point test has no chain-segment case
   onChain <- containsPointQuery (Vec2 0 0) everything

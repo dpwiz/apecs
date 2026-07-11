@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedRecordDot #-}
 {-# LANGUAGE TemplateHaskell #-}
 {-# LANGUAGE TypeFamilies #-}
 
@@ -139,15 +140,15 @@ contactLifecycle = run $ do
   ball <- newEntity (DynamicBody, Position (Vec3 0 1.5 0))
   newEntity_ (Shape ball (GeoSphere vec3Zero 0.5))
   let involvesBoth c =
-        (collisionBodyA c, collisionBodyB c) `elem` [(ground, ball), (ball, ground)]
+        (c.bodyA, c.bodyB) `elem` [(ground, ball), (ball, ground)]
   mcol <- stepUntil 300 $ do
     Collisions cols <- get global
     pure (find involvesBoth cols)
   col <- maybe (liftIO (assertFailure "the ball never touched the ground")) pure mcol
-  m <- case collisionManifolds col of
+  m <- case col.manifolds of
     [] -> liftIO (assertFailure "begin-touch carried no manifolds")
     m : _ -> pure m
-  let Vec3 nx ny nz = contactNormal m
+  let Vec3 nx ny nz = m.normal
   liftIO $
     assertBool
       ("contact normal is vertical: " <> show (nx, ny, nz))
@@ -185,9 +186,9 @@ basicQueries = run $ do
   boxed <- aabbQuery (Vec3 (-2) (-2) (-2)) (Vec3 2 2 2) everything
   missed <- segmentQuery (Vec3 (-5) 5 0) (Vec3 5 5 0) everything
   liftIO $ do
-    fmap rayHitBody hit @?= Just body
+    fmap (.body) hit @?= Just body
     boxed @?= [body]
-    fmap rayHitBody missed @?= Nothing
+    fmap (.body) missed @?= Nothing
 
 moverFreeSpace :: Assertion
 moverFreeSpace = run $ do

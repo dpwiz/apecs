@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | Deterministic capture\/replay recordings, and world snapshots.
 module Apecs.Box2D.Recording where
 
@@ -51,7 +53,7 @@ recording session: do not 'destroyRecording' it before 'stopRecording'.
 startRecording :: forall w m. (MonadIO m, Has w m Physics) => Recording -> SystemT w m ()
 startRecording (Recording p) = do
   sp :: B2Space Physics <- getStore
-  liftIO $ B2World.startRecording (spWorld sp) p
+  liftIO $ B2World.startRecording sp.world p
 
 {- | End the recording session started by 'startRecording'. The buffer
 keeps its recorded bytes; save or validate it, then 'destroyRecording'
@@ -60,7 +62,7 @@ it when you are done.
 stopRecording :: forall w m. (MonadIO m, Has w m Physics) => SystemT w m ()
 stopRecording = do
   sp :: B2Space Physics <- getStore
-  liftIO $ B2World.stopRecording (spWorld sp)
+  liftIO $ B2World.stopRecording sp.world
 
 -- | Save a recording's bytes to a file. Returns 'False' if the file could not be written.
 saveRecording :: (MonadIO m) => Recording -> FilePath -> m Bool
@@ -109,7 +111,7 @@ snapshotWorld :: forall w m. (MonadIO m, Has w m Physics) => SystemT w m (Maybe 
 snapshotWorld = do
   sp :: B2Space Physics <- getStore
   liftIO $ do
-    let wid = spWorld sp
+    let wid = sp.world
     need <- B2World.snapshot wid nullPtr 0
     if need <= 0 then
       pure Nothing
@@ -137,4 +139,4 @@ scene, not undoing spawns and despawns.
 restoreWorld :: forall w m. (MonadIO m, Has w m Physics) => Snapshot -> SystemT w m Bool
 restoreWorld (Snapshot fp size) = do
   sp :: B2Space Physics <- getStore
-  liftIO $ withForeignPtr fp $ \p -> B2World.restore (spWorld sp) p size
+  liftIO $ withForeignPtr fp $ \p -> B2World.restore sp.world p size

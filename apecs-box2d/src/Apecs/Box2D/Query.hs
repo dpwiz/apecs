@@ -1,3 +1,5 @@
+{-# LANGUAGE OverloadedRecordDot #-}
+
 -- | World queries: ray and shape casts, AABB, point and overlap tests.
 module Apecs.Box2D.Query where
 
@@ -27,11 +29,11 @@ normal, and the fraction along the segment (0 at the start, 1 at the
 end).
 -}
 data RayHit = RayHit
-  { rayHitShape :: !Entity
-  , rayHitBody :: !Entity
-  , rayHitPoint :: !WVec
-  , rayHitNormal :: !WVec
-  , rayHitFraction :: !Float
+  { shape :: !Entity
+  , body :: !Entity
+  , point :: !WVec
+  , normal :: !WVec
+  , fraction :: !Float
   }
   deriving (Eq, Show)
 
@@ -78,18 +80,18 @@ segmentQuery start end fltr = do
     let
       Vec2 sx sy = start
       Vec2 ex ey = end
-    res <- B2World.castRayClosest (spWorld sp) start (Vec2 (ex - sx) (ey - sy)) qf
+    res <- B2World.castRayClosest sp.world start (Vec2 (ex - sx) (ey - sy)) qf
     if B2T.rayResultHit res == 0 then
       pure Nothing
     else
       fmap
         ( \(shapeEty, bodyEty) ->
             RayHit
-              { rayHitShape = shapeEty
-              , rayHitBody = bodyEty
-              , rayHitPoint = B2T.rayResultPoint res
-              , rayHitNormal = B2T.rayResultNormal res
-              , rayHitFraction = B2T.rayResultFraction res
+              { shape = shapeEty
+              , body = bodyEty
+              , point = B2T.rayResultPoint res
+              , normal = B2T.rayResultNormal res
+              , fraction = B2T.rayResultFraction res
               }
         )
         <$> shapeEntities sp (B2T.rayResultShapeId res)
@@ -97,7 +99,7 @@ segmentQuery start end fltr = do
 {- | Drive a cast-style engine query ('B2World.castRay',
 'B2World.castShape') with the collect-everything visitor: each reported
 shape becomes a 'RayHit' (hits whose shapes were destroyed since the last
-'Apecs.Box2D.Space.stepPhysics' are dropped), sorted nearest-first by 'rayHitFraction'.
+'Apecs.Box2D.Space.stepPhysics' are dropped), sorted nearest-first by 'fraction'.
 -}
 collectCastHits :: B2Space c -> (FunPtr B2Tags.CastResultFcn -> Ptr () -> IO r) -> IO [RayHit]
 collectCastHits sp run = do
@@ -108,17 +110,17 @@ collectCastHits sp run = do
           modifyIORef'
             found
             ( RayHit
-                { rayHitShape = shapeEty
-                , rayHitBody = bodyEty
-                , rayHitPoint = point
-                , rayHitNormal = normal
-                , rayHitFraction = frac
+                { shape = shapeEty
+                , body = bodyEty
+                , point = point
+                , normal = normal
+                , fraction = frac
                 }
                 :
             )
         pure 1
   _ <- withCastResultFcn visit run
-  sortOn rayHitFraction <$> readIORef found
+  sortOn (.fraction) <$> readIORef found
 
 {- | Drive an overlap-style engine query ('B2World.overlapAABB',
 'B2World.overlapShape'), collecting the deduplicated body entities of
@@ -144,13 +146,13 @@ collectOverlapBodies sp keep run = do
   map Entity . IS.toList <$> readIORef found
 
 {- | Every shape along a world-space segment, sorted nearest-first by
-'rayHitFraction'. Filter semantics match 'segmentQuery'. Unlike
+'fraction'. Filter semantics match 'segmentQuery'. Unlike
 'segmentQuery', which goes through the engine's @b2World_CastRayClosest@
 convenience path, this drives the general @b2World_CastRay@ callback
 directly — and that path does /not/ ignore initial overlaps itself (the
 "ignore initial overlap" behaviour lives in the closest-hit callback, which
 skips fraction-0 hits before they reach the caller). So a segment starting
-inside a shape here reports that shape too, with 'rayHitFraction' 0. Hits
+inside a shape here reports that shape too, with 'fraction' 0. Hits
 whose shapes were destroyed since the last 'Apecs.Box2D.Space.stepPhysics' are dropped, same
 as 'segmentQuery'.
 -}
@@ -166,7 +168,7 @@ segmentQueryAll start end fltr = do
   liftIO $ do
     qf <- toQueryFilter fltr
     collectCastHits sp $ \fp ctx ->
-      B2World.castRay (spWorld sp) start (vec2Sub end start) qf fp ctx
+      B2World.castRay sp.world start (vec2Sub end start) qf fp ctx
 
 {- | The body entities whose shapes' broad-phase bounding boxes overlap
 the world-space box spanned by two corners (any order). Broad-phase:
@@ -184,7 +186,7 @@ aabbQuery cornerA cornerB fltr = do
   liftIO $ do
     qf <- toQueryFilter fltr
     collectOverlapBodies sp (\_ -> pure True) $ \fp ctx ->
-      B2World.overlapAABB (spWorld sp) vec2Zero box qf fp ctx
+      B2World.overlapAABB sp.world vec2Zero box qf fp ctx
   where
     Vec2 ax ay = cornerA
     Vec2 bx by = cornerB
@@ -221,7 +223,7 @@ containsPointQuery point fltr = do
   liftIO $ do
     qf <- toQueryFilter fltr
     collectOverlapBodies sp (`B2Shape.testPoint` point) $ \fp ctx ->
-      B2World.overlapAABB (spWorld sp) vec2Zero (AABB point point) qf fp ctx
+      B2World.overlapAABB sp.world vec2Zero (AABB point point) qf fp ctx
 
 {- | The body entities whose shapes actually overlap a query shape, given
 as a world-space 'Geometry' — exact narrow-phase overlap, the
@@ -240,11 +242,11 @@ overlapQuery geo fltr = do
     (points, radius) <- geometryProxy geo
     collectOverlapBodies sp (\_ -> pure True) $ \fp ctx ->
       B2T.withShapeProxy points radius $ \proxy ->
-        B2World.overlapShape (spWorld sp) vec2Zero proxy qf fp ctx
+        B2World.overlapShape sp.world vec2Zero proxy qf fp ctx
 
 {- | Sweep a query shape (a world-space 'Geometry') along a translation
 and collect everything it would hit, sorted nearest-first by
-'rayHitFraction' — 'segmentQueryAll' with volume. A shape that already
+'fraction' — 'segmentQueryAll' with volume. A shape that already
 overlaps the query shape at the start of the sweep is reported too, at
 fraction 0 (matching upstream @b2World_CastShape@, which treats an
 initial overlap as an immediate hit rather than skipping it).
@@ -263,4 +265,4 @@ sweepQuery geo translation fltr = do
     (points, radius) <- geometryProxy geo
     collectCastHits sp $ \fp ctx ->
       B2T.withShapeProxy points radius $ \proxy ->
-        B2World.castShape (spWorld sp) vec2Zero proxy translation qf fp ctx
+        B2World.castShape sp.world vec2Zero proxy translation qf fp ctx
